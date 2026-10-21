@@ -55,6 +55,7 @@ import asyncio
 from typing import Dict, List, Optional, Union
 
 from open_webui.retrieval.vector.factory import get_vector_db_client
+from open_webui.retrieval.vector.resource_guard import guard_vector
 from open_webui.retrieval.vector.main import (
     GetResult,
     SearchResult,
@@ -79,11 +80,11 @@ class AsyncVectorDBClient:
     def sync(self) -> VectorDBBase:
         """Escape hatch for code that must call the sync client directly
         (e.g. already inside a worker thread)."""
-        return self._sync if self._sync is not None else get_vector_db_client()
+        return guard_vector(self._sync) if self._sync is not None else get_vector_db_client()
 
     @property
     def supports_hybrid_search(self) -> bool:
-        return type(self.sync).hybrid_search is not VectorDBBase.hybrid_search
+        return type(self.sync.wrapped).hybrid_search is not VectorDBBase.hybrid_search
 
     async def has_collection(self, collection_name: str) -> bool:
         return await asyncio.to_thread(lambda: self.sync.has_collection(collection_name))

@@ -48,6 +48,7 @@ from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import get_all_models
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
@@ -761,18 +762,11 @@ async def delete_all_user_chats(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    tag_ids = [tag.id for tag in await Tags.get_tags_by_user_id(user.id, db=db)]
-    result = await Chats.delete_chats_by_user_id(user.id, db=db)
-    if result:
-        await Chats.delete_orphan_tags_for_user(tag_ids, user.id, db=db)
-        await publish_event(
-            request,
-            EVENTS.CHAT_DELETED_ALL,
-            actor=user,
-            subject_id=user.id,
-            subject_type='user',
-        )
-    return result
+    from open_webui.utils.resource_service import legacy_delete_many
+    from open_webui.models.chats import Chat
+    ids = list((await db.scalars(select(Chat.id).where(Chat.user_id == user.id))).all())
+    return await legacy_delete_many(user, 'chat', ids)
+
 
 
 ############################
@@ -1211,17 +1205,10 @@ async def unarchive_all_chats(
 async def unshare_all_chats(
     request: Request, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
-    # Collect chat_ids that have shares so we can clear share_id and access grants
-    shared_list = await SharedChats.get_by_user_id(user.id, db=db)
-    chat_ids = [s.chat_id for s in shared_list]
-
-    # Delete all shared_chat rows for this user
-    result = await SharedChats.delete_all_by_user_id(user.id, db=db)
-
-    # Clear share_id on the original chats and remove access grants
-    for chat_id in chat_ids:
-        await Chats.update_chat_share_id_by_id(chat_id, None, db=db)
-        await AccessGrants.set_access_grants('shared_chat', chat_id, [], db=db)
+    from open_webui.models.shared_chats import SharedChat
+    from open_webui.utils.resource_service import legacy_delete_many
+    ids = list((await db.scalars(select(SharedChat.id).where(SharedChat.user_id == user.id))).all())
+    result = await legacy_delete_many(user, 'share', ids, options={'include_shared': True})
 
     if result:
         await publish_event(
@@ -1681,30 +1668,8 @@ async def delete_chat_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    # Cancel any in-flight LLM tasks (streaming, title/tags generation) before
-    # deleting the chat to prevent orphaned requests.
-    await stop_item_tasks(request.app.state.redis, id)
-    await Chats.delete_orphan_tags_for_user(chat.meta.get('tags', []), chat.user_id, threshold=1, db=db)
-
-    # Cascade to internal child chats spawned from this one.
-    for child_id in await Chats.get_internal_chat_ids_by_parent_id(id, chat.user_id):
-        await stop_item_tasks(request.app.state.redis, child_id)
-        await Chats.delete_chat_by_id_and_user_id(child_id, chat.user_id)
-
-    if user.role == 'admin':
-        result = await Chats.delete_chat_by_id(id, db=db)
-    else:
-        result = await Chats.delete_chat_by_id_and_user_id(id, user.id, db=db)
-
-    if result:
-        await publish_event(
-            request,
-            EVENTS.CHAT_DELETED,
-            actor=user,
-            subject_id=id,
-            data={'owner_id': chat.user_id},
-        )
-    return result
+    from open_webui.utils.resource_service import legacy_delete
+    return await legacy_delete(user, 'chat', id)
 
 
 ############################
@@ -2104,12 +2069,12 @@ async def delete_shared_chat_by_id(
     if not chat:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
 
-    await SharedChats.delete_by_chat_id(id, db=db)
-
-    if chat.share_id:
-        await Chats.update_chat_share_id_by_id(id, None, db=db)
-
-    await AccessGrants.set_access_grants('shared_chat', id, [], db=db)
+    from open_webui.models.shared_chats import SharedChat
+    from open_webui.utils.resource_service import legacy_delete_many
+    ids = list((await db.scalars(select(SharedChat.id).where(
+        SharedChat.chat_id == id, SharedChat.user_id == user.id,
+    ))).all())
+    await legacy_delete_many(user, 'share', ids, options={'include_shared': True})
 
     await publish_event(
         request,

@@ -2,6 +2,7 @@ import base64
 import io
 import logging
 import time
+from open_webui.utils.resource_events import emit_channel_event
 import uuid
 from typing import Optional
 
@@ -847,7 +848,8 @@ async def delete_channel_by_id(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT())
 
     try:
-        await Channels.delete_channel_by_id(id, db=db)
+        from open_webui.utils.resource_service import legacy_delete
+        await legacy_delete(user, 'channel', id, options={'global_channel': True, 'include_shared': True})
         await sio.close_room(f'channel:{id}')
         await publish_event(
             request,
@@ -1108,6 +1110,9 @@ async def send_notification(request, channel, message, active_user_ids, db=None)
     url = f'{webui_url}/channels/{channel.id}'
 
     for u in users:
+        from open_webui.utils.resource_events import message_allowed
+        if not await message_allowed(u.id, channel.id, message.created_at, message.parent_id):
+            continue
         member = members.get(u.id)
         if member and member.is_channel_muted and u.id not in mentioned_user_ids:
             continue
@@ -1419,7 +1424,7 @@ async def new_message_handler(request: Request, id: str, form_data: MessageForm,
                 'channel': channel.model_dump(),
             }
 
-            await sio.emit(
+            await emit_channel_event(
                 'events:channel',
                 event_data,
                 to=f'channel:{channel.id}',
@@ -1430,7 +1435,7 @@ async def new_message_handler(request: Request, id: str, form_data: MessageForm,
                 parent_message = await Messages.get_message_by_id(message.parent_id, db=db)
 
                 if parent_message:
-                    await sio.emit(
+                    await emit_channel_event(
                         'events:channel',
                         {
                             'channel_id': channel.id,
@@ -1639,7 +1644,7 @@ async def pin_channel_message(
             }
         )
 
-        await sio.emit(
+        await emit_channel_event(
             'events:channel',
             {
                 'channel_id': channel.id,
@@ -1777,7 +1782,7 @@ async def update_message_by_id(
         message = await Messages.get_message_by_id(message_id, db=db)
 
         if message:
-            await sio.emit(
+            await emit_channel_event(
                 'events:channel',
                 {
                     'channel_id': channel.id,
@@ -1852,7 +1857,7 @@ async def add_reaction_to_message(
         await Messages.add_reaction_to_message(message_id, user.id, form_data.name, db=db)
         message = await Messages.get_message_by_id(message_id, db=db)
 
-        await sio.emit(
+        await emit_channel_event(
             'events:channel',
             {
                 'channel_id': channel.id,
@@ -1927,7 +1932,7 @@ async def remove_reaction_by_id_and_user_id_and_name(
 
         message = await Messages.get_message_by_id(message_id, db=db)
 
-        await sio.emit(
+        await emit_channel_event(
             'events:channel',
             {
                 'channel_id': channel.id,
@@ -2004,7 +2009,7 @@ async def delete_message_by_id(
 
     try:
         await Messages.delete_message_by_id(message_id, db=db)
-        await sio.emit(
+        await emit_channel_event(
             'events:channel',
             {
                 'channel_id': channel.id,
@@ -2027,7 +2032,7 @@ async def delete_message_by_id(
             parent_message = await Messages.get_message_by_id(message.parent_id, db=db)
 
             if parent_message:
-                await sio.emit(
+                await emit_channel_event(
                     'events:channel',
                     {
                         'channel_id': channel.id,
@@ -2312,7 +2317,7 @@ async def post_webhook_message(
         'channel': channel.model_dump(),
     }
 
-    await sio.emit(
+    await emit_channel_event(
         'events:channel',
         event_data,
         to=f'channel:{channel.id}',

@@ -1,4 +1,5 @@
 from threading import Lock
+from open_webui.retrieval.vector.resource_guard import guard_vector
 
 from fastapi import HTTPException
 from open_webui.config import (
@@ -105,7 +106,7 @@ def get_vector_db_client() -> VectorDBBase:
     """Initialize slim's remote client on first use so chat can start without it."""
     global VECTOR_DB_CLIENT
     if VECTOR_DB_CLIENT is not None:
-        return VECTOR_DB_CLIENT
+        return guard_vector(VECTOR_DB_CLIENT)
     with _vector_client_lock:
         if VECTOR_DB_CLIENT is None:
             from open_webui import config
@@ -120,4 +121,4 @@ def get_vector_db_client() -> VectorDBBase:
                 raise HTTPException(
                     503, f'Unable to connect to configured vector database ({VECTOR_DB}): {exc}'
                 ) from exc
-    return VECTOR_DB_CLIENT
+    return guard_vector(VECTOR_DB_CLIENT)

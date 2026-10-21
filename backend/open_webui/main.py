@@ -372,6 +372,9 @@ https://github.com/open-webui/open-webui
 async def lifespan(app: FastAPI):
     # Store reference to main event loop for sync->async calls (e.g., embedding generation)
     # This allows sync functions to schedule work on the main loop without blocking health checks
+    from open_webui.utils.resource_visibility import install_resource_visibility
+    from open_webui.utils.resource_service import resource_worker
+    install_resource_visibility()
     app.state.main_loop = asyncio.get_running_loop()
 
     if THREAD_POOL_SIZE and THREAD_POOL_SIZE > 0:
@@ -507,6 +510,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning(f'License data retrieval failed during startup: {e}')
 
+    app.state.resource_worker = asyncio.create_task(resource_worker())
     app.state.startup_complete = True
     await publish_event(app, EVENTS.SYSTEM_STARTUP_COMPLETED, source='system')
 
@@ -529,6 +533,8 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, 'redis_event_listener'):
         app.state.redis_event_listener.cancel()
 
+    app.state.resource_worker.cancel()
+    await asyncio.gather(app.state.resource_worker, return_exceptions=True)
     app.state.periodic_socket_authentication.cancel()
     app.state.periodic_usage_pool_cleanup.cancel()
     app.state.periodic_session_pool_cleanup.cancel()
@@ -865,6 +871,8 @@ if ENABLE_COMPRESSION_MIDDLEWARE:
 # CancelledError storms across the request path. See
 # `open_webui.utils.asgi_middleware` for the rationale.
 app.add_middleware(AppHTTPMiddleware)
+from open_webui.utils.resource_visibility import ResourceContextMiddleware
+app.add_middleware(ResourceContextMiddleware)
 
 
 app.add_middleware(
@@ -2409,6 +2417,7 @@ async def get_app_config(request: Request):
             'auto_redirect': config.get('oauth.auto_redirect'),
         },
         'features': {
+            'resource_management': {'protocol': 2, 'retention_days': 7},
             'slim': USE_SLIM,
             # --- Public: required by login/signup page pre-auth ---
             'auth': WEBUI_AUTH,

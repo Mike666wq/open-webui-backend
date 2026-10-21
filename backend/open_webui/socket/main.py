@@ -6,6 +6,8 @@ import logging
 import random
 import sys
 import time
+from open_webui.utils.resource_events import emit_channel_event
+from open_webui.utils.resource_visibility import as_viewer
 from contextlib import suppress
 from functools import wraps
 from typing import Any
@@ -673,19 +675,20 @@ async def channel_events(sid, data):
     if not user:
         return
 
-    if event_type == 'typing':
-        await sio.emit(
-            'events:channel',
-            {
-                'channel_id': data['channel_id'],
-                'message_id': data.get('message_id', None),
-                'data': event_data,
-                'user': UserNameResponse(**user).model_dump(),
-            },
-            room=room,
-        )
-    elif event_type == 'last_read_at':
-        await Channels.update_member_last_read_at(data['channel_id'], user['id'])
+    with as_viewer(user['id']):
+        if event_type == 'typing':
+            await emit_channel_event(
+                'events:channel',
+                {
+                    'channel_id': data['channel_id'],
+                    'message_id': data.get('message_id', None),
+                    'data': event_data,
+                    'user': UserNameResponse(**user).model_dump(),
+                },
+                room=room,
+            )
+        elif event_type == 'last_read_at':
+            await Channels.update_member_last_read_at(data['channel_id'], user['id'])
 
 
 async def get_folder_unread_counts(user_id: str) -> dict[str, int]:
@@ -712,82 +715,83 @@ async def chat_events(sid, data):
     if not user:
         return
 
-    event_data = data.get('data', {})
-    event_type = event_data.get('type')
+    with as_viewer(user['id']):
+        event_data = data.get('data', {})
+        event_type = event_data.get('type')
 
-    if event_type == 'typing':
-        chat_id = data.get('chat_id')
-        typing_data = event_data.get('data')
-        typing = typing_data.get('typing') if isinstance(typing_data, dict) else None
-        if not isinstance(chat_id, str) or not is_saved_chat_id(chat_id) or not isinstance(typing, bool):
-            return False
-        room = f'chat:{chat_id}'
-        if sid not in (get_room_sid_map(sio.manager, '/', room) or {}):
-            return False
-        sender = await Users.get_user_by_id(user['id'])
-        if not sender or not await Chats.get_accessible_chat_by_id(chat_id, sender, permission='write'):
-            return False
-        await sio.emit(
-            'events',
-            {
-                'chat_id': chat_id,
-                'user_id': sender.id,
-                'user': {'id': sender.id, 'name': sender.name},
-                'shared': True,
-                'data': {'type': 'typing', 'data': {'typing': typing}},
-            },
-            room=room,
-            skip_sid=sid,
-        )
-        return True
-
-    if event_type in {'join', 'leave'}:
-        chat_id = data.get('chat_id')
-        if not isinstance(chat_id, str) or not is_saved_chat_id(chat_id):
-            return False
-        session = SESSION_POOL.get(sid) or user
-        chat_ids = set(session.get('chat_ids') or [])
-        if event_type == 'leave':
-            await sio.leave_room(sid, f'chat:{chat_id}')
-            chat_ids.discard(chat_id)
-        else:
-            reader = await Users.get_user_by_id(user['id'])
-            if not reader or not await Chats.get_accessible_chat_by_id(chat_id, reader):
+        if event_type == 'typing':
+            chat_id = data.get('chat_id')
+            typing_data = event_data.get('data')
+            typing = typing_data.get('typing') if isinstance(typing_data, dict) else None
+            if not isinstance(chat_id, str) or not is_saved_chat_id(chat_id) or not isinstance(typing, bool):
                 return False
-            await sio.enter_room(sid, f'chat:{chat_id}')
-            chat_ids.add(chat_id)
-        SESSION_POOL[sid] = {**session, 'chat_ids': list(chat_ids)}
-        return True
-
-    if event_type == 'last_read_at':
-        read_update = await Chats.update_chat_last_read_at_by_id(data['chat_id'], user['id'])
-        if not read_update:
-            return
-        last_read_at, was_unread = read_update
-        response_data = {
-            'chat_id': data['chat_id'],
-            'last_read_at': last_read_at,
-        }
-        if was_unread:
-            response_data['folder_unread_counts'] = await get_folder_unread_counts(user['id'])
-
-        await sio.emit(
-            'events',
-            {
-                'chat_id': data['chat_id'],
-                'data': {
-                    'type': 'chat:list',
-                    'data': response_data,
+            room = f'chat:{chat_id}'
+            if sid not in (get_room_sid_map(sio.manager, '/', room) or {}):
+                return False
+            sender = await Users.get_user_by_id(user['id'])
+            if not sender or not await Chats.get_accessible_chat_by_id(chat_id, sender, permission='write'):
+                return False
+            await sio.emit(
+                'events',
+                {
+                    'chat_id': chat_id,
+                    'user_id': sender.id,
+                    'user': {'id': sender.id, 'name': sender.name},
+                    'shared': True,
+                    'data': {'type': 'typing', 'data': {'typing': typing}},
                 },
-            },
-            room=f'user:{user["id"]}',
-        )
-        try:
-            from open_webui.utils.timers import cancel_timers_for_chat
+                room=room,
+                skip_sid=sid,
+            )
+            return True
 
-            await cancel_timers_for_chat(data['chat_id'], 'chat.read', user['id'])
-        except Exception:
-            log.exception('Failed to cancel chat.read timers for chat %s', data.get('chat_id'))
+        if event_type in {'join', 'leave'}:
+            chat_id = data.get('chat_id')
+            if not isinstance(chat_id, str) or not is_saved_chat_id(chat_id):
+                return False
+            session = SESSION_POOL.get(sid) or user
+            chat_ids = set(session.get('chat_ids') or [])
+            if event_type == 'leave':
+                await sio.leave_room(sid, f'chat:{chat_id}')
+                chat_ids.discard(chat_id)
+            else:
+                reader = await Users.get_user_by_id(user['id'])
+                if not reader or not await Chats.get_accessible_chat_by_id(chat_id, reader):
+                    return False
+                await sio.enter_room(sid, f'chat:{chat_id}')
+                chat_ids.add(chat_id)
+            SESSION_POOL[sid] = {**session, 'chat_ids': list(chat_ids)}
+            return True
+
+        if event_type == 'last_read_at':
+            read_update = await Chats.update_chat_last_read_at_by_id(data['chat_id'], user['id'])
+            if not read_update:
+                return
+            last_read_at, was_unread = read_update
+            response_data = {
+                'chat_id': data['chat_id'],
+                'last_read_at': last_read_at,
+            }
+            if was_unread:
+                response_data['folder_unread_counts'] = await get_folder_unread_counts(user['id'])
+
+            await sio.emit(
+                'events',
+                {
+                    'chat_id': data['chat_id'],
+                    'data': {
+                        'type': 'chat:list',
+                        'data': response_data,
+                    },
+                },
+                room=f'user:{user["id"]}',
+            )
+            try:
+                from open_webui.utils.timers import cancel_timers_for_chat
+
+                await cancel_timers_for_chat(data['chat_id'], 'chat.read', user['id'])
+            except Exception:
+                log.exception('Failed to cancel chat.read timers for chat %s', data.get('chat_id'))
 
 
 def normalize_document_id(document_id: str) -> str:
@@ -800,6 +804,33 @@ def normalize_document_id(document_id: str) -> str:
     if document_id.startswith('note_'):
         document_id = 'note:' + document_id[5:]
     return document_id
+
+
+def with_resource_viewer(permission='read'):
+    def decorate(handler):
+        @wraps(handler)
+        async def wrapped(sid, data):
+            user = await get_socket_session_user(sid, wait_for_disconnect=False)
+            if not user:
+                return
+            with as_viewer(user['id']):
+                document_id = normalize_document_id(data.get('document_id', ''))
+                if document_id.startswith('note:'):
+                    note_id = document_id.split(':', 1)[1]
+                    note = await Notes.get_note_by_id(note_id)
+                    if not note:
+                        return
+                    if user.get('role') != 'admin':
+                        if not await has_permission(user['id'], 'features.notes', await Config.get('user.permissions')):
+                            return
+                        if user['id'] != note.user_id and not await AccessGrants.has_access(
+                            user_id=user['id'], resource_type='note', resource_id=note_id,
+                            permission=permission,
+                        ):
+                            return
+                return await handler(sid, data)
+        return wrapped
+    return decorate
 
 
 def with_document_lock(handler):
@@ -816,6 +847,7 @@ def with_document_lock(handler):
 
 @sio.on('ydoc:document:join')
 @with_document_lock
+@with_resource_viewer('read')
 async def ydoc_document_join(sid, data):
     """Handle user joining a document"""
     user = await get_socket_session_user(sid, wait_for_disconnect=False)
@@ -909,33 +941,35 @@ async def ydoc_document_join(sid, data):
 
 
 async def document_save_handler(document_id, data, user):
-    document_id = normalize_document_id(document_id)
+    with as_viewer(user['id']):
+        document_id = normalize_document_id(document_id)
 
-    if document_id.startswith('note:'):
-        note_id = document_id.split(':')[1]
-        note = await Notes.get_note_by_id(note_id)
-        if not note:
-            log.error(f'Note {note_id} not found')
-            return
+        if document_id.startswith('note:'):
+            note_id = document_id.split(':')[1]
+            note = await Notes.get_note_by_id(note_id)
+            if not note:
+                log.error(f'Note {note_id} not found')
+                return
 
-        if (
-            user.get('role') != 'admin'
-            and user.get('id') != note.user_id
-            and not await AccessGrants.has_access(
-                user_id=user.get('id'),
-                resource_type='note',
-                resource_id=note.id,
-                permission='write',
-            )
-        ):
-            log.error(f'User {user.get("id")} does not have write access to note {note_id}')
-            return
+            if (
+                user.get('role') != 'admin'
+                and user.get('id') != note.user_id
+                and not await AccessGrants.has_access(
+                    user_id=user.get('id'),
+                    resource_type='note',
+                    resource_id=note.id,
+                    permission='write',
+                )
+            ):
+                log.error(f'User {user.get("id")} does not have write access to note {note_id}')
+                return
 
-        return await Notes.update_note_by_id(note_id, NoteUpdateForm(data=data))
+            return await Notes.update_note_by_id(note_id, NoteUpdateForm(data=data))
 
 
 @sio.on('ydoc:document:state')
 @with_document_lock
+@with_resource_viewer('read')
 async def yjs_document_state(sid, data):
     """Send the current state of the Yjs document to the user"""
     try:
@@ -978,6 +1012,7 @@ async def yjs_document_state(sid, data):
 
 @sio.on('ydoc:document:update')
 @with_document_lock
+@with_resource_viewer('write')
 async def yjs_document_update(sid, data):
     """Handle Yjs document updates"""
     try:
@@ -1102,6 +1137,7 @@ async def yjs_document_leave(sid, data):
 
 
 @sio.on('ydoc:awareness:update')
+@with_resource_viewer()
 async def yjs_awareness_update(sid, data):
     """Handle awareness updates (cursors, selections, etc.)"""
     user = await get_socket_session_user(sid)
@@ -1244,7 +1280,7 @@ async def _make_channel_emitter(request_info):
         await Messages.update_message_by_id(message_id, update_form)
         message = await Messages.get_message_by_id(message_id)
         if message:
-            await sio.emit(
+            await emit_channel_event(
                 'events:channel',
                 {
                     'channel_id': channel_id,

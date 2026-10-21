@@ -35,6 +35,7 @@ from open_webui.utils.access_control.files import can_read_all_folder_files, get
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.tasks import has_active_tasks
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
@@ -741,6 +742,15 @@ async def delete_folder_by_id(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
             )
+
+    if delete_contents and folder_owner_id != user.id:
+        raise HTTPException(409, 'The owner must recycle folder contents before administrative folder removal')
+    if delete_contents:
+        from open_webui.models.chats import Chat
+        from open_webui.utils.resource_service import legacy_delete_many
+        ids = list((await db.scalars(select(Chat.id).where(Chat.user_id == user.id, Chat.folder_id.in_(folder_ids)))).all())
+        await legacy_delete_many(user, 'chat', ids)
+        delete_contents = False
 
     folders = []
     folders.append(folder)

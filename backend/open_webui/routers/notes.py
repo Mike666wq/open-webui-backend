@@ -709,18 +709,5 @@ async def delete_note_by_id(
     ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ERROR_MESSAGES.DEFAULT())
 
-    try:
-        note = await Notes.delete_note_by_id(id, db=db)
-        for room in [f'note:{id}', f'doc_note:{id}']:
-            await sio.close_room(room)
-
-        await publish_event(
-            request,
-            EVENTS.NOTE_DELETED,
-            actor=user,
-            subject_id=id,
-        )
-        return True
-    except Exception as e:
-        log.exception(e)
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT())
+    from open_webui.utils.resource_service import legacy_delete
+    return await legacy_delete(user, 'note', id)
