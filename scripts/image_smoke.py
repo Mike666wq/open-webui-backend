@@ -101,8 +101,20 @@ def smoke(image: str, timeout: int, output: Path) -> dict:
     started = time.monotonic()
     network_created = volume_created = container_created = False
     opener = build_opener(ProxyHandler({}), NoRedirect())
+    # --internal networks silently ignore published ports (moby/moby#53256),
+    # so the smoke checks could never reach the container. Use a normal bridge
+    # network (ports publish to the host loopback) and keep the container
+    # offline by blackholing its outbound route: DNS resolves to a link-local
+    # address that never answers, and there is no usable upstream gateway.
+    subnet = f'169.254.{secrets.randbelow(200) + 1}.0/24'
+    gateway = subnet.rsplit('.', 1)[0] + '.1'
     try:
-        docker('network', 'create', '--internal', network)
+        docker(
+            'network', 'create', '--driver', 'bridge',
+            '--subnet', subnet, '--gateway', gateway,
+            '--opt', 'com.docker.network.bridge.ip_masq=false',
+            network,
+        )
         network_created = True
         docker('volume', 'create', volume)
         volume_created = True
@@ -113,6 +125,7 @@ def smoke(image: str, timeout: int, output: Path) -> dict:
             'run', '--detach', '--pull=never', '--platform=linux/amd64',
             '--name', name, '--network', network,
             '--publish', '127.0.0.1::8080',
+            '--dns', '169.254.169.254',
             '--mount', f'type=volume,source={volume},target=/app/backend/data',
             '--env', 'DATA_DIR=/app/backend/data',
             '--env', 'HOST=0.0.0.0', '--env', 'PORT=8080',
@@ -127,7 +140,9 @@ def smoke(image: str, timeout: int, output: Path) -> dict:
             image,
         )
         ports = json.loads(docker('inspect', '--format', '{{json .NetworkSettings.Ports}}', name))
-        bindings = ports['8080/tcp']
+        bindings = ports.get('8080/tcp')
+        if not bindings:
+            raise RuntimeError(f'Port 8080 was not published to the host: {ports}')
         if len(bindings) != 1 or bindings[0]['HostIp'] != '127.0.0.1':
             raise RuntimeError('Smoke container must only publish a localhost port')
         base_url = 'http://127.0.0.1:' + bindings[0]['HostPort']
