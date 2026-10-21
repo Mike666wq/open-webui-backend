@@ -1,311 +1,269 @@
-"""Resource lifecycle: overview, soft-delete to 7-day recycle bin, restore, purge."""
+"""User-owned resource management. Administrative responses contain aggregates only."""
 
-import json
-import time
-import uuid
-from typing import Literal, Optional
+from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from sqlalchemy import text
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from open_webui.internal.db import get_async_session
-from open_webui.utils.auth import get_current_user, get_admin_user
+from open_webui.models.resources import ResourceEntry, ResourceRule, ResourceTask
+from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils import resource_service as service
+from open_webui.utils.resource_visibility import including_recycled
 
 router = APIRouter()
-
-RECYCLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
-RESOURCE_TYPES = ("chat", "file", "note", "knowledge")
+Kind = Literal['chat', 'file', 'note', 'knowledge', 'share', 'channel', 'knowledge_file', 'knowledge_directory']
 
 
-class RecycleItem(BaseModel):
-    id: str
-    type: str
-    title: str
-    size_bytes: int = 0
-    deleted_at: int
-    expires_at: int
-    meta: Optional[dict] = None
+class Item(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    type: Kind
+    id: str = Field(min_length=1, max_length=200)
 
 
-class ResourceStats(BaseModel):
-    chats: int = 0
-    files: int = 0
-    notes: int = 0
-    knowledge: int = 0
-    total_bytes: int = 0
-    recycled_count: int = 0
-    recycled_bytes: int = 0
+class Options(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    include_pinned: bool = False
+    include_shared: bool = False
 
 
-class DeleteRequest(BaseModel):
-    ids: list[str]
-    type: Literal["chat", "file", "note", "knowledge"]
+class Filters(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    type: Kind | None = None
+    query: str = Field(default='', max_length=200)
+    before: int | None = Field(default=None, ge=0)
+    min_bytes: int = Field(default=0, ge=0)
+    sort: Literal['title', 'size_bytes', 'updated_at'] = 'updated_at'
+
+
+class Preview(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: Literal['recycle', 'restore', 'purge']
+    items: list[Item] = Field(default_factory=list, max_length=500)
+    filters: Filters | None = None
+    options: Options = Field(default_factory=Options)
+
+
+class Execute(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    preview_id: str = Field(min_length=1, max_length=100)
+    idempotency_key: str = Field(min_length=8, max_length=100)
+
+
+@router.get('/capabilities')
+async def capabilities(user=Depends(get_verified_user)):
+    return {'protocol': 2, 'retention_days': 7, 'types': service.KINDS,
+            'preflight_required': True, 'personal_channel_clear': True}
+
+
+@router.get('/overview')
+async def overview(user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    resources = (await service.list_resources(db, user, all_results=True))['items']
+    counts = {kind: sum(r['type'] == kind for r in resources) for kind in service.KINDS}
+    recycled = (await db.scalars(select(ResourceEntry).where(
+        ResourceEntry.user_id == user.id, ResourceEntry.state.in_(('recycled', 'purging', 'paused', 'legacy')),
+    ))).all()
+    tasks = (await db.scalars(select(ResourceTask).where(
+        ResourceTask.user_id == user.id, ResourceTask.state != 'preview',
+    ))).all()
+    return {
+        'protocol': 2, 'counts': counts, 'chats': counts['chat'], 'files': counts['file'],
+        'notes': counts['note'], 'knowledge': counts['knowledge'],
+        'total_bytes': sum(r['size_bytes'] for r in resources),
+        'recycled_count': len(recycled),
+        'recycled_bytes': sum(r.size_bytes for r in recycled if r.type == 'file'),
+        'object_bytes_removed': sum(
+            r.get('object_bytes', 0) for task in tasks for r in task.results if r.get('success')
+        ),
+        'failed_tasks': sum(task.state in ('failed', 'partial') for task in tasks),
+        'capacity_basis': 'registered_upload_bytes',
+    }
+
+
+@router.get('/list')
+async def resources(
+    type: Kind | None = None, query: str = Query(default='', max_length=200),
+    before: int | None = Query(default=None, ge=0), min_bytes: int = Query(default=0, ge=0),
+    sort: Literal['title', 'size_bytes', 'updated_at'] = 'updated_at',
+    offset: int = Query(default=0, ge=0), limit: int = Query(default=25, ge=1, le=100),
+    user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session),
+):
+    return await service.list_resources(db, user, dict(
+        type=type, query=query, before=before, min_bytes=min_bytes, sort=sort, offset=offset, limit=limit,
+    ))
+
+
+@router.post('/preflight')
+async def preflight(body: Preview, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    if body.filters and body.items:
+        raise HTTPException(400, 'Choose explicit items or all matching filters')
+    return await service.make_preview(
+        db, user, body.action, [i.model_dump() for i in body.items], body.options.model_dump(),
+        body.filters.model_dump() if body.filters else None,
+    )
+
+
+@router.post('/tasks')
+async def execute(body: Execute, background_tasks: BackgroundTasks, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    task = await service.submit(db, user, body.preview_id, body.idempotency_key)
+    task_id = task.id
+    background_tasks.add_task(service.run_task, task_id)
+    return service.task_response(task)
+
+
+@router.get('/tasks')
+async def tasks(user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    rows = (await db.scalars(select(ResourceTask).where(
+        ResourceTask.user_id == user.id, ResourceTask.state != 'preview',
+    ).order_by(ResourceTask.created_at.desc()).limit(100))).all()
+    return [service.task_response(task) for task in rows]
+
+
+@router.post('/tasks/{id}/retry')
+async def retry(id: str, background_tasks: BackgroundTasks, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    task = await db.get(ResourceTask, id)
+    if not task or task.user_id != user.id:
+        raise HTTPException(404, 'Task not found')
+    if task.state not in ('failed', 'partial'):
+        raise HTTPException(409, 'Task is not retryable')
+    if task.action != 'purge':
+        raise HTTPException(409, 'Preview the remaining resources again')
+    task.state, task.lease_until = 'pending', 0
+    await db.commit()
+    background_tasks.add_task(service.run_task, id)
+    return service.task_response(task)
+
+
+class TemporaryUpload(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    draft_active: bool
+    draft_id: str = Field(default='legacy', min_length=1, max_length=200)
+
+
+@router.put('/uploads/{id}/temporary')
+async def register_temporary_upload(id: str, body: TemporaryUpload, user=Depends(get_verified_user),
+                                    db: AsyncSession = Depends(get_async_session)):
+    """Explicit client registration; unknown/legacy uploads remain protected."""
+    row = await service.owned_row(db, user, 'file', id)
+    drafts = set((row.meta or {}).get('resource_draft_ids', []))
+    if body.draft_active:
+        drafts.add(body.draft_id)
+    else:
+        drafts.discard(body.draft_id)
+    row.meta = {**(row.meta or {}), 'resource_temporary': True,
+                'resource_draft_active': bool(drafts), 'resource_draft_ids': sorted(drafts)}
+    row.updated_at = service.now()
+    await db.commit()
+    return {'registered': True, 'draft_active': bool(drafts)}
+
+
+def recycled_response(entry):
+    return {
+        'id': entry.id, 'original_id': entry.resource_id,
+        'type': 'channel' if entry.type == 'channel_clear' else entry.type,
+        'title': entry.title, 'size_bytes': entry.size_bytes if entry.type != 'channel_clear' else 0,
+        'deleted_at': entry.deleted_at, 'expires_at': entry.expires_at, 'state': entry.state,
+        'restorable': entry.state in ('recycled', 'paused') and entry.expires_at > service.now() and not entry.data.get('restored_private'),
+        'meta': {'reason': entry.data.get('reason'), 'generation': entry.generation,
+                 'effect': 'clear_only_for_me' if entry.type == 'channel_clear' else 'recycle'},
+    }
+
+
+@router.get('/recycle-bin')
+async def recycle_bin(user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    rows = (await db.scalars(select(ResourceEntry).where(
+        ResourceEntry.user_id == user.id, ResourceEntry.state.in_(('recycled', 'purging', 'paused', 'legacy')),
+    ).order_by(ResourceEntry.deleted_at.desc()))).all()
+    return [recycled_response(entry) for entry in rows]
+
+
+class LegacyDelete(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=500)
+    type: Kind
     permanent: bool = False
 
 
-class RestoreRequest(BaseModel):
-    ids: list[str]
-    type: Literal["chat", "file", "note", "knowledge"]
+async def legacy_action(body, action, user, db):
+    preview = await service.make_preview(db, user, action,
+        [{'id': id, 'type': body.type} for id in body.ids], {})
+    if not preview['allowed']:
+        raise HTTPException(409, {'reason': 'No eligible resources', 'items': preview['items']})
+    task = await service.submit(db, user, preview['id'], service.uid())
+    await service.run_task(task.id)
+    await db.refresh(task)
+    count = sum(r['success'] for r in task.results)
+    if not count:
+        raise HTTPException(409, {'results': task.results})
+    return {'restored' if action == 'restore' else 'deleted': count,
+            'permanent': action == 'purge', 'results': task.results, 'task_id': task.id}
 
 
-def _now() -> int:
-    return int(time.time())
+@router.post('/delete')
+async def legacy_delete(body: LegacyDelete, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    return await legacy_action(body, 'purge' if body.permanent else 'recycle', user, db)
 
 
-def _recycle_table(resource_type: str) -> str:
-    return f"resource_recycle_{resource_type}"
+@router.post('/restore')
+async def legacy_restore(body: LegacyDelete, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    return await legacy_action(body, 'restore', user, db)
 
 
-async def _ensure_recycle_table(db: AsyncSession, resource_type: str) -> None:
-    await db.execute(text(f"""
-        CREATE TABLE IF NOT EXISTS {_recycle_table(resource_type)} (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            original_id TEXT NOT NULL,
-            title TEXT NOT NULL,
-            size_bytes INTEGER DEFAULT 0,
-            deleted_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL,
-            meta TEXT
-        )
-    """))
+@router.post('/recycle-bin/purge-expired')
+async def purge_expired(user=Depends(get_admin_user)):
+    await service.maintenance_tick()
+    return {'queued': True}
+
+
+@router.get('/recycle-bin/{resource_type}/{resource_id}')
+async def get_recycle_item(resource_type: Kind, resource_id: str, user=Depends(get_verified_user),
+                           db: AsyncSession = Depends(get_async_session)):
+    entry = await db.get(ResourceEntry, resource_id)
+    accepted = ('channel', 'channel_clear') if resource_type == 'channel' else (resource_type,)
+    if not entry or entry.user_id != user.id or entry.type not in accepted:
+        entry = await service.entry_for(db, 'channel_clear' if resource_type == 'channel' else resource_type, resource_id, user.id)
+    if not entry or entry.user_id != user.id:
+        raise HTTPException(404, 'Item not found')
+    return recycled_response(entry)
+
+
+class RuleUpdate(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    temporary_uploads: bool
+
+
+@router.get('/rules')
+async def rules(user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+    rule = await db.get(ResourceRule, 'default')
+    return {'retention_days': 7, 'temporary_uploads': bool(rule and rule.temporary_uploads),
+            'temporary_idle_days': 7, 'can_edit': user.role == 'admin',
+            'temporary_scope': 'explicitly_registered_unreferenced_uploads'}
+
+
+@router.put('/rules')
+async def set_rules(body: RuleUpdate, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
+    rule = await db.get(ResourceRule, 'default')
+    if not rule:
+        rule = ResourceRule(id='default')
+        db.add(rule)
+    rule.temporary_uploads, rule.updated_at, rule.updated_by = body.temporary_uploads, service.now(), user.id
     await db.commit()
+    return await rules(user, db)
 
 
-async def _move_to_recycle(
-    db: AsyncSession, resource_type: str, original_id: str, user_id: str,
-    title: str, size_bytes: int = 0, meta: Optional[dict] = None,
-) -> None:
-    await _ensure_recycle_table(db, resource_type)
-    now = _now()
-    await db.execute(
-        text(f"""
-            INSERT OR REPLACE INTO {_recycle_table(resource_type)}
-            (id, user_id, original_id, title, size_bytes, deleted_at, expires_at, meta)
-            VALUES (:id, :user_id, :original_id, :title, :size_bytes, :deleted_at, :expires_at, :meta)
-        """),
-        {
-            "id": str(uuid.uuid4()),
-            "user_id": user_id,
-            "original_id": original_id,
-            "title": title,
-            "size_bytes": size_bytes,
-            "deleted_at": now,
-            "expires_at": now + RECYCLE_RETENTION_SECONDS,
-            "meta": json.dumps(meta or {}),
-        },
-    )
-    await db.commit()
-
-
-async def _list_recycled(user_id: str, db: AsyncSession) -> list[RecycleItem]:
-    items: list[RecycleItem] = []
-    for rtype in RESOURCE_TYPES:
-        await _ensure_recycle_table(db, rtype)
-        result = await db.execute(
-            text(f"""
-                SELECT id, original_id, title, size_bytes, deleted_at, expires_at, meta
-                FROM {_recycle_table(rtype)} WHERE user_id = :uid ORDER BY deleted_at DESC
-            """),
-            {"uid": user_id},
-        )
-        for row in result.mappings():
-            items.append(RecycleItem(
-                id=row["id"],
-                type=rtype,
-                title=row["title"],
-                size_bytes=row["size_bytes"],
-                deleted_at=row["deleted_at"],
-                expires_at=row["expires_at"],
-                meta=json.loads(row["meta"]) if row["meta"] else None,
-            ))
-    return items
-
-
-@router.get("/overview", response_model=ResourceStats)
-async def resource_overview(
-    user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_async_session),
-) -> ResourceStats:
-    stats = ResourceStats()
-
-    # Count chats
-    result = await db.execute(
-        text("SELECT COUNT(*) FROM chat WHERE user_id = :uid"),
-        {"uid": user.id},
-    )
-    stats.chats = result.scalar() or 0
-
-    # Count files and sum sizes
-    result = await db.execute(
-        text("SELECT COUNT(*), COALESCE(SUM(CAST(json_extract(meta, '$.size') AS INTEGER)), 0) FROM file WHERE user_id = :uid"),
-        {"uid": user.id},
-    )
-    row = result.first()
-    stats.files = row[0] or 0
-    stats.total_bytes = row[1] or 0
-
-    # Count notes
-    result = await db.execute(
-        text("SELECT COUNT(*) FROM note WHERE user_id = :uid"),
-        {"uid": user.id},
-    )
-    stats.notes = result.scalar() or 0
-
-    # Count knowledge
-    result = await db.execute(
-        text("SELECT COUNT(*) FROM knowledge WHERE user_id = :uid"),
-        {"uid": user.id},
-    )
-    stats.knowledge = result.scalar() or 0
-
-    recycled = await _list_recycled(user.id, db)
-    stats.recycled_count = len(recycled)
-    stats.recycled_bytes = sum(item.size_bytes for item in recycled)
-    return stats
-
-
-@router.get("/recycle-bin", response_model=list[RecycleItem])
-async def list_recycle_bin(
-    user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_async_session),
-) -> list[RecycleItem]:
-    return await _list_recycled(user.id, db)
-
-
-@router.post("/delete")
-async def delete_resources(
-    body: DeleteRequest,
-    user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_async_session),
-) -> dict:
-    deleted = 0
-    for resource_id in body.ids:
-        try:
-            table_name = body.type
-            if body.type == "chat":
-                table_name = "chat"
-                title_col = "title"
-            elif body.type == "file":
-                table_name = "file"
-                title_col = "filename"
-            elif body.type == "note":
-                table_name = "note"
-                title_col = "title"
-            elif body.type == "knowledge":
-                table_name = "knowledge"
-                title_col = "name"
-
-            # Fetch resource info
-            result = await db.execute(
-                text(f"SELECT {title_col}, user_id FROM {table_name} WHERE id = :rid"),
-                {"rid": resource_id},
-            )
-            row = result.first()
-            if not row or row[1] != user.id:
-                continue
-
-            title = row[0] or "Untitled"
-
-            if not body.permanent:
-                # Get size for files
-                size_bytes = 0
-                if body.type == "file":
-                    size_result = await db.execute(
-                        text("SELECT CAST(json_extract(meta, '$.size') AS INTEGER) FROM file WHERE id = :rid"),
-                        {"rid": resource_id},
-                    )
-                    size_bytes = size_result.scalar() or 0
-
-                await _move_to_recycle(
-                    db, body.type, resource_id, user.id,
-                    title=title, size_bytes=size_bytes,
-                )
-
-            # Delete from main table
-            await db.execute(
-                text(f"DELETE FROM {table_name} WHERE id = :rid AND user_id = :uid"),
-                {"rid": resource_id, "uid": user.id},
-            )
-            await db.commit()
-            deleted += 1
-        except Exception:
-            continue
-    return {"deleted": deleted, "permanent": body.permanent}
-
-
-@router.post("/restore")
-async def restore_resources(
-    body: RestoreRequest,
-    user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_async_session),
-) -> dict:
-    restored = 0
-    for resource_id in body.ids:
-        try:
-            table = _recycle_table(body.type)
-            await _ensure_recycle_table(db, body.type)
-            result = await db.execute(
-                text(f"SELECT id FROM {table} WHERE original_id = :oid AND user_id = :uid"),
-                {"oid": resource_id, "uid": user.id},
-            )
-            if result.first():
-                await db.execute(
-                    text(f"DELETE FROM {table} WHERE original_id = :oid AND user_id = :uid"),
-                    {"oid": resource_id, "uid": user.id},
-                )
-                await db.commit()
-                restored += 1
-        except Exception:
-            continue
-    return {"restored": restored}
-
-
-@router.get("/recycle-bin/{resource_type}/{resource_id}", response_model=RecycleItem)
-async def get_recycle_item(
-    resource_type: str,
-    resource_id: str,
-    user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_async_session),
-) -> RecycleItem:
-    if resource_type not in RESOURCE_TYPES:
-        raise HTTPException(status_code=400, detail="Invalid resource type")
-    table = _recycle_table(resource_type)
-    await _ensure_recycle_table(db, resource_type)
-    result = await db.execute(
-        text(f"""
-            SELECT id, original_id, title, size_bytes, deleted_at, expires_at, meta
-            FROM {table} WHERE original_id = :oid AND user_id = :uid
-        """),
-        {"oid": resource_id, "uid": user.id},
-    )
-    row = result.mappings().first()
-    if not row:
-        raise HTTPException(status_code=404, detail="Item not found in recycle bin")
-    return RecycleItem(
-        id=row["id"], type=resource_type, title=row["title"],
-        size_bytes=row["size_bytes"], deleted_at=row["deleted_at"],
-        expires_at=row["expires_at"],
-        meta=json.loads(row["meta"]) if row["meta"] else None,
-    )
-
-
-@router.post("/recycle-bin/purge-expired")
-async def purge_expired_recycle_bin(
-    user=Depends(get_admin_user),
-    db: AsyncSession = Depends(get_async_session),
-) -> dict:
-    purged: dict[str, int] = {}
-    now = _now()
-    for rtype in RESOURCE_TYPES:
-        table = _recycle_table(rtype)
-        await _ensure_recycle_table(db, rtype)
-        result = await db.execute(
-            text(f"DELETE FROM {table} WHERE expires_at < :now"),
-            {"now": now},
-        )
-        await db.commit()
-        purged[rtype] = result.rowcount
-    return {"purged": purged}
+@router.get('/admin/overview')
+async def admin_overview(user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
+    with including_recycled():
+        accounts = {}
+        for kind in service.KINDS:
+            cls = service.models()[kind]
+            rows = (await db.execute(select(cls.user_id, func.count()).group_by(cls.user_id))).all()
+            for user_id, count in rows:
+                accounts.setdefault(user_id, {'user_id': user_id, 'counts': {}})['counts'][kind] = count
+        states = (await db.execute(select(
+            ResourceTask.user_id, ResourceTask.state, func.count(),
+        ).where(ResourceTask.state != 'preview').group_by(ResourceTask.user_id, ResourceTask.state))).all()
+        for user_id, state, count in states:
+            accounts.setdefault(user_id, {'user_id': user_id, 'counts': {}}).setdefault('tasks', {})[state] = count
+        return {'accounts': list(accounts.values())}

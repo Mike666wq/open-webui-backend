@@ -2947,47 +2947,12 @@ async def reset_vector_db(
     user=Depends(get_admin_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    await ASYNC_VECTOR_DB_CLIENT.reset()
-    await Knowledges.delete_all_knowledge(db=db)
-    await publish_event(
-        request,
-        EVENTS.RETRIEVAL_VECTOR_DB_RESET,
-        actor=user,
-        subject_id='default',
-    )
+    raise HTTPException(status_code=409, detail='Use Resources & Storage with an impact preview; bulk resets bypass retention and reference protection')
 
 
 @router.post('/reset/uploads')
 async def reset_upload_dir(request: Request, user=Depends(get_admin_user)) -> bool:
-    folder = f'{UPLOAD_DIR}'
-    try:
-        # Check if the directory exists
-        if await asyncio.to_thread(os.path.exists, folder):
-            # Iterate over all the files and directories in the specified directory
-            for filename in await asyncio.to_thread(os.listdir, folder):
-                file_path = os.path.join(folder, filename)
-                try:
-                    if await asyncio.to_thread(os.path.isfile, file_path) or await asyncio.to_thread(
-                        os.path.islink, file_path
-                    ):
-                        await asyncio.to_thread(os.unlink, file_path)  # Remove the file or link
-                    elif await asyncio.to_thread(os.path.isdir, file_path):
-                        await asyncio.to_thread(shutil.rmtree, file_path)  # Remove the directory
-                except Exception as e:
-                    log.exception(f'Failed to delete {file_path}. Reason: {e}')
-        else:
-            log.warning(f'The directory {folder} does not exist')
-    except Exception as e:
-        log.exception(f'Failed to process the directory {folder}. Reason: {e}')
-
-    await publish_event(
-        request,
-        EVENTS.RETRIEVAL_UPLOADS_RESET,
-        actor=user,
-        subject_id='all',
-        subject_type='file.uploads',
-    )
-    return True
+    raise HTTPException(status_code=409, detail='Use Resources & Storage with an impact preview; bulk resets bypass retention and reference protection')
 
 
 if ENV == 'dev':

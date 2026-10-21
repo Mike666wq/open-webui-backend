@@ -61,25 +61,6 @@ router = APIRouter()
 PAGE_ITEM_COUNT = 30
 
 
-async def delete_file_resource(file: FileModel, db: AsyncSession) -> bool:
-    try:
-        file_collection = f'file-{file.id}'
-        if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=file_collection):
-            await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=file_collection)
-    except Exception as e:
-        log.debug('This was most likely caused by bypassing embedding processing')
-        log.debug(e)
-
-    result = await Files.delete_file_by_id(file.id, db=db)
-    if result and file.path:
-        try:
-            await asyncio.to_thread(Storage.delete_file, file.path)
-        except Exception as e:
-            log.debug(e)
-
-    return result
-
-
 ############################
 # Knowledge Base Embedding
 ############################
@@ -1658,21 +1639,10 @@ async def remove_file_from_knowledge_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    await Knowledges.remove_file_from_knowledge_by_id(knowledge_id=id, file_id=form_data.file_id, db=db)
-
-    # Remove content from the vector database
-    try:
-        await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'file_id': form_data.file_id})
-        if file.hash:
-            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'hash': file.hash})
-    except Exception as e:
-        log.debug('This was most likely caused by bypassing embedding processing')
-        log.debug(e)
-        pass
-
-    # Anyone with write permission or higher can delete files
-    if delete_file and (file.user_id == user.id or user.role == 'admin'):
-        await delete_file_resource(file, db)
+    # The relationship, original file and vectors survive until expiry.
+    # Other uses of this file are never removed by detaching it here.
+    from open_webui.utils.resource_service import knowledge_cleanup
+    await knowledge_cleanup(user, id, file_ids=[form_data.file_id])
 
     if knowledge:
         response = KnowledgeFilesResponse(
@@ -1729,59 +1699,8 @@ async def delete_knowledge_by_id(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    log.info('Deleting knowledge base: %s (name: %s)', id, knowledge.name)
-
-    # Get all models
-    models = await Models.get_all_models(db=db)
-    log.info('Found %s models to check for knowledge base %s', len(models), id)
-
-    # Update models that reference this knowledge base
-    for model in models:
-        if model.meta and hasattr(model.meta, 'knowledge'):
-            knowledge_list = model.meta.knowledge or []
-            # Filter out the deleted knowledge base
-            updated_knowledge = [k for k in knowledge_list if k.get('id') != id]
-
-            # If the knowledge list changed, update the model
-            if len(updated_knowledge) != len(knowledge_list):
-                log.info('Updating model %s to remove knowledge base %s', model.id, id)
-                model.meta.knowledge = updated_knowledge
-                model_form = ModelForm(**model.model_dump())
-                await Models.update_model_by_id(model.id, model_form, db=db, user_id=user.id)
-
-    # Clean up vector DB
-    if is_external_knowledge(knowledge):
-        connection_id = (knowledge.meta or {}).get('external', {}).get('connection_id')
-        # Connections are admin-owned and shared across knowledge bases
-        if (
-            connection_id
-            and user.role == 'admin'
-            and await _get_knowledge_base_count_for_external_connection(connection_id, db=db) <= 1
-        ):
-            connections = [
-                connection for connection in await _get_external_connections() if connection.get('id') != connection_id
-            ]
-            await _set_external_connections(connections)
-    else:
-        try:
-            await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=id)
-        except Exception as e:
-            log.debug(e)
-            pass
-
-    # Remove knowledge base embedding
-    await remove_knowledge_base_metadata_embedding(id)
-
-    result = await Knowledges.delete_knowledge_by_id(id=id, db=db)
-    if result:
-        await publish_event(
-            request,
-            EVENTS.KNOWLEDGE_DELETED,
-            actor=user,
-            subject_id=id,
-            data={'name': knowledge.name},
-        )
-    return result
+    from open_webui.utils.resource_service import legacy_delete
+    return await legacy_delete(user, 'knowledge', id)
 
 
 ############################
@@ -1822,19 +1741,13 @@ async def reset_knowledge_by_id(
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    files = await Knowledges.get_files_by_id(id, db=db) if not ENABLE_KNOWLEDGE_FILE_RETENTION else []
-
-    try:
-        await ASYNC_VECTOR_DB_CLIENT.delete_collection(collection_name=id)
-    except Exception as e:
-        log.debug(e)
-        pass
-
-    for file in files:
-        if file.user_id == user.id or user.role == 'admin':
-            await delete_file_resource(file, db)
-
-    knowledge = await Knowledges.reset_knowledge_by_id(id=id, include_directories=include_directories, db=db)
+    from sqlalchemy import select
+    from open_webui.models.knowledge import KnowledgeDirectory, KnowledgeFile
+    from open_webui.utils.resource_service import knowledge_cleanup
+    file_ids = list((await db.scalars(select(KnowledgeFile.file_id).where(KnowledgeFile.knowledge_id == id))).all())
+    directories = list((await db.scalars(select(KnowledgeDirectory.id).where(KnowledgeDirectory.knowledge_id == id))).all()) if include_directories else []
+    await knowledge_cleanup(user, id, file_ids=file_ids, directory_ids=directories)
+    knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
     if knowledge:
         await publish_event(
             request,
@@ -2005,40 +1918,8 @@ async def sync_knowledge_cleanup(
     """
     await _verify_knowledge_write_access(id, user, db)
 
-    # ── Remove deleted files ──
-    for file_id in form_data.file_ids:
-        file = await Files.get_file_by_id(file_id, db=db)
-        if not file:
-            continue
-
-        # Only clean up files that belong to this knowledge base.
-        if not await Knowledges.has_file(id, file_id, db=db):
-            continue
-
-        await Knowledges.remove_file_from_knowledge_by_id(id, file_id, db=db)
-
-        try:
-            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=id, filter={'file_id': file_id})
-            if file.hash:
-                await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=id, filter={'hash': file.hash})
-        except Exception:
-            pass
-
-        linked_knowledges = await Knowledges.get_knowledges_by_file_id(file_id, db=db)
-        if (
-            not ENABLE_KNOWLEDGE_FILE_RETENTION
-            and not linked_knowledges
-            and (file.user_id == user.id or user.role == 'admin')
-        ):
-            await delete_file_resource(file, db)
-
-    # ── Remove orphaned directories (children before parents) ──
-    for dir_id in reversed(form_data.dir_ids):
-        # Only delete directories that belong to this knowledge base.
-        directory = await Knowledges.get_directory_by_id(dir_id, db=db)
-        if not directory or directory.knowledge_id != id:
-            continue
-        await Knowledges.delete_directory(dir_id, move_files_to_parent=False, db=db)
+    from open_webui.utils.resource_service import knowledge_cleanup
+    await knowledge_cleanup(user, id, file_ids=form_data.file_ids, directory_ids=form_data.dir_ids)
 
     return {'status': True}
 
@@ -2351,32 +2232,8 @@ async def delete_knowledge_directory(
     # Collect before delete_directory drops the KnowledgeFile rows
     files = [] if move_files else await Knowledges.get_files_by_id_and_directory_id(id, dir_id, db=db)
 
-    success = await Knowledges.delete_directory(
-        directory_id=dir_id,
-        move_files_to_parent=move_files,
-        db=db,
-    )
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail='Failed to delete directory.',
-        )
-
-    for file in files:
-        try:
-            await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=id, filter={'file_id': file.id})
-            if file.hash:
-                await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=id, filter={'hash': file.hash})
-        except Exception as e:
-            log.debug('This was most likely caused by bypassing embedding processing')
-            log.debug(e)
-
-        if (
-            not ENABLE_KNOWLEDGE_FILE_RETENTION
-            and not await Knowledges.get_knowledges_by_file_id(file.id, db=db)
-            and (file.user_id == user.id or user.role == 'admin')
-        ):
-            await delete_file_resource(file, db)
+    from open_webui.utils.resource_service import knowledge_cleanup
+    await knowledge_cleanup(user, id, directory_ids=[dir_id], move_files=move_files)
 
     await publish_event(
         request,

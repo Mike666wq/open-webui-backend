@@ -285,6 +285,7 @@ async def upload_file(
     metadata: Optional[dict | str] = Form(None),
     process: bool = Query(True),
     process_in_background: bool = Query(True),
+    managed_temporary: bool = Query(False),
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
@@ -294,6 +295,7 @@ async def upload_file(
         metadata=metadata,
         process=process,
         process_in_background=process_in_background,
+        managed_temporary=managed_temporary,
         user=user,
         background_tasks=background_tasks,
         db=db,
@@ -327,6 +329,7 @@ async def upload_file_handler(
     metadata: Optional[dict | str] = Form(None),
     process: bool = Query(True),
     process_in_background: bool = Query(True),
+    managed_temporary: bool = False,
     user=Depends(get_verified_user),
     background_tasks: Optional[BackgroundTasks] = None,
     db: Optional[AsyncSession] = None,
@@ -421,6 +424,7 @@ async def upload_file_handler(
                         'size': len(contents),
                         'file_hash': file_hash,
                         'data': file_metadata,
+                        **({'resource_temporary': True, 'resource_draft_active': False} if managed_temporary is True else {}),
                     },
                 }
             ),
@@ -576,25 +580,7 @@ async def count_files(
 async def delete_all_files(
     request: Request, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
 ):
-    result = await Files.delete_all_files(db=db)
-    if result:
-        try:
-            await asyncio.to_thread(Storage.delete_all_files)
-            await ASYNC_VECTOR_DB_CLIENT.reset()
-        except Exception as e:
-            log.exception(e)
-            log.error('Error deleting files')
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.DEFAULT('Error deleting files'),
-            )
-        await publish_event(request, EVENTS.FILE_DELETED_ALL, actor=user, subject_type='file')
-        return {'message': 'All files deleted successfully'}
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=ERROR_MESSAGES.DEFAULT('Error deleting files'),
-        )
+    raise HTTPException(status_code=409, detail='Use Resources & Storage with an impact preview; bulk resets bypass retention and reference protection')
 
 
 ############################
@@ -1033,46 +1019,7 @@ async def delete_file_by_id(
         )
 
     if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'write', user, db=db):
-        # Clean up KB associations and embeddings before deleting
-        knowledges = await Knowledges.get_knowledges_by_file_id(id, db=db)
-        for knowledge in knowledges:
-            # Remove KB-file relationship
-            await Knowledges.remove_file_from_knowledge_by_id(knowledge.id, id, db=db)
-            # Clean KB embeddings (same logic as /knowledge/{id}/file/remove)
-            try:
-                await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'file_id': id})
-                if file.hash:
-                    await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=knowledge.id, filter={'hash': file.hash})
-            except Exception as e:
-                log.debug('KB embedding cleanup for %s: %s', knowledge.id, e)
-
-        result = await Files.delete_file_by_id(id, db=db)
-        if result:
-            try:
-                await asyncio.to_thread(Storage.delete_file, file.path)
-                await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=f'file-{id}')
-            except Exception as e:
-                log.exception(e)
-                log.error('Error deleting files')
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=ERROR_MESSAGES.DEFAULT('Error deleting files'),
-                )
-            await publish_event(
-                request,
-                EVENTS.FILE_DELETED,
-                actor=user,
-                subject_id=id,
-                data={'filename': file.filename},
-            )
-            return {'message': 'File deleted successfully'}
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=ERROR_MESSAGES.DEFAULT('Error deleting file'),
-            )
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=ERROR_MESSAGES.NOT_FOUND,
-        )
+        from open_webui.utils.resource_service import legacy_delete
+        await legacy_delete(user, 'file', id)
+        return {'message': 'File moved to recycle bin'}
+    raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)

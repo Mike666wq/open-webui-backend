@@ -32,10 +32,41 @@ jobs:
       - name: Run foundation unit tests
         run: python -m unittest discover -s tests -v
 
+  resource-lifecycle:
+    name: resource lifecycle tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/open-webui/open-webui:v0.12.2@sha256:10e6a78ba2d172493460a9e8a92c496aaa7a64dc4d26d622a2e95e0c736081c9
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: owui_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run SQLite lifecycle tests
+        run: python scripts/test_resource_lifecycle.py
+      - name: Run PostgreSQL migration tests
+        env:
+          TEST_POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/owui_test
+        run: python scripts/test_resource_postgres.py
+
   image:
     name: build, smoke and publish image
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: checks
+    needs: [checks, resource-lifecycle]
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     permissions:
