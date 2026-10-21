@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "sourceRepository": "Mike666wq/open-webui-backend",
+  "upstreamRepository": "open-webui/open-webui",
+  "upstreamVersion": "0.12.2",
+  "upstreamCommit": "6a18585ff4c2e5f6805f682222cfbc46dc669ef8",
+  "sourceArchiveUrl": "https://codeload.github.com/open-webui/open-webui/tar.gz/6a18585ff4c2e5f6805f682222cfbc46dc669ef8",
+  "sourceArchiveSha256": "c8f0db44e7cb6749c2a5b3835a7863a8cb5f6eaec068a5f6148645a1a9c703da",
+  "baseImage": "ghcr.io/open-webui/open-webui:v0.12.2@sha256:10e6a78ba2d172493460a9e8a92c496aaa7a64dc4d26d622a2e95e0c736081c9",
+  "importedPaths": [
+    "backend/",
+    "static/static/",
+    "package.json",
+    "pyproject.toml",
+    "uv.lock",
+    "hatch_build.py",
+    "CHANGELOG.md",
+    "LICENSE",
+    "LICENSE_HISTORY",
+    "LICENSE_NOTICE",
+    "CONTRIBUTOR_LICENSE_AGREEMENT"
+  ],
+  "runtimeRequirementsSha256": {
+    "backend/requirements.txt": "d532d221dcd8beb0d36f7756259cc33515464c060775f5de3c8b197a5f55f098",
+    "backend/requirements-slim.txt": "6dc3e004a3935f4bcc19f804f791e536c1f4be381049d866f842b2c2e4a88509"
+  }
+}

@@ -1,0 +1,138 @@
+name: Backend
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'main-publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  REGISTRY_IMAGE: ghcr.io/mike666wq/open-webui-backend
+
+jobs:
+  checks:
+    name: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check source and repository boundaries
+        run: python scripts/check_source.py
+      - name: Run foundation unit tests
+        run: python -m unittest discover -s tests -v
+
+  image:
+    name: build, smoke and publish image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Reuse an already published immutable source tag
+        id: existing
+        shell: bash
+        run: |
+          if docker buildx imagetools inspect --format '{{json .Manifest}}' \
+            "${REGISTRY_IMAGE}:sha-${GITHUB_SHA}" > /tmp/existing-image.json 2> /tmp/existing-image-error; then
+            python - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          digest = json.loads(Path('/tmp/existing-image.json').read_text())['digest']
+          if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+              raise SystemExit('Registry returned an invalid digest')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'exists=true\ndigest={digest}\n')
+          PY
+          elif grep -Eqi 'manifest unknown|not found|name unknown' /tmp/existing-image-error; then
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          else
+            cat /tmp/existing-image-error >&2
+            exit 1
+          fi
+      - name: Download and verify the locked frontend
+        if: steps.existing.outputs.exists != 'true'
+        run: python scripts/prepare_frontend.py
+      - name: Read frontend provenance
+        id: frontend
+        run: |
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          commit = json.loads(Path('frontend.lock.json').read_text())['sourceCommit']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'commit={commit}\n')
+          PY
+      - name: Build immutable multi-platform image
+        id: build
+        if: steps.existing.outputs.exists != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.REGISTRY_IMAGE }}:sha-${{ github.sha }}
+          build-args: |
+            BUILD_HASH=${{ github.sha }}
+            FRONTEND_COMMIT=${{ steps.frontend.outputs.commit }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=backend-image
+          cache-to: type=gha,mode=max,scope=backend-image
+          provenance: mode=max
+      - name: Select the immutable image digest
+        env:
+          EXISTING_DIGEST: ${{ steps.existing.outputs.digest }}
+          BUILT_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          python - <<'PY'
+          import os, re
+          digest = os.environ['EXISTING_DIGEST'] or os.environ['BUILT_DIGEST']
+          if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
+              raise SystemExit('No valid immutable image digest was produced')
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f'IMAGE_DIGEST={digest}\n')
+          PY
+      - name: Pull exactly the amd64 image being promoted
+        run: docker pull --platform linux/amd64 "${REGISTRY_IMAGE}@${IMAGE_DIGEST}"
+      - name: Check the isolated image and locked frontend
+        run: python scripts/image_smoke.py --image "${REGISTRY_IMAGE}@${IMAGE_DIGEST}"
+      - name: Promote the verified multi-platform digest
+        run: docker buildx imagetools create --tag "${REGISTRY_IMAGE}:latest" "${REGISTRY_IMAGE}@${IMAGE_DIGEST}"
+      - name: Retain smoke evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/image-smoke/
+          if-no-files-found: ignore
+          retention-days: 14
