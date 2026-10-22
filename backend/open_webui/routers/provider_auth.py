@@ -15,7 +15,12 @@ from fastapi.responses import FileResponse
 from open_webui.internal.db import Base, get_async_db_context, get_async_session
 from open_webui.models.provider_connections import ProviderConnection
 from open_webui.utils.auth import get_verified_user
-from open_webui.utils.chatgpt_auth import REQUIRED_SCOPES, normalize_token_response, revoke_chatgpt_session, validate_id_token
+from open_webui.utils.chatgpt_auth import (
+    REQUIRED_SCOPES,
+    normalize_token_response,
+    revoke_chatgpt_session,
+    validate_id_token,
+)
 from open_webui.utils.providers import (
     create_provider_connection,
     delete_provider_connection,
@@ -115,9 +120,14 @@ def _safe_redirect_uri(value: str) -> bool:
     try:
         parsed = urlsplit(value)
         return (
-            parsed.scheme == 'http' and parsed.hostname == '127.0.0.1' and parsed.port is not None
-            and parsed.path == '/auth/callback' and not parsed.query and not parsed.fragment
-            and parsed.username is None and parsed.password is None
+            parsed.scheme == 'http'
+            and parsed.hostname == '127.0.0.1'
+            and parsed.port is not None
+            and parsed.path == '/auth/callback'
+            and not parsed.query
+            and not parsed.fragment
+            and parsed.username is None
+            and parsed.password is None
         )
     except ValueError:
         return False
@@ -210,11 +220,13 @@ async def pair_local_helper(form: PairForm, request: Request, db: AsyncSession =
     now = int(time.time())
     pairing_hash = _hash(form.pairing_code.upper())
     attempt = await db.scalar(
-        select(ChatGPTAuthAttempt).where(
+        select(ChatGPTAuthAttempt)
+        .where(
             ChatGPTAuthAttempt.pairing_code_hash == pairing_hash,
             ChatGPTAuthAttempt.status == 'pending',
             ChatGPTAuthAttempt.expires_at > now,
-        ).with_for_update()
+        )
+        .with_for_update()
     )
     if not attempt or attempt.state:
         raise HTTPException(404, 'Pairing code is invalid, expired, or already used')
@@ -320,7 +332,10 @@ async def complete_chatgpt_auth(
         if attempt.expected_subject and claims['sub'] != attempt.expected_subject:
             raise HTTPException(400, 'The selected ChatGPT account changed during reauthorization')
         credentials = normalize_token_response(
-            token, claims, client_id=form.client_id, host_id=attempt.host_id,
+            token,
+            claims,
+            client_id=form.client_id,
+            host_id=attempt.host_id,
             granted_scope=form.granted_scope,
         )
         if not REQUIRED_SCOPES.issubset(set(credentials['scopes'])):
@@ -330,13 +345,19 @@ async def complete_chatgpt_auth(
         await db.commit()
         raise
     from open_webui.models.users import Users
+
     owner = await Users.get_user_by_id(attempt.owner_id, db=db)
     if not owner:
         attempt.status = 'failed'
         await db.commit()
         raise HTTPException(404, 'Owner account no longer exists')
     connection = None
-    config = {'host_id': attempt.host_id, 'client_id': form.client_id, 'subject': credentials['subject'], 'model_ids': []}
+    config = {
+        'host_id': attempt.host_id,
+        'client_id': form.client_id,
+        'subject': credentials['subject'],
+        'model_ids': [],
+    }
     if attempt.connection_id:
         connection = await get_provider_connection(attempt.connection_id, owner, db=db)
         if not connection or connection.owner_id != attempt.owner_id:
@@ -371,7 +392,9 @@ async def get_chatgpt_auth_status(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    attempt = await db.scalar(select(ChatGPTAuthAttempt).where(ChatGPTAuthAttempt.id == attempt_id, ChatGPTAuthAttempt.owner_id == user.id))
+    attempt = await db.scalar(
+        select(ChatGPTAuthAttempt).where(ChatGPTAuthAttempt.id == attempt_id, ChatGPTAuthAttempt.owner_id == user.id)
+    )
     if not attempt:
         raise HTTPException(404, 'Authorization attempt not found')
     if attempt.status in ('pending', 'processing') and attempt.expires_at <= int(time.time()):
@@ -387,7 +410,11 @@ async def cancel_chatgpt_auth(
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
-    attempt = await db.scalar(select(ChatGPTAuthAttempt).where(ChatGPTAuthAttempt.id == attempt_id, ChatGPTAuthAttempt.owner_id == user.id).with_for_update())
+    attempt = await db.scalar(
+        select(ChatGPTAuthAttempt)
+        .where(ChatGPTAuthAttempt.id == attempt_id, ChatGPTAuthAttempt.owner_id == user.id)
+        .with_for_update()
+    )
     if not attempt:
         raise HTTPException(404, 'Authorization attempt not found')
     if attempt.status == 'complete':
@@ -419,4 +446,3 @@ async def disconnect_chatgpt(
     await db.commit()
     await delete_provider_connection(connection_id, user, db=db)
     return {'status': 'disconnected', 'revocation_confirmed': revocation_confirmed}
-
