@@ -62,20 +62,51 @@ def git(*args):
     return subprocess.check_output(['git', *args], text=True).strip()
 
 
+def latest_frontend():
+    """Select by main history, not Release creation order or latest (which may be an APK)."""
+    candidates = {}
+    for page in range(1, 11):
+        releases = api(f'/repos/{FRONTEND}/releases?per_page=100&page={page}')
+        for release in releases:
+            tag = release['tag_name']
+            if not release['draft'] and not release['prerelease'] and re.fullmatch(r'frontend-[0-9a-f]{12}', tag):
+                candidates[tag[9:]] = release
+        if len(releases) < 100:
+            break
+    else:
+        raise ValueError('Too many releases to resolve safely')
+    if not candidates:
+        return None
+    for page in range(1, 101):
+        commits = api(f'/repos/{FRONTEND}/commits?sha=main&per_page=100&page={page}')
+        for commit in commits:
+            sha = commit['sha']
+            release = candidates.get(sha[:12])
+            if release:
+                return sha, release
+        if len(commits) < 100:
+            break
+    raise ValueError('No published frontend bundle belongs to main history')
+
+
+def product_changed(before, after):
+    """Ignore documentation/config-only commits when deciding whether to rebuild an image."""
+    files = git('diff', '--name-only', before, after).splitlines()
+    return any(not (name.startswith(('docs/', '.devcontainer/')) or name.lower().endswith('.md') or
+                    Path(name).name.startswith(('LICENSE', 'COPYING', 'NOTICE'))) for name in files)
+
+
 def main():
     if os.environ['GITHUB_REF'] != 'refs/heads/main':
         raise ValueError('Pipeline synchronization must run on main')
-    sha = git('ls-remote', f'https://github.com/{FRONTEND}.git', 'refs/heads/main').split()[0]
-    tag = 'frontend-' + sha[:12]
-    try:
-        release = api(f'/repos/{FRONTEND}/releases/tags/{tag}')
-    except urllib.error.HTTPError as error:
-        if error.code != 404:
-            raise
+    resolved = latest_frontend()
+    if resolved is None:
         if '--check' in sys.argv:
-            raise ValueError('Frontend main is not published yet; run frontend-sync after its release succeeds')
-        print('Frontend main has not passed its release pipeline yet. Downstream builds wait for the next sync.')
+            raise ValueError('No verified frontend has been published')
+        print('Waiting for the first verified frontend bundle.')
         return
+    sha, release = resolved
+    tag = 'frontend-' + sha[:12]
     if release['draft'] or release['prerelease'] or release['tag_name'] != tag:
         raise ValueError('Frontend release is not a stable published bundle')
     prefix = f'https://github.com/{FRONTEND}/releases/download/{tag}/'
@@ -85,16 +116,16 @@ def main():
             raise ValueError('Missing or unexpected frontend release asset: ' + name)
     current = json.loads(Path('frontend.lock.json').read_text())
     lock = make_lock(current, sha, request(assets['frontend-manifest.json']), request(assets['SHA256SUMS']))
-    # An older queued sync must never roll a consumer back after frontend main advances.
-    if git('ls-remote', f'https://github.com/{FRONTEND}.git', 'refs/heads/main').split()[0] != sha:
+    # Re-resolve published products, so a docs/native-only main commit never blocks consumers.
+    if latest_frontend()[0] != sha:
         if '--check' in sys.argv:
-            raise ValueError('Frontend main advanced; retry after synchronization')
-        print('Frontend main advanced during resolution; waiting for its next successful release.')
+            raise ValueError('Published frontend advanced; retry after synchronization')
+        print('Published frontend advanced during resolution; waiting for the next sync.')
         return
     if '--check' in sys.argv:
         if lock != current:
             raise ValueError('Stale frontend.lock.json; run frontend-sync before building')
-        print('Verified latest published frontend: ' + sha)
+        print('Verified latest published frontend product: ' + sha)
         return
     changed = lock != current
     if changed:
@@ -111,16 +142,12 @@ def main():
     if git('ls-remote', 'origin', 'refs/heads/main').split()[0] != head:
         print('Consumer main advanced; the newer push/scheduled sync will handle it.')
         return
-    # Android release preparation creates a version-bump commit. It belongs to
-    # the existing run, and must not start a new release on every scheduled sync.
-    marker = re.search(r'^openwebui-release-run:([0-9]+)$', git('log', '-1', '--format=%B'), re.MULTILINE)
-    if workflow == 'android.yml' and marker and not changed:
-        print('Release preparation already belongs to run ' + marker[1] + '; retry that run if needed.')
-        return
-    runs = api(f'/repos/{repo}/actions/workflows/{workflow}/runs?head_sha={head}&event=workflow_dispatch&per_page=1')['workflow_runs']
+    runs = api(f'/repos/{repo}/actions/workflows/{workflow}/runs?event=workflow_dispatch&branch=main&per_page=1')['workflow_runs']
+    previous = runs[0]['head_sha'] if runs else None
+    needs_build = changed or not previous or product_changed(previous, head)
     # Recover a commit whose dispatch failed; never repeatedly rebuild failed runs on a timer.
     force = os.environ.get('PIPELINE_FORCE') == 'true'
-    if not runs or force:
+    if needs_build or force:
         api(f'/repos/{repo}/actions/workflows/{workflow}/dispatches', {'ref': 'main'})
         message = f'Dispatched {workflow} for {head}; frontend {sha}.'
     else:

@@ -28,6 +28,7 @@ LOCK = sync.make_lock(CURRENT, SHA, MANIFEST, CHECKSUMS)
 class SyncTests(unittest.TestCase):
     def run_sync(self, current=None, runs=None, release_missing=False, marker='', workflow='backend.yml', force=False, check=False, git_failure=False, consumer_head=HEAD, frontend_heads=None):
         calls = []
+        resolved_release = dict(draft=False, prerelease=False, tag_name='frontend-' + SHA[:12], assets=[dict(name=name, browser_download_url=f'https://github.com/{sync.FRONTEND}/releases/download/frontend-{SHA[:12]}/'+name) for name in ['open-webui-frontend.zip', 'frontend-manifest.json', 'SHA256SUMS']])
         heads = iter(frontend_heads or [SHA, SHA])
         prefix = f'https://github.com/{sync.FRONTEND}/releases/download/frontend-{SHA[:12]}/'
         def api(route, data=None):
@@ -42,7 +43,7 @@ class SyncTests(unittest.TestCase):
             if route.endswith('/commits/main'):
                 return {'sha': HEAD}
             if '/runs?' in route:
-                return {'workflow_runs': runs or []}
+                return {'workflow_runs': [{**run, 'head_sha': HEAD} for run in (runs or [])]}
             if route.endswith('/dispatches'):
                 return None
             raise AssertionError(route)
@@ -54,6 +55,8 @@ class SyncTests(unittest.TestCase):
                 return next(heads) + '\trefs/heads/main'
             if args[:2] == ('ls-remote', 'origin'):
                 return consumer_head + '\trefs/heads/main'
+            if args[0] == 'diff':
+                return ''
             if args[0] == 'log':
                 return marker
             return HEAD
@@ -67,7 +70,7 @@ class SyncTests(unittest.TestCase):
                            PIPELINE_FORCE='true' if force else 'false')
                 with patch.dict(os.environ, env), patch.object(sync, 'api', side_effect=api), \
                      patch.object(sync, 'request', side_effect=lambda url: MANIFEST if url.endswith('.json') else CHECKSUMS), \
-                     patch.object(sync, 'git', side_effect=git), patch.object(sys, 'argv', ['sync_frontend.py'] + (['--check'] if check else [])), \
+                     patch.object(sync, 'latest_frontend', side_effect=lambda: None if release_missing else (next(heads), resolved_release)), patch.object(sync, 'git', side_effect=git), patch.object(sys, 'argv', ['sync_frontend.py'] + (['--check'] if check else [])), \
                      contextlib.redirect_stdout(io.StringIO()):
                     sync.main()
                 result = json.loads(Path('frontend.lock.json').read_text())
@@ -111,14 +114,6 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(any(call[0].endswith('/dispatches') for call in calls))
         self.assertFalse(any(call[0] == 'git' and call[1][0] == 'commit' for call in calls))
 
-    def test_version_bump_does_not_cause_infinite_android_releases(self):
-        calls, _ = self.run_sync(current=LOCK, workflow='android.yml', marker='chore(release): v1.0.0\n\nopenwebui-release-run:123')
-        self.assertFalse(any(call[0].endswith('/dispatches') for call in calls))
-
-    def test_new_frontend_can_follow_an_android_version_bump(self):
-        calls, _ = self.run_sync(workflow='android.yml', marker='openwebui-release-run:123')
-        self.assertTrue(any(call[0].endswith('/dispatches') for call in calls))
-
     def test_manual_rebuild(self):
         calls, _ = self.run_sync(current=LOCK, runs=[{'html_url':'https://example.com/run'}], force=True)
         self.assertTrue(any(call[0].endswith('/dispatches') for call in calls))
@@ -129,7 +124,7 @@ class SyncTests(unittest.TestCase):
         self.run_sync(current=LOCK, check=True)
 
     def test_pending_frontend_rejects_direct_build(self):
-        with self.assertRaisesRegex(ValueError, 'not published'):
+        with self.assertRaisesRegex(ValueError, 'published'):
             self.run_sync(check=True, release_missing=True)
 
     def test_push_conflict_stops_pipeline(self):
@@ -148,6 +143,31 @@ class SyncTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'duplicate'):
             sync.make_lock(CURRENT, SHA, MANIFEST, CHECKSUMS + CHECKSUMS)
 
+
+
+
+class ProductResolutionTests(unittest.TestCase):
+    def test_docs_and_native_commits_do_not_hide_published_web(self):
+        release = dict(tag_name='frontend-' + SHA[:12], draft=False, prerelease=False)
+        apk = dict(tag_name='v0.2.33', draft=False, prerelease=False)
+        def api(route, data=None):
+            if '/releases?' in route: return [apk, release]
+            if '/commits?' in route: return [{'sha': HEAD}, {'sha': SHA}]
+            raise AssertionError(route)
+        with patch.object(sync, 'api', side_effect=api):
+            self.assertEqual(sync.latest_frontend(), (SHA, release))
+
+    def test_source_history_wins_over_release_creation_order(self):
+        old = dict(tag_name='frontend-' + HEAD[:12], draft=False, prerelease=False)
+        new = dict(tag_name='frontend-' + SHA[:12], draft=False, prerelease=False)
+        with patch.object(sync, 'api', side_effect=[[old, new], [{'sha': SHA}, {'sha': HEAD}]]):
+            self.assertEqual(sync.latest_frontend(), (SHA, new))
+
+    def test_docs_only_backend_does_not_need_image(self):
+        with patch.object(sync, 'git', return_value='README.md\ndocs/CI.md\n.devcontainer/devcontainer.json'):
+            self.assertFalse(sync.product_changed(SHA, HEAD))
+        with patch.object(sync, 'git', return_value='backend/open_webui/main.py'):
+            self.assertTrue(sync.product_changed(SHA, HEAD))
 
 if __name__ == '__main__':
     unittest.main()

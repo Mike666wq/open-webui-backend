@@ -1,3 +1,5 @@
+> 两仓库更新：Android 已归入 frontend；后端同步解析 main 历史中的最新已发布 frontend-* 产品，忽略 APK Release 和文档提交。文档变化不会重复构建镜像。
+
 # 后端检查、镜像与串联交付
 
 共同进度见 [PROJECT_STATUS.md](PROJECT_STATUS.md)，日常操作见 [CLOUD_DEVELOPMENT.md](CLOUD_DEVELOPMENT.md)。
