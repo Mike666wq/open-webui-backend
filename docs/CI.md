@@ -1,45 +1,57 @@
-# 后端检查与镜像交付
+# 后端检查、镜像与串联交付
 
-此仓库独立维护后端源码和 Docker 镜像，不同步官方 Git 历史，也不运行官方前端构建、Android 构建或服务器部署。创建工作流文件不会自动发布；只有代码提交并推送到对应 GitHub 分支后才会运行。
+共同进度见 [PROJECT_STATUS.md](PROJECT_STATUS.md)，日常操作见 [CLOUD_DEVELOPMENT.md](CLOUD_DEVELOPMENT.md)。
 
-## PR 与 main 检查
+## 实际入口
 
-`Backend / checks` 使用 Python 3.11，仅运行仓库边界／源码语法检查和 `tests` 下的标准库单元测试，无需安装完整机器学习依赖。
+- PR：`Backend` 运行只读源码/基础测试、SQLite 生命周期和 PostgreSQL 迁移检查，不推镜像。
+- main push、定时或手动：`Sync verified frontend and build` 检查前端当前 main 的 Release，校验并提交 frontend.lock.json，再显式派发 `backend.yml`。
+- `Backend` 正式镜像任务只在 main 的 workflow_dispatch 运行；不是“main push 直接编译镜像”。直接手动派发时也会检查前端锁是否过期。
+- `Test published image` 是额外的手动隔离冒烟入口，不发布镜像。
+
+当前工作流分别为 .github/workflows/backend.yml、frontend-sync.yml、test-image.yml。全部使用本仓库 GITHUB_TOKEN，不需要生产 SSH 密钥或跨仓库写入 PAT。
+
+## 自动检查与镜像提升
+
+1. Python 3.11 运行源码边界/语法与标准库基础测试。
+2. 固定官方运行时容器运行 SQLite 资源生命周期和 PostgreSQL 迁移检查；这些检查独立于开发者本地依赖。
+3. 下载并逐文件校验锁定的前端，基于 Dockerfile 中不可变的官方依赖镜像构建 linux/amd64 和 linux/arm64。
+4. 推送 `ghcr.io/mike666wq/open-webui-backend:sha-<完整源码SHA>`。同一源码已有标签时复用其 digest，不覆盖它。
+5. 按不可变 digest 拉取 amd64，检查健康、基线版本、前端全部摘要、首页/聊天深链、JS/CSS 与缺失资源 404。
+6. 使用 compose.test.yml 的独立测试数据运行健康及首次测试注册登录；临时账号与卷不属于生产。
+7. 仅前述检查全部成功才把同一多架构 digest 推广为 latest。arm64 构建成功不等于真实 arm64 机器运行已验收。
+
+镜像 SHA、BUILD_HASH、OCI revision 和前端身份可追溯；镜像内 /app/frontend.lock.json 与 /app/build/frontend-manifest.json 保留来源。候选 sha 标签存在不代表 latest 或生产已通过。
+
+## 并发、失败与重试
+
+PR 新提交可取消旧检查；main 发布串行，不取消已经开始的发布。镜像/冒烟失败时不会提升 latest。优先重跑失败 job；源码修复应生成新的提交和不可变标签。同步 non-force push 遇到并发/保护规则时不会覆盖 main。
+
+基础检查也可在具备 Python 的机器运行：
 
 ```sh
 python3 scripts/check_source.py
 python3 -m unittest discover -s tests -v
 ```
 
-PR 只有只读 `contents` 权限，不登录镜像仓库。PR 新提交会取消旧检查；main 的镜像运行排队，不取消已经开始的发布。
+本地资源有限时不必执行完整依赖安装、镜像编译或数据库集成测试；Actions 会执行相应检查。
 
-## main 镜像发布
+## 手动镜像测试
 
-main push 的检查通过后，工作流执行以下步骤：
+Actions → Test published image，选匹配所选分支 frontend.lock.json 的 latest、sha-<完整SHA> 或 sha256:<digest>。脚本校验输入后解析为不可变引用，再运行隔离冒烟。
 
-1. 按 `frontend.lock.json` 下载并校验已发布的 DIY 前端，不重新编译前端。
-2. 使用 Dockerfile 固定的官方基线镜像，覆盖本仓库后端源码和锁定前端资源，构建 `linux/amd64`、`linux/arm64`；构建层使用 GitHub Actions 缓存。
-3. 将镜像推送为 `ghcr.io/mike666wq/open-webui-backend:sha-<完整源码 SHA>`，随后通过不可变的 registry digest 拉取同一镜像的 amd64 版本。
-4. 在隔离容器中验收后端健康、基线版本、全部前端文件摘要、首页、聊天深链接、JS/CSS 和缺失资源的 404。成功后才把同一个多架构 digest 推广为 `latest`。
-
-已有的 `sha-<SHA>` 标签不会覆盖。重试运行复用其 digest 并重新验收；如果镜像代码需要修复，提交新源码以生成新 SHA。构建或冒烟检查失败时保留源码标签用于诊断，`latest` 保持原值。`sha-<SHA>` 在冒烟成功前只代表候选镜像，不代表生产验收通过。
-
-源码 SHA 写入 `BUILD_HASH` 和 OCI revision label；前端 SHA 写入 `FRONTEND_COMMIT`。镜像内的 `/app/frontend.lock.json` 和 `/app/build/frontend-manifest.json` 保留完整资源身份。CI 只在镜像任务申请 `packages: write`，使用仓库内置 `GITHUB_TOKEN`，无需生产服务器密钥。
-
-首次发布后，仓库管理员按需要将 GHCR package visibility 设为 public。推送权限和包可见性是 GitHub/GHCR 配置，不由应用代码更改。
-
-## 隔离镜像冒烟
-
-以下命令要求 Docker 已启动，镜像已拉取或本地构建：
+单独运行需要 Docker 已启动且镜像已拉取：
 
 ```sh
 python3 scripts/image_smoke.py --image ghcr.io/mike666wq/open-webui-backend@sha256:<实际摘要>
 ```
 
-检查使用随机容器名、独立命名数据卷和仅向 `127.0.0.1` 发布随机端口的 bridge 网络。该网络关闭 IP masquerade 并把容器 DNS 指向黑洞，使容器无外网；端口映射独立生效，仅绑定宿主机回环。不挂载现有数据库，不连接生产服务，不注册账号，也不发送业务消息。停止容器后删除其临时数据卷和网络。
+image_smoke 使用随机容器/卷/网络、回环随机端口、阻断出网的测试网络，不挂载生产数据、不注册业务账号；独立 compose 环境检查则另行创建一次性合成测试账号。两种测试的目的和证据分别保留，不混称为真实用户联调。
 
-报告、后端日志和容器状态保存在 `artifacts/image-smoke/`，不记录容器环境中的临时密钥。GitHub 保存这些证据 14 天；失败不会覆盖 `latest`。当前只做 amd64 运行验收，arm64 经过镜像构建检查，不声称已经完成 arm64 设备运行或生产数据迁移验收。
+报告位于 artifacts/image-smoke/ 和 artifacts/compose-test/；正式构建保留14天，手动镜像测试保留7天。不上传实际用户数据或容器环境密钥。
 
-## 发布边界
+## 当前验收与发布边界
 
-镜像推送不等于服务器切换。生产配置、数据库迁移、完整备份、恢复演练与切换仍需独立实施和确认。此脚手架不包含资源回收站业务，也不会清理任何现有用户数据。
+[run 39722585622](https://github.com/Mike666wq/open-webui-backend/actions/runs/39722585622) 已通过以上正式镜像门禁。资源生命周期代码已经合入，不能再称为“仅空脚手架”；真实多人/多设备和生产副本演练仍待完成，见 [RESOURCE_MANAGEMENT.md](RESOURCE_MANAGEMENT.md)。
+
+GHCR 包的可见性由仓库管理员配置；镜像发布不等于服务器已切换。生产备份、迁移、恢复演练和部署另行安排。本流程不会自动清理任何现有生产数据。Codespaces 仍未通过实际启动验收，当前暂停使用。

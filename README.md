@@ -1,4 +1,4 @@
-> 云端开发和前端 → 后端镜像 / APK 串联构建，见 [云端开发说明](docs/CLOUD_DEVELOPMENT.md)。
+> 三仓库共同进度见 [当前进度](docs/PROJECT_STATUS.md)，操作方式见 [GitHub 构建与人工验收](docs/CLOUD_DEVELOPMENT.md)。Codespaces 当前暂停使用，尚未验收可用。
 
 # Open WebUI Backend
 
@@ -14,7 +14,11 @@
 
 本仓库不重复维护 Svelte 组件。根 `package.json` 和 `CHANGELOG.md` 是官方后端读取版本所需的元数据，不用它们运行 `npm install`。`pyproject.toml`、`uv.lock`、`hatch_build.py` 保留用于依赖和来源审计；本仓库不使用官方 wheel 构建流程。
 
-## 本地开发
+## 推荐开发方式
+
+本地只编辑和推送；GitHub Actions 执行源码、生命周期、迁移检查和镜像构建。前端已发布成功后，本仓库同步 `frontend.lock.json`，显式派发 Backend 工作流；验收通过才更新 GHCR latest。人工验收拉取已构建镜像，使用独立测试数据。Codespaces 暂停使用。
+
+## 可选本地源码开发
 
 使用 **Python 3.11 或 3.12**，建议 3.11。首次准备依赖：
 
@@ -54,11 +58,11 @@ docker build -t open-webui-backend:dev .
 
 镜像基于固定摘要的同版官方标准 CPU 镜像，继承其依赖后完整替换 Python 源码和 DIY 前端。若修改官方 requirements，需要相应调整镜像安装层；来源检查会阻止只改依赖声明而复用旧运行环境。生产切换还需核对实际使用的 CPU/CUDA/Ollama/slim 变体。
 
-仓库只配置自己的后端检查与 GHCR 镜像发布，不构建 APK，不重复构建 Svelte，也不自动部署生产。流程见 [CI.md](docs/CI.md)。
+本仓库负责后端检查和 GHCR 镜像；它与客户端共享前端版本锁，但不重复编译 Svelte、不构建 APK，也不自动部署生产。流程见 [CI.md](docs/CI.md)。
 
 ## 当前阶段与数据边界
 
-当前提交准备的是后端开发与镜像基础，不代表七天回收站、资源统计或自动清理已经完成。后续按 [RESOURCE_MANAGEMENT.md](docs/RESOURCE_MANAGEMENT.md) 分阶段开发，先本地展示，再 CI 验证和发布。
+资源生命周期 API、模型、增量迁移和隔离测试已合入；SQLite 生命周期与 PostgreSQL 迁移检查已有 GitHub 成功记录，镜像发布及独立测试环境注册登录也已通过。它们不代表真实多人/多设备、生产副本迁移和空间回收已全面验收。需求与剩余验收见 [RESOURCE_MANAGEMENT.md](docs/RESOURCE_MANAGEMENT.md)。
 
 正式切换镜像前必须确认数据挂载、数据库、向量／对象存储和原有 secret，做完整一致性备份并在独立副本演练。原服务地址和数据可继续使用；启动本地测试或创建镜像不会迁移或清理生产数据。
 
