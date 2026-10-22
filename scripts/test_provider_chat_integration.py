@@ -83,6 +83,8 @@ async def verify():
                 )
 
             admin = await signup('provider-admin')
+            config = await call('GET', '/api/config', token=admin['token'])
+            assert config['features']['enable_provider_connections'] is True
             await Config.upsert({'ui.enable_signup': True})
             alice, bob = await signup('provider-alice'), await signup('provider-bob')
             for account in (alice, bob):

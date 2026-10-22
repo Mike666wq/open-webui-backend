@@ -43,6 +43,6 @@ python scripts/test_provider_chat_integration.py
 
 后两项使用项目后端依赖，可在现有 GitHub Actions 运行时容器内执行。真实 ChatGPT 授权和厂商 Key 的最终人工验证仍需账号所有者参与；自动测试通过不表示已验证真实套餐资格。
 
-开发与发布仍只有 frontend/backend 两个仓库：前端发布验证后的资源与 APK，后端再更新前端锁定版本、验证并构建镜像。本改造不需要恢复 client 仓库。
+开发与发布仍只有 frontend/backend 两个仓库：前端发布验证后的资源与 APK，后端再更新前端锁定版本、验证并构建镜像。本改造不需要恢复 client 仓库。前端通过后端配置中的 `enable_provider_connections` 能力标记显示新入口，因此先更新前端、稍后更新后端时仍保持旧页面可用。
 
 协议细节见 [ChatGPT 授权说明](chatgpt-siwc-provider.md)。
