@@ -67,6 +67,27 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, [{'id': 'gpt-image-test', 'name': 'gpt-image-test'}])
         session.assert_not_awaited()
 
+    async def test_image_request_cannot_override_the_admin_media_model(self):
+        config = SimpleNamespace(
+            IMAGE_GENERATION_ENGINE='provider',
+            IMAGES_PROVIDER_CONNECTION_ID='saved',
+            IMAGE_GENERATION_MODEL='allowed-image',
+            IMAGE_SIZE='1024x1024',
+        )
+        with (
+            patch.object(images, 'get_image_config', new=AsyncMock(return_value=config)),
+            patch.object(
+                images, 'get_media_api_connection', new=AsyncMock(return_value=(self.connection, 'saved-key'))
+            ),
+            patch.object(images, 'media_http_session') as session,
+        ):
+            with self.assertRaises(HTTPException) as denied:
+                await images.image_generations(
+                    None, images.CreateImageForm(prompt='test', model='other-model'), user=self.owner
+                )
+            self.assertEqual(denied.exception.status_code, 400)
+            session.assert_not_called()
+
     async def test_generation_and_edit_forward_saved_key_and_store_image(self):
         buffer = io.BytesIO()
         Image.new('RGB', (1, 1)).save(buffer, format='PNG')

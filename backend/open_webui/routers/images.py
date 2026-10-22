@@ -651,13 +651,11 @@ async def image_generations(
 
     metadata = metadata or {}
 
-    model = (
-        (form_data.model or image_config.IMAGE_GENERATION_MODEL)
-        if media_connection
-        else await get_image_model(request)
-    )
+    model = image_config.IMAGE_GENERATION_MODEL if media_connection else await get_image_model(request)
     if media_connection and not model:
         raise HTTPException(400, 'Select an image model for this provider connection')
+    if media_connection and form_data.model and form_data.model != model:
+        raise HTTPException(400, 'Use the configured image model for this provider connection')
 
     try:
         if image_config.IMAGE_GENERATION_ENGINE == 'openai':
@@ -972,6 +970,12 @@ async def image_edits(
         width, height = tuple(map(int, size.split('x')))
 
     model = image_config.IMAGE_EDIT_MODEL if form_data.model is None else form_data.model
+    if media_connection:
+        if not image_config.IMAGE_EDIT_MODEL:
+            raise HTTPException(400, 'Select an image edit model for this provider connection')
+        if form_data.model and form_data.model != image_config.IMAGE_EDIT_MODEL:
+            raise HTTPException(400, 'Use the configured image edit model for this provider connection')
+        model = image_config.IMAGE_EDIT_MODEL
 
     try:
 
