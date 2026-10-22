@@ -7,7 +7,7 @@
 ## 实际入口
 
 - PR：`Backend` 运行只读源码/基础测试、SQLite 生命周期和 PostgreSQL 迁移检查，不推镜像。
-- main push、定时或手动：`Sync verified frontend and build` 检查前端当前 main 的 Release，校验并提交 frontend.lock.json，再显式派发 `backend.yml`。
+- main push、定时或手动：`Sync verified frontend and build` 解析前端 main 历史中最新成功发布的 frontend-* 产品，校验并提交 frontend.lock.json；仅产品输入变化或明确手动重建时派发 `backend.yml`。
 - `Backend` 正式镜像任务只在 main 的 workflow_dispatch 运行；不是“main push 直接编译镜像”。直接手动派发时也会检查前端锁是否过期。
 - `Test published image` 是额外的手动隔离冒烟入口，不发布镜像。
 

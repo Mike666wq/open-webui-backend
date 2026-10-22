@@ -8,11 +8,11 @@
 
 当前基线是 Open WebUI **0.12.2**、提交 `6a18585ff4c2e5f6805f682222cfbc46dc669ef8`。来源、归档摘要和镜像摘要记录在 [backend.upstream.json](backend.upstream.json)。官方许可、品牌资产和许可历史完整保留。
 
-## 三个项目的职责
+## 两个仓库的职责
 
 - `open-webui-frontend`：Svelte/Vite DIY 网页及已校验的静态资源发布。
 - `open-webui-backend`：Python API、资源管理后续开发、数据库迁移、后端镜像。
-- `open-webui-client`：Android 原生外壳、APK 签名与发布。
+- Android 原生外壳、APK 签名与发布已归入 `open-webui-frontend/apps/client/`；旧 client 仓库仅保留历史。
 
 本仓库不重复维护 Svelte 组件。根 `package.json` 和 `CHANGELOG.md` 是官方后端读取版本所需的元数据，不用它们运行 `npm install`。`pyproject.toml`、`uv.lock`、`hatch_build.py` 保留用于依赖和来源审计；本仓库不使用官方 wheel 构建流程。
 
