@@ -10,6 +10,7 @@ from sqlalchemy import delete
 
 from fastapi import HTTPException
 from open_webui.utils import chatgpt_auth, providers
+from open_webui.routers import provider_auth
 
 
 class ChunkedContent:
@@ -95,6 +96,32 @@ class ProviderTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(second.config['client_id'], 'oaiapp_second')
             await db.execute(
                 delete(providers.ProviderConnection).where(providers.ProviderConnection.owner_id == owner.id)
+            )
+            await db.commit()
+
+    async def test_disconnect_revokes_latest_rotated_token_not_stale_session(self):
+        owner = SimpleNamespace(id='disconnect-test-' + str(uuid4()))
+        async with get_async_db_context() as db:
+            connection = await providers.create_provider_connection(
+                owner,
+                {'client_id': 'oaiapp_test'},
+                db=db,
+                credentials={'client_id': 'oaiapp_test', 'refresh_token': 'old-token'},
+            )
+            await db.commit()
+            async with get_async_db_context() as other:
+                latest = await other.get(providers.ProviderConnection, connection.id)
+                latest.credential = providers.encrypt_credential(
+                    json.dumps({'client_id': 'oaiapp_test', 'refresh_token': 'new-token'})
+                )
+                await other.commit()
+            with patch.object(provider_auth, 'revoke_chatgpt_session', new=AsyncMock(return_value=True)) as revoke:
+                result = await provider_auth.disconnect_chatgpt(connection.id, owner, db)
+            self.assertTrue(result['revocation_confirmed'])
+            self.assertEqual(revoke.await_args.args[0]['refresh_token'], 'new-token')
+            self.assertIsNone(connection.credential)
+            await db.execute(
+                delete(providers.ProviderConnection).where(providers.ProviderConnection.id == connection.id)
             )
             await db.commit()
 

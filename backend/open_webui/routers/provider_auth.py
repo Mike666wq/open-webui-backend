@@ -435,6 +435,14 @@ async def disconnect_chatgpt(
     db: AsyncSession = Depends(get_async_session),
 ):
     connection = await get_provider_connection(connection_id, user, db=db)
+    # Serialize disconnect with refresh so revocation targets the latest rotated
+    # refresh token rather than a token superseded by another worker.
+    await db.execute(
+        update(ProviderConnection)
+        .where(ProviderConnection.id == connection_id, ProviderConnection.owner_id == user.id)
+        .values(updated_at=ProviderConnection.updated_at)
+    )
+    await db.refresh(connection)
     credentials = await get_oauth_credentials(connection, user, db=db)
     revocation_confirmed = await revoke_chatgpt_session(credentials)
     connection.config = {
