@@ -12,6 +12,7 @@ import tempfile
 
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import BigInteger, Column, MetaData, String, Table, Text, create_engine, inspect, select, text
 
 from dev_backend import REPO_ROOT, configuration
@@ -86,7 +87,7 @@ def verify(database_url: str, root: Path) -> None:
         indexes = {item["name"] for item in inspect(connection).get_indexes("resource_entry")}
         assert "ix_resource_visibility" in indexes, indexes
         version = connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-        assert version == "7b20d6e498af", version
+        assert version == ScriptDirectory.from_config(config).get_current_head(), version
     verification_engine.dispose()
 
 

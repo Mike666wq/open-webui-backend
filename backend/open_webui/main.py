@@ -175,6 +175,8 @@ from open_webui.routers import (
     ollama,
     openai,
     pipelines,
+    providers,
+    provider_auth,
     prompts,
     retrieval,
     scim,
@@ -264,6 +266,8 @@ from open_webui.utils.models import (
     get_all_base_models,
     get_all_models,
     get_filtered_models,
+    get_request_models,
+    load_provider_models,
 )
 from open_webui.utils.payload import apply_model_controls
 from open_webui.utils.oauth import (
@@ -889,6 +893,8 @@ app.mount('/ws', socket_app)
 
 app.include_router(ollama.router, prefix='/ollama', tags=['ollama'])
 app.include_router(openai.router, prefix='/openai', tags=['openai'])
+app.include_router(providers.router, prefix='/api/v1/providers', tags=['providers'])
+app.include_router(provider_auth.router, prefix='/api/v1/providers/auth/chatgpt', tags=['provider-auth'])
 
 
 app.include_router(pipelines.router, prefix='/api/v1/pipelines', tags=['pipelines'])
@@ -954,7 +960,7 @@ async def get_models(request: Request, refresh: bool = False, user=Depends(get_v
         model for model in all_models if not ('pipeline' in model and model['pipeline'].get('type', None) == 'filter')
     ]
 
-    # Chat requests resolve models by ID from request.app.state.MODELS, where
+    # Chat requests resolve models by ID from get_request_models(request), where
     # duplicate IDs collapse to the last model. Return the same effective list.
     models = list({model['id']: model for model in models}.values())
 
@@ -1140,7 +1146,7 @@ async def embeddings(request: Request, form_data: dict, user=Depends(get_verifie
         dict: OpenAI-compatible embeddings response.
     """
     # Make sure models are loaded in app state
-    if not request.app.state.MODELS:
+    if not get_request_models(request):
         await get_all_models(request, user=user)
     # Use generic dispatcher in utils.embeddings
     return await generate_embeddings(request, form_data, user)
@@ -1164,9 +1170,10 @@ async def chat_completion(
     form_data: dict,
     user=Depends(get_verified_user),
 ):
-    if not request.app.state.MODELS:
+    if not get_request_models(request):
         await get_all_models(request, user=user)
 
+    await load_provider_models(request, user)
     model_id = form_data.get('model', None)
     request.state.model_id = model_id
     model_item = form_data.pop('model_item', {})
@@ -1178,13 +1185,13 @@ async def chat_completion(
         fallback_model = None
         missing_base_model = False
         if not model_item.get('direct', False):
-            if model_id not in request.app.state.MODELS:
+            if model_id not in get_request_models(request):
                 raise Exception('Model not found')
 
-            model = request.app.state.MODELS[model_id]
+            model = get_request_models(request)[model_id]
             model_info = await Models.get_model_by_id(model_id)
             missing_base_model = bool(
-                model_info and model_info.base_model_id and model_info.base_model_id not in request.app.state.MODELS
+                model_info and model_info.base_model_id and model_info.base_model_id not in get_request_models(request)
             )
 
             if missing_base_model and ENABLE_CUSTOM_MODEL_FALLBACK:
@@ -1197,7 +1204,7 @@ async def chat_completion(
                     None,
                 )
                 if fallback_model_id:
-                    fallback_model = request.app.state.MODELS.get(fallback_model_id)
+                    fallback_model = get_request_models(request).get(fallback_model_id)
 
             # Check if user has access to the model
             if not BYPASS_MODEL_ACCESS_CONTROL and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL):
@@ -1865,7 +1872,7 @@ async def chat_completion(
             }
 
             # Resolve the model object for this specific model
-            resolved_model = request.app.state.MODELS.get(target_model_id, model)
+            resolved_model = get_request_models(request).get(target_model_id, model)
 
             # Only the first model runs chat-level background tasks;
             # subsequent models only run follow-ups.
