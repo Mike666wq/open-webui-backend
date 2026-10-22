@@ -28,3 +28,12 @@
 - [客户端前端锁](https://github.com/Mike666wq/open-webui-frontend/blob/main/apps/client/frontend.lock.json)
 - [后端流水线](https://github.com/Mike666wq/open-webui-backend/actions/workflows/backend.yml)
 - [后端前端锁](https://github.com/Mike666wq/open-webui-backend/blob/main/frontend.lock.json)
+
+## 本次迁移验收记录
+
+- 原签名迁移：[run 39759453405，第 3 次](https://github.com/Mike666wq/open-webui-client/actions/runs/39759453405/attempts/3) 成功；一次性入口已删除。
+- frontend 独立原生路径：[run 39760517628](https://github.com/Mike666wq/open-webui-frontend/actions/runs/39760517628) 成功，发布 v0.2.33/versionCode 200031。
+- 网页构建后复用同次产物打包：[run 39761599593](https://github.com/Mike666wq/open-webui-frontend/actions/runs/39761599593)，实时结果以该入口为准。
+- 后端消费同一新版网页：[run 39762613694](https://github.com/Mike666wq/open-webui-backend/actions/runs/39762613694)，实时结果以该入口为准。
+- 对齐的网页验收来源为 b1b7f63debb2032bd10cf86cbf9abf5db1ae0d6d；这是本次迁移的记录，不是永久的“最新版本”常量。
+- 临时迁移 Secret 可删除；专用 Token 可撤销，原签名配置继续保留。生产未自动部署，真机覆盖安装仍需人工验收。
