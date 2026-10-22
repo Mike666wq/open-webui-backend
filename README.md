@@ -1,6 +1,6 @@
 > 架构更新：目前只有 frontend（包含 Android 客户端）和 backend 两个开发仓库。见 [当前状态](docs/PROJECT_STATUS.md)。旧 client 自动同步已停用。
 
-> 三仓库共同进度见 [当前进度](docs/PROJECT_STATUS.md)，操作方式见 [GitHub 构建与人工验收](docs/CLOUD_DEVELOPMENT.md)。Codespaces 当前暂停使用，尚未验收可用。
+> 两仓库共同进度见 [当前进度](docs/PROJECT_STATUS.md)，操作方式见 [GitHub 构建与人工验收](docs/CLOUD_DEVELOPMENT.md)。Codespaces 当前暂停使用，尚未验收可用。
 
 # Open WebUI Backend
 
