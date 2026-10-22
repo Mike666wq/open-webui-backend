@@ -161,6 +161,10 @@ jobs:
         run: docker pull --platform linux/amd64 "${REGISTRY_IMAGE}@${IMAGE_DIGEST}"
       - name: Check the isolated image and locked frontend
         run: python scripts/image_smoke.py --image "${REGISTRY_IMAGE}@${IMAGE_DIGEST}"
+      - name: Verify the manual cloud test environment
+        env:
+          WEBUI_TEST_IMAGE: ${{ env.REGISTRY_IMAGE }}@${{ env.IMAGE_DIGEST }}
+        run: python scripts/test_compose_environment.py
       - name: Promote the verified multi-platform digest
         run: docker buildx imagetools create --tag "${REGISTRY_IMAGE}:latest" "${REGISTRY_IMAGE}@${IMAGE_DIGEST}"
       - name: Retain smoke evidence
@@ -168,6 +172,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: image-smoke-${{ github.run_id }}-${{ github.run_attempt }}
-          path: artifacts/image-smoke/
+          path: |
+            artifacts/image-smoke/
+            artifacts/compose-test/
           if-no-files-found: ignore
           retention-days: 14
