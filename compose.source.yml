@@ -1,0 +1,5 @@
+# Overlay only application source; keep the prebuilt runtime and frontend.
+services:
+  backend:
+    volumes:
+      - ./backend/open_webui:/app/backend/open_webui:ro

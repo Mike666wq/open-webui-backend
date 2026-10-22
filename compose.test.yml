@@ -1,0 +1,25 @@
+name: owui-dev
+services:
+  backend:
+    image: ${WEBUI_TEST_IMAGE:-ghcr.io/mike666wq/open-webui-backend:latest}
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      WEBUI_AUTH: "True"
+      ENABLE_SIGNUP: "True"
+      ENABLE_PERSISTENT_CONFIG: "False"
+      ENABLE_VERSION_UPDATE_CHECK: "False"
+      HF_HUB_OFFLINE: "1"
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "False"
+      RAG_RERANKING_MODEL_AUTO_UPDATE: "False"
+      WHISPER_MODEL_AUTO_UPDATE: "False"
+    volumes:
+      - test-data:/app/backend/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+volumes:
+  test-data:

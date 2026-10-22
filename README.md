@@ -1,3 +1,5 @@
+> 云端开发和前端 → 后端镜像 / APK 串联构建，见 [云端开发说明](docs/CLOUD_DEVELOPMENT.md)。
+
 # Open WebUI Backend
 
 这是 `Mike666wq` 自行维护的 Open WebUI 后端开发仓库。官方源码先以固定版本快照导入本地，在这里开发、验证后再提交；没有上游 GitHub 自动同步或官方发布工作流。
