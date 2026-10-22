@@ -58,6 +58,8 @@ async def verify():
         await call('GET', f'/api/v1/chats/{chat_id}', token=token, expected=401)
         listing = await call('GET', '/api/v1/resources/list?type=chat', token=token)
         assert listing['total'] == 0, listing
+        sidebar = await call('GET', '/api/v1/chats/list', token=token)
+        assert all(item['id'] != chat_id for item in sidebar), sidebar
         recycled = await call('GET', '/api/v1/resources/recycle-bin', token=token)
         assert len(recycled) == 1 and recycled[0]['original_id'] == chat_id
         # The old APK sends recycle-item IDs. Verify that compatibility path,
@@ -75,7 +77,7 @@ async def verify():
         await call('POST', '/api/v1/resources/restore', {'ids': [recycled[0]['id']], 'type': 'chat'}, token)
         await call('GET', f'/api/v1/chats/{chat_id}', token=token)
         passed = ['body_restore', 'legacy_recycle_id', 'idempotency', 'old_delete_route',
-                  'list_exclusion', 'deep_link_exclusion']
+                  'list_exclusion', 'deep_link_exclusion', 'sidebar_list_exclusion']
 
         async def preview(action, kind, rid, as_token=token, options=None):
             return await call('POST', '/api/v1/resources/preflight', {
