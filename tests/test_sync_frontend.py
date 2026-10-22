@@ -26,8 +26,9 @@ LOCK = sync.make_lock(CURRENT, SHA, MANIFEST, CHECKSUMS)
 
 
 class SyncTests(unittest.TestCase):
-    def run_sync(self, current=None, runs=None, release_missing=False, marker='', workflow='backend.yml', force=False, check=False, git_failure=False):
+    def run_sync(self, current=None, runs=None, release_missing=False, marker='', workflow='backend.yml', force=False, check=False, git_failure=False, consumer_head=HEAD, frontend_heads=None):
         calls = []
+        heads = iter(frontend_heads or [SHA, SHA])
         prefix = f'https://github.com/{sync.FRONTEND}/releases/download/frontend-{SHA[:12]}/'
         def api(route, data=None):
             calls.append((route, data))
@@ -49,6 +50,10 @@ class SyncTests(unittest.TestCase):
             calls.append(('git', args))
             if args[0] == 'push' and git_failure:
                 raise RuntimeError('non-fast-forward')
+            if args[:2] == ('ls-remote', f'https://github.com/{sync.FRONTEND}.git'):
+                return next(heads) + '\trefs/heads/main'
+            if args[:2] == ('ls-remote', 'origin'):
+                return consumer_head + '\trefs/heads/main'
             if args[0] == 'log':
                 return marker
             return HEAD
@@ -70,6 +75,20 @@ class SyncTests(unittest.TestCase):
                 os.chdir(old)
         return calls, result
 
+    def test_read_after_push_uses_git_refs_instead_of_cached_commit_api(self):
+        calls, _ = self.run_sync()
+        self.assertFalse(any(call[0].endswith('/commits/main') for call in calls))
+        self.assertIn(('git', ('ls-remote', 'origin', 'refs/heads/main')), calls)
+
+    def test_frontend_advancing_during_resolution_waits(self):
+        calls, result = self.run_sync(frontend_heads=[SHA, 'f' * 40])
+        self.assertEqual(result, CURRENT)
+        self.assertFalse(any(call[0].endswith('/dispatches') for call in calls))
+
+    def test_consumer_advancing_does_not_dispatch_unchecked_source(self):
+        calls, _ = self.run_sync(current=LOCK, consumer_head='f' * 40)
+        self.assertFalse(any(call[0].endswith('/dispatches') for call in calls))
+
     def test_new_release_commits_only_lock_before_dispatch(self):
         calls, result = self.run_sync()
         self.assertEqual(result, LOCK)
@@ -81,7 +100,7 @@ class SyncTests(unittest.TestCase):
     def test_pending_frontend_prevents_all_downstream_mutation(self):
         calls, result = self.run_sync(release_missing=True)
         self.assertEqual(result, CURRENT)
-        self.assertFalse(any(call[0] == 'git' or call[1] is not None for call in calls))
+        self.assertFalse(any(call[0] == 'git' and call[1][0] != 'ls-remote' or call[0] != 'git' and call[1] is not None for call in calls))
 
     def test_duplicate_schedule_does_not_build_again(self):
         calls, _ = self.run_sync(current=LOCK, runs=[{'html_url':'https://example.com/run'}])

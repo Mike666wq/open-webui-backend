@@ -65,7 +65,7 @@ def git(*args):
 def main():
     if os.environ['GITHUB_REF'] != 'refs/heads/main':
         raise ValueError('Pipeline synchronization must run on main')
-    sha = api(f'/repos/{FRONTEND}/commits/main')['sha']
+    sha = git('ls-remote', f'https://github.com/{FRONTEND}.git', 'refs/heads/main').split()[0]
     tag = 'frontend-' + sha[:12]
     try:
         release = api(f'/repos/{FRONTEND}/releases/tags/{tag}')
@@ -86,7 +86,7 @@ def main():
     current = json.loads(Path('frontend.lock.json').read_text())
     lock = make_lock(current, sha, request(assets['frontend-manifest.json']), request(assets['SHA256SUMS']))
     # An older queued sync must never roll a consumer back after frontend main advances.
-    if api(f'/repos/{FRONTEND}/commits/main')['sha'] != sha:
+    if git('ls-remote', f'https://github.com/{FRONTEND}.git', 'refs/heads/main').split()[0] != sha:
         if '--check' in sys.argv:
             raise ValueError('Frontend main advanced; retry after synchronization')
         print('Frontend main advanced during resolution; waiting for its next successful release.')
@@ -108,7 +108,7 @@ def main():
     head = git('rev-parse', 'HEAD')
     repo = os.environ['GITHUB_REPOSITORY']
     workflow = os.environ['DOWNSTREAM_WORKFLOW']
-    if api(f'/repos/{repo}/commits/main')['sha'] != head:
+    if git('ls-remote', 'origin', 'refs/heads/main').split()[0] != head:
         print('Consumer main advanced; the newer push/scheduled sync will handle it.')
         return
     # Android release preparation creates a version-bump commit. It belongs to
