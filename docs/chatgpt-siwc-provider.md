@@ -47,6 +47,13 @@ temperature, top-p, output-token limits, previous response IDs, and unsupported
 tools. The backend does not call Codex app-server or ChatGPT `backend-api`
 endpoints.
 
+SIWC plan OAuth does not authorize image generation tools, audio/video input,
+transcription endpoints, speech synthesis, or Realtime. Supported image/file
+**input** to a Responses model is distinct from generating a new image.
+Configure a separate API-key connection for images, speech, and transcription
+in the media settings. Realtime retains its dedicated API-key configuration.
+See the [provider guide](provider-connections.md) for setup.
+
 This is a preview integration. Supported models and tool behavior depend on the
 signed-in account, workspace policy, and OpenAI's current preview limits. SIWC
 plan usage shares the account's ChatGPT usage limits. Check the current official

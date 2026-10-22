@@ -4,7 +4,9 @@ import base64
 import hashlib
 import json
 import logging
+import platform
 import re
+import socket
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlsplit
@@ -15,7 +17,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
-from open_webui.env import WEBUI_SECRET_KEY
+from open_webui.env import VERSION, WEBUI_SECRET_KEY
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.provider_connections import ProviderConnection
 from open_webui.utils.apps import AppTCPConnector, validate_app_url
@@ -42,6 +44,12 @@ PROVIDER_CATALOG = [
     },
     {'id': 'custom', 'name': 'OpenAI-compatible', 'auth_types': ['api_key'], 'default_base_url': ''},
     {'id': 'chatgpt', 'name': 'ChatGPT', 'auth_types': ['oauth'], 'default_base_url': ''},
+    {
+        'id': 'kimi',
+        'name': 'Kimi Code',
+        'auth_types': ['oauth'],
+        'default_base_url': 'https://api.kimi.com/coding/v1',
+    },
 ]
 _DEFAULTS = {entry['id']: entry['default_base_url'] for entry in PROVIDER_CATALOG}
 _BAILIAN_REGIONS = {
@@ -98,7 +106,7 @@ def decrypt_credential(value: str | None) -> str | None:
 def public_connection(connection: ProviderConnection) -> dict:
     config = dict(connection.config or {})
     config.pop('_models_by_user', None)
-    for key in ('host_id', 'client_id', 'subject'):
+    for key in ('host_id', 'client_id', 'subject', 'device_id'):
         config.pop(key, None)
     return {
         'id': connection.id,
@@ -207,14 +215,51 @@ def _bailian_models_url(connection: ProviderConnection) -> str:
     return f'https://{_bailian_host(connection)}/api/v1/models'
 
 
+def kimi_device_headers(device_id: str | None = None) -> dict[str, str]:
+    """Return the stable, honest client identity expected by Kimi Code.
+
+    The device id is derived from the deployment secret so it survives worker
+    restarts without storing another credential. The platform is explicitly
+    Open WebUI; the adapter does not impersonate the official Kimi CLI.
+    """
+
+    if not device_id:
+        device_id = hashlib.sha256(f'open-webui-kimi-device:{WEBUI_SECRET_KEY}'.encode()).hexdigest()[:32]
+
+    def ascii_header(value: str, fallback: str = 'unknown') -> str:
+        cleaned = value.encode('ascii', errors='ignore').decode('ascii').strip()
+        return cleaned or fallback
+
+    system = platform.system() or 'Unknown'
+    machine = platform.machine() or 'unknown'
+    release = platform.release() or 'unknown'
+    model = ' '.join(part for part in (system, release, machine) if part).strip()
+    return {
+        'X-Msh-Platform': 'open_webui',
+        'X-Msh-Version': ascii_header(VERSION, 'unknown'),
+        'X-Msh-Device-Name': ascii_header(socket.gethostname()),
+        'X-Msh-Device-Model': ascii_header(model),
+        'X-Msh-Os-Version': ascii_header(platform.version()),
+        'X-Msh-Device-Id': ascii_header(device_id, 'unknown'),
+    }
+
+
+def provider_request_headers(connection: ProviderConnection, token: str) -> dict[str, str]:
+    headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
+    if connection.provider_id == 'kimi':
+        headers.update(kimi_device_headers((connection.config or {}).get('device_id')))
+    return headers
+
+
 async def _authorization(connection: ProviderConnection, user) -> str:
     if connection.auth_type == 'oauth':
         if connection.status == 'disconnected' or not connection.credential:
             raise HTTPException(401, 'Reconnect this provider account')
-        # OAuth implementation owns token refresh. Expected adapter contract:
-        # async get_provider_access_token(connection, user) -> bearer token.
         try:
-            from open_webui.utils.chatgpt_auth import get_provider_access_token
+            if connection.provider_id == 'kimi':
+                from open_webui.utils.kimi_auth import get_provider_access_token
+            else:
+                from open_webui.utils.chatgpt_auth import get_provider_access_token
 
             return await get_provider_access_token(connection, user)
         except HTTPException:
@@ -251,7 +296,7 @@ def provider_http_error(status: int) -> HTTPException:
 
 async def _request_json(connection: ProviderConnection, user, url: str, *, method='GET', body=None, params=None):
     token = await _authorization(connection, user)
-    headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
+    headers = provider_request_headers(connection, token)
     if body is not None:
         headers['Content-Type'] = 'application/json'
     try:
@@ -538,10 +583,10 @@ async def provider_chat_completion(model_id: str, payload: dict, user, db: Async
             body = convert_to_responses_payload(body)
             body['model'] = resolved.upstream_model_id
             target_path = '/responses'
-            headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+            headers = {**provider_request_headers(connection, token), 'Content-Type': 'application/json'}
         else:
             target_path = '/chat/completions'
-            headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+            headers = {**provider_request_headers(connection, token), 'Content-Type': 'application/json'}
         target_url = f'{provider_base_url(connection)}{target_path}'
         allow_private = validate_app_url(target_url)
         session = aiohttp.ClientSession(
@@ -574,7 +619,9 @@ async def provider_chat_completion(model_id: str, payload: dict, user, db: Async
             if key.lower() in ('cache-control', 'x-request-id', 'openai-processing-ms')
         }
         headers.setdefault('Cache-Control', 'no-cache')
-        return StreamingResponse(chunks(), status_code=response.status, media_type='text/event-stream', headers=headers)
+        return StreamingResponse(
+            chunks(), status_code=response.status, media_type='text/event-stream', headers=headers
+        )
     try:
         raw = await read_bounded_response(response)
         if len(raw) > 2_000_000:
@@ -622,13 +669,19 @@ async def provider_chat_completion(model_id: str, payload: dict, user, db: Async
         await session.close()
 
 
-async def get_oauth_credentials(connection: ProviderConnection, user, db: AsyncSession | None = None) -> dict:
+async def get_oauth_credentials(
+    connection: ProviderConnection,
+    user,
+    db: AsyncSession | None = None,
+    *,
+    provider_id: str = 'chatgpt',
+) -> dict:
     """Read the encrypted OAuth credential document for its owner."""
     async with _provider_db_scope(db) as session:
         current = await session.get(ProviderConnection, connection.id)
         if (
             not current
-            or current.provider_id != 'chatgpt'
+            or current.provider_id != provider_id
             or current.auth_type != 'oauth'
             or current.owner_id != user.id
         ):
@@ -644,14 +697,19 @@ async def get_oauth_credentials(connection: ProviderConnection, user, db: AsyncS
 
 
 async def replace_oauth_credentials(
-    connection: ProviderConnection, user, credentials: dict, db: AsyncSession | None = None
+    connection: ProviderConnection,
+    user,
+    credentials: dict,
+    db: AsyncSession | None = None,
+    *,
+    provider_id: str = 'chatgpt',
 ) -> ProviderConnection:
     """Atomically replace the encrypted OAuth credential document."""
     async with _provider_db_scope(db) as session:
         current = await session.get(ProviderConnection, connection.id, with_for_update=True)
         if (
             not current
-            or current.provider_id != 'chatgpt'
+            or current.provider_id != provider_id
             or current.auth_type != 'oauth'
             or current.owner_id != user.id
         ):
@@ -665,12 +723,18 @@ async def replace_oauth_credentials(
 
 
 async def create_provider_connection(
-    user, config: dict | None = None, db: AsyncSession | None = None, credentials: dict | None = None
+    user,
+    config: dict | None = None,
+    db: AsyncSession | None = None,
+    credentials: dict | None = None,
+    *,
+    provider_id: str = 'chatgpt',
+    name: str | None = None,
 ):
     async with _provider_db_scope(db) as session:
         connection = new_provider_connection(
-            provider_id='chatgpt',
-            name='ChatGPT',
+            provider_id=provider_id,
+            name=name or ('Kimi Code' if provider_id == 'kimi' else 'ChatGPT'),
             auth_type='oauth',
             visibility='private',
             owner_id=user.id,
@@ -687,22 +751,33 @@ async def create_provider_connection(
         return connection
 
 
-async def get_provider_connection(connection_id: str, user, db: AsyncSession | None = None):
+async def get_provider_connection(
+    connection_id: str,
+    user,
+    db: AsyncSession | None = None,
+    *,
+    provider_id: str = 'chatgpt',
+):
     async with _provider_db_scope(db) as session:
         connection = await session.get(ProviderConnection, connection_id)
-        if not connection or connection.provider_id != 'chatgpt' or connection.owner_id != user.id:
+        if not connection or connection.provider_id != provider_id or connection.owner_id != user.id:
             raise HTTPException(404, 'Provider connection not found')
         return connection
 
 
-async def list_provider_connections(user, db: AsyncSession | None = None):
+async def list_provider_connections(
+    user,
+    db: AsyncSession | None = None,
+    *,
+    provider_id: str = 'chatgpt',
+):
     async with _provider_db_scope(db) as session:
         return list(
             (
                 await session.scalars(
                     select(ProviderConnection).where(
                         ProviderConnection.owner_id == user.id,
-                        ProviderConnection.provider_id == 'chatgpt',
+                        ProviderConnection.provider_id == provider_id,
                         ProviderConnection.auth_type == 'oauth',
                     )
                 )
@@ -710,15 +785,63 @@ async def list_provider_connections(user, db: AsyncSession | None = None):
         )
 
 
-async def delete_provider_connection(connection_id: str, user, db: AsyncSession | None = None):
+async def delete_provider_connection(
+    connection_id: str,
+    user,
+    db: AsyncSession | None = None,
+    *,
+    provider_id: str = 'chatgpt',
+):
     async with _provider_db_scope(db) as session:
         connection = await session.get(ProviderConnection, connection_id, with_for_update=True)
-        if not connection or connection.provider_id != 'chatgpt' or connection.owner_id != user.id:
+        if not connection or connection.provider_id != provider_id or connection.owner_id != user.id:
             raise HTTPException(404, 'Provider connection not found')
         connection.credential = None
         connection.is_active = True
         connection.models = []
-        connection.config = {key: value for key, value in (connection.config or {}).items() if key != '_models_by_user'}
+        connection.config = {
+            key: value for key, value in (connection.config or {}).items() if key != '_models_by_user'
+        }
         connection.status = 'disconnected'
         await session.commit()
         return connection
+
+
+async def get_media_api_connection(
+    connection_id: str,
+    user,
+    db: AsyncSession | None = None,
+) -> tuple[ProviderConnection, str]:
+    """Resolve a server-saved API-key connection for image or audio media."""
+    if user is None:
+        raise HTTPException(401, 'Sign in to use this provider connection')
+    if not connection_id:
+        raise HTTPException(400, 'Select a provider connection for this media feature')
+    async with _provider_db_scope(db) as session:
+        connection = await session.get(ProviderConnection, connection_id)
+        await require_connection_access(connection, user, session)
+        if not connection.is_active:
+            raise HTTPException(404, 'Provider connection not found')
+        if connection.auth_type != 'api_key' or not connection.credential:
+            raise HTTPException(
+                400,
+                'Media features require the provider API-key connection. Account sign-in only covers supported text inference.',
+            )
+        return connection, decrypt_credential(connection.credential)
+
+
+@asynccontextmanager
+async def media_http_session(connection: ProviderConnection | None = None):
+    """Keep user-configured media endpoints behind the provider DNS guard."""
+    if connection is None:
+        from open_webui.utils.session_pool import get_session
+
+        yield await get_session()
+        return
+    allow_private = validate_app_url(provider_base_url(connection))
+    async with aiohttp.ClientSession(
+        connector=AppTCPConnector(allow_private=allow_private),
+        timeout=aiohttp.ClientTimeout(total=300, connect=20),
+        trust_env=False,
+    ) as session:
+        yield session

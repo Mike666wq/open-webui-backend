@@ -177,6 +177,7 @@ from open_webui.routers import (
     pipelines,
     providers,
     provider_auth,
+    kimi_auth,
     prompts,
     retrieval,
     scim,
@@ -895,6 +896,7 @@ app.include_router(ollama.router, prefix='/ollama', tags=['ollama'])
 app.include_router(openai.router, prefix='/openai', tags=['openai'])
 app.include_router(providers.router, prefix='/api/v1/providers', tags=['providers'])
 app.include_router(provider_auth.router, prefix='/api/v1/providers/auth/chatgpt', tags=['provider-auth'])
+app.include_router(kimi_auth.router, prefix='/api/v1/providers/auth/kimi', tags=['provider-auth'])
 
 
 app.include_router(pipelines.router, prefix='/api/v1/pipelines', tags=['pipelines'])
@@ -2450,6 +2452,7 @@ async def get_app_config(request: Request):
                     'enable_easter_eggs': ENABLE_EASTER_EGGS,
                     'enable_direct_connections': config.get('direct.enable'),
                     'enable_provider_connections': True,
+                    'enable_provider_media_connections': True,
                     'enable_direct_integrations': ENABLE_TOOL_SERVERS
                     and config.get('direct.integrations.enable', False),
                     'enable_plugins': ENABLE_PLUGINS,

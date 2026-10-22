@@ -1363,6 +1363,8 @@ IMAGE_GENERATION_ENGINE = os.getenv('IMAGE_GENERATION_ENGINE', 'openai')
 
 IMAGE_GENERATION_MODEL = os.getenv('IMAGE_GENERATION_MODEL', '')
 
+IMAGES_PROVIDER_CONNECTION_ID = os.getenv('IMAGES_PROVIDER_CONNECTION_ID', '')
+
 # Regex pattern for models that support IMAGE_SIZE = "auto".
 IMAGE_AUTO_SIZE_MODELS_REGEX_PATTERN = os.getenv('IMAGE_AUTO_SIZE_MODELS_REGEX_PATTERN', '^gpt-image')
 
@@ -1537,6 +1539,8 @@ IMAGE_EDIT_ENGINE = os.getenv('IMAGE_EDIT_ENGINE', 'openai')
 
 IMAGE_EDIT_MODEL = os.getenv('IMAGE_EDIT_MODEL', '')
 
+IMAGES_EDIT_PROVIDER_CONNECTION_ID = os.getenv('IMAGES_EDIT_PROVIDER_CONNECTION_ID', '')
+
 IMAGE_EDIT_SIZE = os.getenv('IMAGE_EDIT_SIZE', '')
 
 ENABLE_OPENAI_IMAGE_EDIT_NORMALIZATION = os.getenv('ENABLE_OPENAI_IMAGE_EDIT_NORMALIZATION', 'true').lower() == 'true'
@@ -1590,6 +1594,8 @@ AUDIO_STT_OPENAI_API_BASE_URL = os.getenv('AUDIO_STT_OPENAI_API_BASE_URL', OPENA
 
 AUDIO_STT_OPENAI_API_KEY = os.getenv('AUDIO_STT_OPENAI_API_KEY', OPENAI_API_KEY)
 
+AUDIO_STT_PROVIDER_CONNECTION_ID = os.getenv('AUDIO_STT_PROVIDER_CONNECTION_ID', '')
+
 AUDIO_STT_OPENAI_API_REQUEST_FORMAT = os.getenv('AUDIO_STT_OPENAI_API_REQUEST_FORMAT', 'multipart')
 
 AUDIO_STT_ENGINE = os.getenv('AUDIO_STT_ENGINE', '')
@@ -1629,6 +1635,8 @@ AUDIO_STT_MISTRAL_USE_CHAT_COMPLETIONS = os.getenv('AUDIO_STT_MISTRAL_USE_CHAT_C
 
 AUDIO_TTS_OPENAI_API_BASE_URL = os.getenv('AUDIO_TTS_OPENAI_API_BASE_URL', OPENAI_API_BASE_URL)
 AUDIO_TTS_OPENAI_API_KEY = os.getenv('AUDIO_TTS_OPENAI_API_KEY', OPENAI_API_KEY)
+
+AUDIO_TTS_PROVIDER_CONNECTION_ID = os.getenv('AUDIO_TTS_PROVIDER_CONNECTION_ID', '')
 
 audio_tts_openai_params = os.getenv('AUDIO_TTS_OPENAI_PARAMS', '')
 try:
@@ -3085,6 +3093,7 @@ DEFAULT_CONFIG = {
     'image_generation.enable': ENABLE_IMAGE_GENERATION,
     'image_generation.engine': IMAGE_GENERATION_ENGINE,
     'image_generation.model': IMAGE_GENERATION_MODEL,
+    'image_generation.provider_connection_id': IMAGES_PROVIDER_CONNECTION_ID,
     'image_generation.size': IMAGE_SIZE,
     'image_generation.steps': IMAGE_STEPS,
     'image_generation.prompt.enable': ENABLE_IMAGE_PROMPT_GENERATION,
@@ -3105,6 +3114,7 @@ DEFAULT_CONFIG = {
     'images.edit.enable': ENABLE_IMAGE_EDIT,
     'images.edit.engine': IMAGE_EDIT_ENGINE,
     'images.edit.model': IMAGE_EDIT_MODEL,
+    'images.edit.provider_connection_id': IMAGES_EDIT_PROVIDER_CONNECTION_ID,
     'images.edit.size': IMAGE_EDIT_SIZE,
     'images.edit.openai.api_base_url': IMAGES_EDIT_OPENAI_API_BASE_URL,
     'images.edit.openai.api_version': IMAGES_EDIT_OPENAI_API_VERSION,
@@ -3119,6 +3129,7 @@ DEFAULT_CONFIG = {
     'audio.stt.deepgram.api_key': DEEPGRAM_API_KEY,
     'audio.stt.openai.api_base_url': AUDIO_STT_OPENAI_API_BASE_URL,
     'audio.stt.openai.api_key': AUDIO_STT_OPENAI_API_KEY,
+    'audio.stt.provider_connection_id': AUDIO_STT_PROVIDER_CONNECTION_ID,
     'audio.stt.openai.api_request_format': AUDIO_STT_OPENAI_API_REQUEST_FORMAT,
     'audio.stt.engine': AUDIO_STT_ENGINE,
     'audio.stt.model': AUDIO_STT_MODEL,
@@ -3134,6 +3145,7 @@ DEFAULT_CONFIG = {
     'audio.stt.mistral.use_chat_completions': AUDIO_STT_MISTRAL_USE_CHAT_COMPLETIONS,
     'audio.tts.openai.api_base_url': AUDIO_TTS_OPENAI_API_BASE_URL,
     'audio.tts.openai.api_key': AUDIO_TTS_OPENAI_API_KEY,
+    'audio.tts.provider_connection_id': AUDIO_TTS_PROVIDER_CONNECTION_ID,
     'audio.tts.openai.params': AUDIO_TTS_OPENAI_PARAMS,
     'audio.tts.api_key': AUDIO_TTS_API_KEY,
     'audio.realtime.enabled': AUDIO_REALTIME_ENABLED,

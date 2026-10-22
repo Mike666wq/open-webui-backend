@@ -35,8 +35,8 @@ router = APIRouter()
 def _validate_form(form: ProviderConnectionCreate, user):
     if form.visibility == 'shared' and user.role != 'admin':
         raise HTTPException(403, 'Only administrators can create shared provider connections')
-    if form.provider_id == 'chatgpt':
-        raise HTTPException(400, 'Connect ChatGPT through its OAuth sign-in flow')
+    if form.provider_id in ('chatgpt', 'kimi'):
+        raise HTTPException(400, f'Connect {form.provider_id} through its OAuth sign-in flow')
     elif form.auth_type != 'api_key':
         raise HTTPException(400, 'This provider requires an API key')
     elif not form.api_key:
@@ -217,9 +217,9 @@ async def update_connection(
     for field in ('name', 'visibility', 'config'):
         if field in values and values[field] is None:
             raise HTTPException(400, f'{field} cannot be null')
-    if connection.provider_id == 'chatgpt' and connection.auth_type == 'oauth':
+    if connection.auth_type == 'oauth':
         if set(values) - {'name'} or values.get('name') is None:
-            raise HTTPException(400, 'Only the ChatGPT connection name can be edited here')
+            raise HTTPException(400, 'Only the OAuth connection name can be edited here')
     if values.get('visibility') == 'shared' and user.role != 'admin':
         raise HTTPException(403, 'Only administrators can create shared provider connections')
     grants = values.pop('access_control', None)
@@ -232,8 +232,8 @@ async def update_connection(
         connection.visibility = values['visibility']
     if 'config' in values:
         config = values['config'] or {}
-        if connection.provider_id == 'chatgpt' and connection.auth_type == 'oauth':
-            raise HTTPException(400, 'Manage ChatGPT OAuth through its provider settings')
+        if connection.auth_type == 'oauth':
+            raise HTTPException(400, 'Manage OAuth through its provider settings')
         allowed = {'base_url', 'region', 'workspace_id', 'model_ids', 'api_type'}
         if set(config) - allowed:
             raise HTTPException(400, 'Unsupported provider configuration field')
@@ -288,8 +288,8 @@ async def delete_connection(
             raise HTTPException(403, 'Only administrators can delete shared provider connections')
     elif connection.owner_id != user.id:
         raise HTTPException(404, 'Provider connection not found')
-    if connection.provider_id == 'chatgpt' and connection.auth_type == 'oauth':
-        raise HTTPException(400, 'Disconnect ChatGPT through its OAuth settings')
+    if connection.auth_type == 'oauth':
+        raise HTTPException(400, 'Disconnect this account through its OAuth settings')
     await db.delete(connection)
     await AccessGrants.replace_access_grants(db, 'provider_connection', connection_id, [])
     await db.commit()

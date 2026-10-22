@@ -31,7 +31,7 @@ class ProviderConnection(Base):
 
 
 class ProviderConnectionCreate(BaseModel):
-    provider_id: Literal['openai', 'deepseek', 'bailian', 'custom', 'chatgpt']
+    provider_id: Literal['openai', 'deepseek', 'bailian', 'custom', 'chatgpt', 'kimi']
     name: str = Field(min_length=1, max_length=100)
     auth_type: Literal['api_key', 'oauth'] = 'api_key'
     visibility: Literal['private', 'shared'] = 'private'
