@@ -24,10 +24,56 @@ async def verify():
     from starlette.requests import Request
 
     received = []
+    responses_received = []
 
     async def models(request):
         assert request.headers['Authorization'].startswith('Bearer synthetic-')
-        return web.json_response({'data': [{'id': 'same-model'}]})
+        return web.json_response(
+            {
+                'data': [{'id': 'same-model'}],
+                'models': [{'slug': 'same-model', 'display_name': 'Synthetic ChatGPT', 'visibility': 'list'}],
+            }
+        )
+
+    async def responses(request):
+        assert request.headers['Authorization'] == 'Bearer synthetic-oauth-access'
+        body = await request.json()
+        responses_received.append(body)
+        assert body['model'] == 'same-model' and body['stream'] is True and body['store'] is False
+        if len(responses_received) == 2:
+            events = [
+                {
+                    'type': 'response.failed',
+                    'response': {
+                        'error': {
+                            'code': 'subscription_sharing_usage_limit_exceeded',
+                            'message': 'Synthetic plan limit',
+                        }
+                    },
+                }
+            ]
+        else:
+            events = [
+                {
+                    'type': 'response.output_item.added',
+                    'output_index': 0,
+                    'item': {
+                        'id': 'synthetic-message',
+                        'type': 'message',
+                        'role': 'assistant',
+                        'content': [],
+                    },
+                },
+                {'type': 'response.output_text.delta', 'output_index': 0, 'content_index': 0, 'delta': '你好🌏'},
+                {'type': 'response.completed', 'response': {'id': 'synthetic-response', 'output': []}},
+            ]
+        # A Responses SSE body normally includes event: fields and several data
+        # records in one network read. This used to silently become a blank chat.
+        wire = ''.join(
+            'event: ' + event['type'] + '\n' + 'data: ' + json.dumps(event, ensure_ascii=False) + '\n\n'
+            for event in events
+        )
+        return web.Response(text=wire, content_type='text/event-stream')
 
     async def completion(request):
         body = await request.json()
@@ -57,6 +103,7 @@ async def verify():
     upstream = web.Application()
     upstream.router.add_get('/v1/models', models)
     upstream.router.add_post('/v1/chat/completions', completion)
+    upstream.router.add_post('/v1/responses', responses)
     runner = web.AppRunner(upstream)
     await runner.setup()
     site = web.TCPSite(runner, '127.0.0.1', 0)
@@ -140,22 +187,43 @@ async def verify():
 
             # Browser/manual callback requires no local helper or token import.
             from urllib.parse import parse_qs, urlsplit, urlencode
+
             browser = await call('POST', auth_prefix + '/start', {'mode': 'browser'}, alice['token'])
             assert 'authorization_url' in browser and 'command' not in browser and 'pairing_code' not in browser
             query = parse_qs(urlsplit(browser['authorization_url']).query)
-            callback_url = browser['redirect_uri'] + '?' + urlencode({
-                'code': 'synthetic-browser-code', 'state': query['state'][0], 'client_id': 'oaiapp_browser_http',
-            })
+            callback_url = (
+                browser['redirect_uri']
+                + '?'
+                + urlencode(
+                    {
+                        'code': 'synthetic-browser-code',
+                        'state': query['state'][0],
+                        'client_id': 'oaiapp_browser_http',
+                    }
+                )
+            )
             callback_path = auth_prefix + '/' + browser['attempt_id'] + '/callback'
             await call('POST', callback_path, {'callback_url': callback_url}, bob['token'], expected=404)
-            await call('POST', callback_path, {'callback_url': callback_url.replace(query['state'][0], 'wrong')}, alice['token'], expected=400)
-            with (patch.object(provider_auth, 'exchange_authorization_code', new=AsyncMock(return_value=token_body['token'])) as exchange,
-                  patch.object(provider_auth, 'validate_id_token', new=AsyncMock(return_value=claims))):
+            await call(
+                'POST',
+                callback_path,
+                {'callback_url': callback_url.replace(query['state'][0], 'wrong')},
+                alice['token'],
+                expected=400,
+            )
+            with (
+                patch.object(
+                    provider_auth, 'exchange_authorization_code', new=AsyncMock(return_value=token_body['token'])
+                ) as exchange,
+                patch.object(provider_auth, 'validate_id_token', new=AsyncMock(return_value=claims)),
+            ):
                 connected = await call('POST', callback_path, {'callback_url': callback_url}, alice['token'])
                 assert connected['status'] == 'complete'
                 assert exchange.await_count == 1
             await call('POST', callback_path, {'callback_url': callback_url}, alice['token'], expected=404)
-            await call('GET', '/api/v1/providers/connections/' + connected['connection_id'], token=bob['token'], expected=404)
+            await call(
+                'GET', '/api/v1/providers/connections/' + connected['connection_id'], token=bob['token'], expected=404
+            )
 
             ids = {}
             for account in (alice, bob):
@@ -254,6 +322,55 @@ async def verify():
                 )
                 assert denied.status_code in (400, 403, 404), denied.text
 
+            # Route a connected OAuth account through real HTTP and the saved
+            # chat/socket middleware, not just a raw SSE passthrough API call.
+            from open_webui.utils import chatgpt_auth, middleware
+
+            oauth_model = stable_model_id(connected['connection_id'], 'same-model')
+            with (
+                patch.object(registry, 'get_all_base_models', return_value=[]),
+                patch.object(chatgpt_auth, 'OPENAI_API', base),
+            ):
+                for should_fail in (False, True):
+                    chat = await call(
+                        'POST',
+                        '/api/v1/chats/new',
+                        {
+                            'chat': {
+                                'title': 'Synthetic OAuth streaming',
+                                'history': {'messages': {}, 'currentId': None},
+                            }
+                        },
+                        alice['token'],
+                    )
+                    emitter = AsyncMock()
+                    with patch.object(
+                        middleware, 'get_event_emitter_and_caller', new=AsyncMock(return_value=(emitter, None))
+                    ):
+                        await call(
+                            'POST',
+                            '/api/chat/completions',
+                            {
+                                'model': oauth_model,
+                                'stream': True,
+                                'chat_id': chat['id'],
+                                'id': 'synthetic-reply',
+                                'messages': [{'role': 'user', 'content': 'Hello'}],
+                            },
+                            alice['token'],
+                        )
+                    events = [c.args[0] for c in emitter.await_args_list]
+                    from open_webui.models.chats import Chats
+
+                    saved = await Chats.get_message_by_id_and_message_id(chat['id'], 'synthetic-reply')
+                    if should_fail:
+                        assert any(e['data'].get('error') for e in events), events
+                        assert 'subscription_sharing_usage_limit_exceeded' in json.dumps(saved), saved
+                    else:
+                        final = next(e['data'] for e in reversed(events) if e['data'].get('done'))
+                        assert final['output'][0]['content'][0]['text'] == '你好🌏', final
+                        assert saved['output'][0]['content'][0]['text'] == '你好🌏', saved
+            assert len(responses_received) == 2
             assert len(received) == 4, received
             assert received[0][0] != received[2][0]
             print(
@@ -268,6 +385,8 @@ async def verify():
                             'request_cache_isolation',
                             'internal_payload_redaction',
                             'sse_chat',
+                            'oauth_responses_sse_real_http_and_saved_chat',
+                            'oauth_in_stream_plan_limit_visible_and_persisted',
                             'shared_grants_revocation',
                             'oauth_helper_download',
                             'oauth_pair_replay_denied',

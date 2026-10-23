@@ -49,6 +49,15 @@ temperature, top-p, output-token limits, previous response IDs, and unsupported
 tools. The backend does not call Codex app-server or ChatGPT `backend-api`
 endpoints.
 
+The transport assembles complete SSE events before passing them to the chat
+consumer. Network chunks may contain multiple events or split a JSON value or
+UTF-8 character. A successful sign-in/model listing and an HTTP 200 alone do
+not confirm a successful generation: Responses requests must reach
+`response.completed`. In-stream failures (including plan usage limits),
+incomplete responses and interrupted streams appear as chat errors. Look for
+`Provider stream` warnings and the corresponding chat error when diagnosing
+an empty reply; routine GET/access-polling logs do not show generation success.
+
 SIWC plan OAuth does not authorize image generation tools, audio/video input,
 transcription endpoints, speech synthesis, or Realtime. Supported image/file
 **input** to a Responses model is distinct from generating a new image.
