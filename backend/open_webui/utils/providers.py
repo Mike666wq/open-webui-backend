@@ -600,18 +600,11 @@ async def provider_chat_completion(model_id: str, payload: dict, user, db: Async
             await session.close()
             raise HTTPException(502, 'Could not reach the provider') from None
     if response.status < 200 or response.status >= 300:
-        await response.release()
+        response.release()
         await session.close()
         raise provider_http_error(response.status)
     if payload.get('stream'):
-
-        async def chunks():
-            try:
-                async for chunk in response.content.iter_chunked(16384):
-                    yield chunk
-            finally:
-                response.release()
-                await session.close()
+        from open_webui.utils.provider_stream import provider_stream
 
         headers = {
             key: value
@@ -620,7 +613,17 @@ async def provider_chat_completion(model_id: str, payload: dict, user, db: Async
         }
         headers.setdefault('Cache-Control', 'no-cache')
         return StreamingResponse(
-            chunks(), status_code=response.status, media_type='text/event-stream', headers=headers
+            provider_stream(
+                response,
+                session,
+                require_completed=(
+                    resolved.connection.provider_id == 'chatgpt'
+                    or (resolved.connection.config or {}).get('api_type') == 'responses'
+                ),
+            ),
+            status_code=response.status,
+            media_type='text/event-stream',
+            headers=headers,
         )
     try:
         raw = await read_bounded_response(response)

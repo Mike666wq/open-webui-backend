@@ -430,7 +430,7 @@ async def chatgpt_chat_completion(connection: ProviderConnection, model_id: str,
         raise HTTPException(502, 'Could not reach ChatGPT') from None
     if response.status < 200 or response.status >= 300:
         status_code = response.status
-        await response.release()
+        response.release()
         await session.close()
         if status_code in (401, 403):
             raise HTTPException(401, 'ChatGPT rejected the connected account')
