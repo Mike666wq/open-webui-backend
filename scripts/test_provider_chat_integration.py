@@ -138,6 +138,25 @@ async def verify():
             assert disconnected['revocation_confirmed'] is False
             # A disconnected registration remains available for explicit reconnect but contributes no models.
 
+            # Browser/manual callback requires no local helper or token import.
+            from urllib.parse import parse_qs, urlsplit, urlencode
+            browser = await call('POST', auth_prefix + '/start', {'mode': 'browser'}, alice['token'])
+            assert 'authorization_url' in browser and 'command' not in browser and 'pairing_code' not in browser
+            query = parse_qs(urlsplit(browser['authorization_url']).query)
+            callback_url = browser['redirect_uri'] + '?' + urlencode({
+                'code': 'synthetic-browser-code', 'state': query['state'][0], 'client_id': 'oaiapp_browser_http',
+            })
+            callback_path = auth_prefix + '/' + browser['attempt_id'] + '/callback'
+            await call('POST', callback_path, {'callback_url': callback_url}, bob['token'], expected=404)
+            await call('POST', callback_path, {'callback_url': callback_url.replace(query['state'][0], 'wrong')}, alice['token'], expected=400)
+            with (patch.object(provider_auth, 'exchange_authorization_code', new=AsyncMock(return_value=token_body['token'])) as exchange,
+                  patch.object(provider_auth, 'validate_id_token', new=AsyncMock(return_value=claims))):
+                connected = await call('POST', callback_path, {'callback_url': callback_url}, alice['token'])
+                assert connected['status'] == 'complete'
+                assert exchange.await_count == 1
+            await call('POST', callback_path, {'callback_url': callback_url}, alice['token'], expected=404)
+            await call('GET', '/api/v1/providers/connections/' + connected['connection_id'], token=bob['token'], expected=404)
+
             ids = {}
             for account in (alice, bob):
                 connection = await call(
@@ -254,6 +273,8 @@ async def verify():
                             'oauth_pair_replay_denied',
                             'oauth_complete_replay_denied',
                             'oauth_private_owner_binding',
+                            'oauth_browser_callback_without_helper',
+                            'oauth_browser_callback_owner_and_replay_checks',
                         ],
                     }
                 )
