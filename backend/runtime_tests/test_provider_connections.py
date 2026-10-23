@@ -33,6 +33,25 @@ class ProviderConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await providers.can_access_connection(self.connection, self.other, self.db))
         self.assertFalse(await providers.can_access_connection(self.connection, self.admin, self.db))
 
+    async def test_platform_web_search_does_not_require_provider_native_search(self):
+        for provider_id, features in (('chatgpt', []), ('openai', []), ('custom', []), ('bailian', ['web-search'])):
+            with self.subTest(provider=provider_id):
+                self.connection.provider_id = provider_id
+                model_id = providers.stable_model_id(self.connection.id, 'text-model')
+                models = [{'id': model_id, 'upstream_id': 'text-model', 'capabilities': [], 'features': features}]
+                db = SimpleNamespace(
+                    get=AsyncMock(return_value=self.connection),
+                    scalars=AsyncMock(return_value=SimpleNamespace(all=lambda: [self.connection])),
+                )
+                with patch.object(providers, 'visible_connection_models', new=AsyncMock(return_value=models)):
+                    listing = await providers.list_visible_models(self.owner, db)
+                    resolved = await providers.resolve_model(model_id, self.owner, db)
+                for model in (listing[0], resolved.model_metadata):
+                    self.assertTrue(model['info']['meta']['capabilities']['web_search'])
+                    self.assertFalse(model['info']['meta']['capabilities']['vision'])
+                    self.assertFalse(model['info']['meta']['capabilities']['file_upload'])
+                    self.assertEqual(model['features'], features)
+
     async def test_shared_connection_uses_existing_user_and_group_grants(self):
         self.connection.visibility = 'shared'
         with (
@@ -41,6 +60,33 @@ class ProviderConnectionTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertTrue(await providers.can_access_connection(self.connection, self.other, self.db))
             has_access.assert_awaited_once_with('other', 'provider_connection', self.connection.id, 'read', db=self.db)
+
+    async def test_platform_search_still_requires_config_feature_permission_and_model_capability(self):
+        from open_webui.utils import tools
+
+        request = SimpleNamespace(state=SimpleNamespace())
+        extra = {'__user__': {'id': self.owner.id, 'role': 'user'}}
+        for enabled, selected, allowed, capable in (
+            (True, True, True, True),
+            (False, True, True, True),
+            (True, False, True, True),
+            (True, True, False, True),
+            (True, True, True, False),
+        ):
+            with self.subTest(enabled=enabled, selected=selected, allowed=allowed, capable=capable):
+                with (
+                    patch.object(tools.Config, 'get_many', new=AsyncMock(return_value={'web.search.enable': enabled})),
+                    patch.object(tools.Config, 'get', new=AsyncMock(return_value={})),
+                    patch.object(tools, 'has_permission', new=AsyncMock(return_value=allowed)),
+                ):
+                    available = await tools.get_builtin_tools(
+                        request,
+                        extra,
+                        {'web_search': selected},
+                        {'info': {'meta': {'capabilities': {'web_search': capable}}}},
+                    )
+                for name in ('search_web', 'fetch_url'):
+                    self.assertEqual(name in available, enabled and selected and allowed and capable)
 
     async def test_manual_model_fallback_keeps_connection_scoped_stable_ids(self):
         self.connection.config = {'model_ids': ['manual/vision']}

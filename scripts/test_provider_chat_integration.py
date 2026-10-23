@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import secrets
 import sys
 import tempfile
@@ -40,7 +41,25 @@ async def verify():
         body = await request.json()
         responses_received.append(body)
         assert body['model'] == 'same-model' and body['stream'] is True and body['store'] is False
-        if len(responses_received) == 2:
+        if len(responses_received) == 3:
+            # Open WebUI's own search is an ordinary function tool, independent
+            # of whether the provider advertises a hosted/native web-search tool.
+            specs = {tool.get('name'): tool for tool in body.get('tools', [])}
+            assert {'search_web', 'fetch_url'} <= specs.keys(), specs
+            assert specs['search_web']['type'] == 'function'
+            item = {
+                'type': 'function_call',
+                'id': 'fc-search',
+                'call_id': 'call-search',
+                'name': 'search_web',
+                'arguments': '{"query":"synthetic search"}',
+                'status': 'completed',
+            }
+            events = [
+                {'type': 'response.output_item.done', 'output_index': 0, 'item': item},
+                {'type': 'response.completed', 'response': {'id': 'resp-search', 'output': [item]}},
+            ]
+        elif len(responses_received) == 2:
             events = [
                 {
                     'type': 'response.failed',
@@ -53,6 +72,10 @@ async def verify():
                 }
             ]
         else:
+            if len(responses_received) == 4:
+                results = [item for item in body['input'] if item.get('type') == 'function_call_output']
+                assert len(results) == 1 and results[0]['call_id'] == 'call-search', body['input']
+                assert 'Synthetic search result' in str(results[0]['output']), results
             events = [
                 {
                     'type': 'response.output_item.added',
@@ -370,7 +393,68 @@ async def verify():
                         final = next(e['data'] for e in reversed(events) if e['data'].get('done'))
                         assert final['output'][0]['content'][0]['text'] == '你好🌏', final
                         assert saved['output'][0]['content'][0]['text'] == '你好🌏', saved
-            assert len(responses_received) == 2
+                listing = await call('GET', '/api/models', token=alice['token'])
+                oauth_entry = next(model for model in listing['data'] if model['id'] == oauth_model)
+                assert oauth_entry['info']['meta']['capabilities']['web_search'] is True, oauth_entry
+                await Config.upsert({'web.search.enable': True, 'chat.tool_search.enable': False})
+                chat = await call(
+                    'POST',
+                    '/api/v1/chats/new',
+                    {
+                        'chat': {
+                            'title': 'Synthetic search tool round trip',
+                            'history': {'messages': {}, 'currentId': None},
+                        }
+                    },
+                    alice['token'],
+                )
+                from open_webui import main as main_module
+                from open_webui.tools import builtin
+                from open_webui.tasks import tasks as running_tasks
+
+                emitter = AsyncMock()
+                search = AsyncMock(
+                    return_value=[
+                        SimpleNamespace(
+                            title='Synthetic search result',
+                            link='https://example.invalid/result',
+                            snippet='Synthetic snippet',
+                        )
+                    ]
+                )
+                with (
+                    patch.object(
+                        middleware, 'get_event_emitter_and_caller', new=AsyncMock(return_value=(emitter, None))
+                    ),
+                    patch.object(main_module, 'get_event_emitter', new=AsyncMock(return_value=emitter)),
+                    patch.object(builtin, '_search_web', new=search),
+                ):
+                    started = await call(
+                        'POST',
+                        '/api/chat/completions',
+                        {
+                            'model': oauth_model,
+                            'stream': True,
+                            'chat_id': chat['id'],
+                            'id': 'search-reply',
+                            'session_id': 'synthetic-ui-session',
+                            'features': {'web_search': True},
+                            'params': {'function_calling': 'native'},
+                            'messages': [{'role': 'user', 'content': 'Search for synthetic search'}],
+                        },
+                        alice['token'],
+                    )
+                    pending = [running_tasks[task_id] for task_id in started['task_ids'] if task_id in running_tasks]
+                    if pending:
+                        await asyncio.wait_for(asyncio.gather(*pending), timeout=20)
+                search.assert_awaited_once()
+                assert search.await_args.args[2] == 'synthetic search'
+                assert search.await_args.args[3].id == alice['id']
+                saved = await Chats.get_message_by_id_and_message_id(chat['id'], 'search-reply')
+                assert saved.get('done') is True and not saved.get('error'), saved
+                assert any(item['type'] == 'function_call_output' for item in saved['output']), saved
+                assert any('你好🌏' in str(item) for item in saved['output']), saved
+            assert len(responses_received) == 4, responses_received
             assert len(received) == 4, received
             assert received[0][0] != received[2][0]
             print(
@@ -387,6 +471,8 @@ async def verify():
                             'sse_chat',
                             'oauth_responses_sse_real_http_and_saved_chat',
                             'oauth_in_stream_plan_limit_visible_and_persisted',
+                            'oauth_platform_web_search_menu_capability',
+                            'oauth_native_search_tool_execution_and_followup',
                             'shared_grants_revocation',
                             'oauth_helper_download',
                             'oauth_pair_replay_denied',

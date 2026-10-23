@@ -470,7 +470,9 @@ async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
                                         {'VU', 'Visual Understanding'} & set(model.get('capabilities') or [])
                                     ),
                                     'file_upload': False,
-                                    'web_search': 'web-search' in (model.get('features') or []),
+                                    # This gates Open WebUI's search UI/tools,
+                                    # not the provider's hosted search feature.
+                                    'web_search': True,
                                 }
                             }
                         },
@@ -511,7 +513,7 @@ async def _resolve_model(model_id: str, user, db: AsyncSession) -> ResolvedProvi
                 'capabilities': {
                     'vision': bool({'VU', 'Visual Understanding'} & set(metadata.get('capabilities') or [])),
                     'file_upload': False,
-                    'web_search': 'web-search' in (metadata.get('features') or []),
+                    'web_search': True,
                 }
             }
         },
