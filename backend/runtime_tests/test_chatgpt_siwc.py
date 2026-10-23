@@ -245,6 +245,123 @@ class ChatGPTRefreshTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await pairing_rate_limiter.get_count(None, '127.0.0.1'), 2)
 
 
+class ChatGPTBrowserTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from open_webui.routers.provider_auth import ChatGPTAuthHost
+        async with async_engine.begin() as connection:
+            for table in (ProviderConnection.__table__, ChatGPTAuthAttempt.__table__, ChatGPTAuthHost.__table__):
+                await connection.run_sync(table.create, checkfirst=True)
+        self.owner = SimpleNamespace(id='browser-owner', role='user')
+
+    async def start(self):
+        from open_webui.routers.provider_auth import StartAuthForm, start_chatgpt_auth
+        async with AsyncSessionLocal() as db:
+            attempt = await start_chatgpt_auth(None, StartAuthForm(mode='browser'), self.owner, db)
+            row = await db.get(ChatGPTAuthAttempt, attempt['attempt_id'])
+            return attempt, parse_qs(urlsplit(attempt['authorization_url']).query), row.pkce_verifier
+
+    def callback(self, query, **changes):
+        from urllib.parse import urlencode
+        values = {'state': query['state'][0], 'code': 'synthetic-code', 'client_id': 'oaiapp_browser'}
+        values.update(changes)
+        return 'http://127.0.0.1:1455/auth/callback?' + urlencode(values)
+
+    async def complete(self, attempt, value, owner=None):
+        from open_webui.routers.provider_auth import BrowserCallbackForm, complete_browser_auth
+        async with AsyncSessionLocal() as db:
+            return await complete_browser_auth(attempt['attempt_id'], BrowserCallbackForm(callback_url=value), owner or self.owner, db)
+
+    async def test_browser_callback_is_owner_bound_encrypted_and_one_time(self):
+        from open_webui.routers import provider_auth
+        from open_webui.models.users import Users
+        from open_webui.utils.providers import decrypt_credential
+        attempt, query, encrypted = await self.start()
+        verifier = decrypt_credential(encrypted)
+        self.assertNotEqual(encrypted, verifier)
+        self.assertEqual(pkce_challenge(verifier), query['code_challenge'][0])
+        self.assertNotIn('command', attempt)
+        self.assertNotIn('pairing_code', attempt)
+        self.assertNotIn(verifier, json.dumps(attempt))
+        with self.assertRaises(HTTPException) as denied:
+            await self.complete(attempt, self.callback(query), SimpleNamespace(id='another-owner'))
+        self.assertEqual(denied.exception.status_code, 404)
+        token = {'access_token': 'browser-access', 'refresh_token': 'browser-refresh', 'id_token': 'browser-id',
+                 'expires_in': 3600, 'scope': 'openid offline_access resource.invoke chatgpt.tokens.use.direct'}
+        claims = {'iss': 'https://auth.openai.com', 'sub': 'browser-subject'}
+        with (patch.object(provider_auth, 'exchange_authorization_code', new=AsyncMock(return_value=token)) as exchange,
+              patch.object(provider_auth, 'validate_id_token', new=AsyncMock(return_value=claims)) as validate,
+              patch.object(Users, 'get_user_by_id', new=AsyncMock(return_value=self.owner))):
+            result = await self.complete(attempt, self.callback(query))
+            self.assertEqual(result['status'], 'complete')
+            exchange.assert_awaited_once_with(code='synthetic-code', client_id='oaiapp_browser', verifier=verifier,
+                                             redirect_uri='http://127.0.0.1:1455/auth/callback')
+            validate.assert_awaited_once_with('browser-id', client_id='oaiapp_browser', nonce=query['nonce'][0])
+        with self.assertRaises(HTTPException):
+            await self.complete(attempt, self.callback(query))
+        async with AsyncSessionLocal() as db:
+            row = await db.get(ChatGPTAuthAttempt, attempt['attempt_id'])
+            self.assertIsNone(row.pkce_verifier)
+            connection = await db.get(ProviderConnection, result['connection_id'])
+            self.assertEqual(connection.visibility, 'private')
+            self.assertEqual(connection.owner_id, self.owner.id)
+            self.assertNotIn('browser-access', connection.credential)
+
+    async def test_invalid_state_origin_and_duplicate_params_do_not_consume_login(self):
+        attempt, query, _ = await self.start()
+        good = self.callback(query)
+        for bad in (self.callback(query, state='wrong'), good.replace('127.0.0.1', 'example.com'),
+                    good + '&code=duplicate', good + '#fragment', self.callback(query, client_id='wrong')):
+            with self.assertRaises(HTTPException) as error:
+                await self.complete(attempt, bad)
+            self.assertEqual(error.exception.status_code, 400)
+        async with AsyncSessionLocal() as db:
+            row = await db.get(ChatGPTAuthAttempt, attempt['attempt_id'])
+            self.assertEqual(row.status, 'pending')
+            self.assertIsNotNone(row.pkce_verifier)
+
+    async def test_decline_cancel_and_expiry_cannot_exchange(self):
+        from open_webui.routers import provider_auth
+        with patch.object(provider_auth, 'exchange_authorization_code', new=AsyncMock()) as exchange:
+            attempt, query, _ = await self.start()
+            with self.assertRaises(HTTPException):
+                await self.complete(attempt, self.callback(query, error='access_denied'))
+            async with AsyncSessionLocal() as db:
+                row = await db.get(ChatGPTAuthAttempt, attempt['attempt_id'])
+                self.assertEqual(row.status, 'failed')
+                self.assertIsNone(row.pkce_verifier)
+            for expired in (False, True):
+                attempt, query, _ = await self.start()
+                async with AsyncSessionLocal() as db:
+                    if expired:
+                        row = await db.get(ChatGPTAuthAttempt, attempt['attempt_id'])
+                        row.expires_at = int(time.time()) - 1
+                        await db.commit()
+                    else:
+                        await provider_auth.cancel_chatgpt_auth(attempt['attempt_id'], self.owner, db)
+                with self.assertRaises(HTTPException):
+                    await self.complete(attempt, self.callback(query))
+            exchange.assert_not_awaited()
+
+    async def test_cancel_during_exchange_discards_late_tokens(self):
+        from open_webui.routers import provider_auth
+        attempt, query, _ = await self.start()
+        async def exchange(**kwargs):
+            async with AsyncSessionLocal() as db:
+                await provider_auth.cancel_chatgpt_auth(attempt['attempt_id'], self.owner, db)
+            return {'access_token': 'late-access', 'refresh_token': 'late-refresh', 'id_token': 'late-id',
+                    'expires_in': 3600, 'scope': 'offline_access resource.invoke chatgpt.tokens.use.direct'}
+        with (patch.object(provider_auth, 'exchange_authorization_code', new=exchange),
+              patch.object(provider_auth, 'validate_id_token', new=AsyncMock(return_value={
+                  'iss': 'https://auth.openai.com', 'sub': 'late-subject'}))):
+            with self.assertRaises(HTTPException) as error:
+                await self.complete(attempt, self.callback(query))
+            self.assertEqual(error.exception.status_code, 409)
+        async with AsyncSessionLocal() as db:
+            row = await db.get(ChatGPTAuthAttempt, attempt['attempt_id'])
+            self.assertNotEqual(row.status, 'complete')
+            self.assertIsNone(row.connection_id)
+
+
 class ChatGPTIDTokenTests(unittest.IsolatedAsyncioTestCase):
     async def test_id_token_signature_issuer_audience_and_nonce_are_checked(self):
         from open_webui.utils import chatgpt_auth

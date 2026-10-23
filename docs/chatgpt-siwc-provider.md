@@ -8,25 +8,27 @@ credentials.
 
 ## Connect a self-hosted server
 
-1. In Open WebUI, start a ChatGPT sign-in attempt and copy its short-lived
-   pairing code.
-2. Run the command shown by Open WebUI on a computer with a browser. It
-   downloads the stdlib-only helper from the Open WebUI server, then prompts
-   for the pairing code.
-3. The helper claims the attempt over HTTPS, opens the official OpenAI sign-in
-   page, and listens on `http://127.0.0.1:<port>/auth/callback`. It exchanges
-   the authorization code locally with PKCE, then sends the short-lived result
-   to the backend over HTTPS.
-4. Open WebUI validates the ID-token signature against OpenAI's published
-   JWKS, checks issuer, audience, expiry, nonce, account identity, and the
-   granted `chatgpt.tokens.use.direct`, `resource.invoke`, and `offline_access` scopes. It then
-   encrypts and stores the tokens in the owner-only provider connection.
+1. In Open WebUI, select ChatGPT and start browser sign-in.
+2. Open the official authorization link from the dialog and authorize the account.
+3. Copy the entire final callback URL from the browser address bar, return to
+   Open WebUI, and submit it. With a remote backend, the loopback page may show
+   a connection error; the address still contains the authorization result.
+4. The backend checks the exact callback origin/path, state, issued client ID,
+   attempt ownership and expiry. It atomically consumes the encrypted PKCE
+   verifier, exchanges the code, validates the ID token and required scopes,
+   then saves an owner-only encrypted session. Codes and tokens are not returned
+   in the status response. Cancellation discards late token responses.
 
-The pairing code expires after ten minutes and can be claimed once. The helper
-keeps OAuth tokens in memory, does not print callback URLs or tokens, and never
-places credentials in a URL or shell command. The browser callback uses the
-loopback machine, which is why it must run on the user's computer rather than
-on the remote backend VM.
+No local script or Python installation is required. This follows Pi's manual
+browser callback interaction. It does not claim automatic callback capture in
+web browsers or a SIWC device-code grant. Pi's separate Codex device-code flow
+uses a different client and inference API and is not interchangeable with SIWC.
+
+The backend generates state, nonce and PKCE for each attempt. The verifier is
+encrypted at rest, removed on consumption/cancellation/status expiry, and never
+returned to the browser. Attempts last ten minutes; submission is one-time.
+Keep the pasted URL private. Older clients can still use the helper pairing
+API during rolling upgrades; the new UI never requires or downloads a helper.
 
 Reauthorization for a saved connection reuses its issued client ID, stable host
 ID, and validated account subject. Disconnect attempts the documented SIWC
