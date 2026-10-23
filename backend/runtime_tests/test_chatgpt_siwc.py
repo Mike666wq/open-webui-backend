@@ -342,6 +342,42 @@ class ChatGPTBrowserTests(unittest.IsolatedAsyncioTestCase):
                     await self.complete(attempt, self.callback(query))
             exchange.assert_not_awaited()
 
+    async def test_concurrent_callback_submission_exchanges_only_once(self):
+        from open_webui.routers import provider_auth
+        from open_webui.models.users import Users
+        attempt, query, _ = await self.start()
+        token = {'access_token': 'once-access', 'refresh_token': 'once-refresh', 'id_token': 'once-id',
+                 'expires_in': 3600, 'scope': 'offline_access resource.invoke chatgpt.tokens.use.direct'}
+        async def exchange(**kwargs):
+            await asyncio.sleep(0.03)
+            return token
+        async def submit():
+            try:
+                return await self.complete(attempt, self.callback(query))
+            except HTTPException as error:
+                return error.status_code
+        with (patch.object(provider_auth, 'exchange_authorization_code', new=AsyncMock(side_effect=exchange)) as exchange_mock,
+              patch.object(provider_auth, 'validate_id_token', new=AsyncMock(return_value={
+                  'iss': 'https://auth.openai.com', 'sub': 'once-subject'})),
+              patch.object(Users, 'get_user_by_id', new=AsyncMock(return_value=self.owner))):
+            results = await asyncio.gather(submit(), submit())
+            self.assertEqual(sum(isinstance(value, dict) for value in results), 1)
+            self.assertIn(404, results)
+            self.assertEqual(exchange_mock.await_count, 1)
+
+    async def test_failed_exchange_is_not_reusable_and_erases_verifier(self):
+        from open_webui.routers import provider_auth
+        attempt, query, _ = await self.start()
+        with patch.object(provider_auth, 'exchange_authorization_code', new=AsyncMock(side_effect=HTTPException(401, 'Start a new sign-in'))):
+            with self.assertRaises(HTTPException):
+                await self.complete(attempt, self.callback(query))
+        async with AsyncSessionLocal() as db:
+            row = await db.get(ChatGPTAuthAttempt, attempt['attempt_id'])
+            self.assertEqual(row.status, 'failed')
+            self.assertIsNone(row.pkce_verifier)
+        with self.assertRaises(HTTPException):
+            await self.complete(attempt, self.callback(query))
+
     async def test_cancel_during_exchange_discards_late_tokens(self):
         from open_webui.routers import provider_auth
         attempt, query, _ = await self.start()
