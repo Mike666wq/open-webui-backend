@@ -21,6 +21,7 @@ from open_webui.models.config import Config
 from open_webui.routers.pipelines import process_pipeline_inlet_filter
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.chat import generate_chat_completion
+from open_webui.utils.models import get_request_models, load_provider_models
 from open_webui.utils.payload import apply_params_to_form_data
 from open_webui.utils.task import (
     autocomplete_generation_template,
@@ -150,13 +151,14 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
             content={'detail': 'Title generation is disabled'},
         )
 
+    await load_provider_models(request, user)
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **dict(request.app.state.MODELS.items()),
+            **dict(get_request_models(request).items()),
             request.state.model['id']: request.state.model,
         }
     else:
-        models = request.app.state.MODELS
+        models = get_request_models(request)
 
     model_id = form_data['model']
     if not model_id:
@@ -223,13 +225,14 @@ async def generate_follow_ups(request: Request, form_data: dict, user=Depends(ge
             content={'detail': 'Follow-up generation is disabled'},
         )
 
+    await load_provider_models(request, user)
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **dict(request.app.state.MODELS.items()),
+            **dict(get_request_models(request).items()),
             request.state.model['id']: request.state.model,
         }
     else:
-        models = request.app.state.MODELS
+        models = get_request_models(request)
 
     model_id = form_data['model']
     if model_id not in models:
@@ -290,13 +293,14 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
             content={'detail': 'Tags generation is disabled'},
         )
 
+    await load_provider_models(request, user)
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **dict(request.app.state.MODELS.items()),
+            **dict(get_request_models(request).items()),
             request.state.model['id']: request.state.model,
         }
     else:
-        models = request.app.state.MODELS
+        models = get_request_models(request)
 
     model_id = form_data['model']
     if model_id not in models:
@@ -349,13 +353,14 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
 
 @router.post('/image_prompt/completions')
 async def generate_image_prompt(request: Request, form_data: dict, user=Depends(get_verified_user)):
+    await load_provider_models(request, user)
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **dict(request.app.state.MODELS.items()),
+            **dict(get_request_models(request).items()),
             request.state.model['id']: request.state.model,
         }
     else:
-        models = request.app.state.MODELS
+        models = get_request_models(request)
 
     model_id = form_data['model']
     if model_id not in models:
@@ -426,13 +431,14 @@ async def generate_queries(request: Request, form_data: dict, user=Depends(get_v
         log.info('Reusing cached queries: %s', request.state.cached_queries)
         return request.state.cached_queries
 
+    await load_provider_models(request, user)
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **dict(request.app.state.MODELS.items()),
+            **dict(get_request_models(request).items()),
             request.state.model['id']: request.state.model,
         }
     else:
-        models = request.app.state.MODELS
+        models = get_request_models(request)
 
     model_id = form_data['model']
     if model_id not in models:
@@ -502,13 +508,14 @@ async def generate_autocompletion(request: Request, form_data: dict, user=Depend
                 detail=ERROR_MESSAGES.INPUT_TOO_LONG(autocomplete_input_max_length),
             )
 
+    await load_provider_models(request, user)
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **dict(request.app.state.MODELS.items()),
+            **dict(get_request_models(request).items()),
             request.state.model['id']: request.state.model,
         }
     else:
-        models = request.app.state.MODELS
+        models = get_request_models(request)
 
     model_id = form_data['model']
     if model_id not in models:
@@ -561,13 +568,14 @@ async def generate_autocompletion(request: Request, form_data: dict, user=Depend
 
 @router.post('/emoji/completions')
 async def generate_emoji(request: Request, form_data: dict, user=Depends(get_verified_user)):
+    await load_provider_models(request, user)
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **dict(request.app.state.MODELS.items()),
+            **dict(get_request_models(request).items()),
             request.state.model['id']: request.state.model,
         }
     else:
-        models = request.app.state.MODELS
+        models = get_request_models(request)
 
     model_id = form_data['model']
     if model_id not in models:
@@ -615,13 +623,14 @@ async def generate_emoji(request: Request, form_data: dict, user=Depends(get_ver
 
 @router.post('/moa/completions')
 async def generate_moa_response(request: Request, form_data: dict, user=Depends(get_verified_user)):
+    await load_provider_models(request, user)
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **dict(request.app.state.MODELS.items()),
+            **dict(get_request_models(request).items()),
             request.state.model['id']: request.state.model,
         }
     else:
-        models = request.app.state.MODELS
+        models = get_request_models(request)
 
     model_id = form_data['model']
 

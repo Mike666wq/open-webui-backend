@@ -12,6 +12,7 @@
 !frontend.lock.json
 !scripts/
 !scripts/frontend_archive.py
+!scripts/chatgpt-authorize.py
 !.build/
 !.build/frontend/
 !.build/frontend/**

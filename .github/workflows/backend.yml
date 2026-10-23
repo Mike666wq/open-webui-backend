@@ -62,6 +62,10 @@ jobs:
           persist-credentials: false
       - name: Run SQLite lifecycle tests
         run: python scripts/test_resource_lifecycle.py
+      - name: Run isolated provider runtime tests
+        run: python scripts/test_provider_runtime.py
+      - name: Exercise provider chat and account isolation
+        run: python scripts/test_provider_chat_integration.py
       - name: Run PostgreSQL migration tests
         env:
           TEST_POSTGRES_URL: postgresql://postgres:postgres@postgres:5432/owui_test

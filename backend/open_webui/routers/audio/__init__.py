@@ -59,6 +59,12 @@ from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import strict_match_mime_type
+from open_webui.utils.providers import (
+    get_media_api_connection,
+    media_http_session,
+    provider_base_url,
+    provider_http_error,
+)
 from open_webui.utils.session_pool import get_session
 from pydantic import BaseModel, Field
 
@@ -85,6 +91,7 @@ SPEECH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 TTS_CONFIG_KEYS = {
     'OPENAI_API_BASE_URL': 'audio.tts.openai.api_base_url',
     'OPENAI_API_KEY': 'audio.tts.openai.api_key',
+    'PROVIDER_CONNECTION_ID': 'audio.tts.provider_connection_id',
     'OPENAI_PARAMS': 'audio.tts.openai.params',
     'API_KEY': 'audio.tts.api_key',
     'ENGINE': 'audio.tts.engine',
@@ -115,6 +122,7 @@ REALTIME_CONFIG_KEYS = {
 STT_CONFIG_KEYS = {
     'OPENAI_API_BASE_URL': 'audio.stt.openai.api_base_url',
     'OPENAI_API_KEY': 'audio.stt.openai.api_key',
+    'PROVIDER_CONNECTION_ID': 'audio.stt.provider_connection_id',
     'OPENAI_API_REQUEST_FORMAT': 'audio.stt.openai.api_request_format',
     'ENGINE': 'audio.stt.engine',
     'MODEL': 'audio.stt.model',
@@ -260,6 +268,7 @@ def set_faster_whisper_model(model: str, auto_update: bool = False):
 class TTSConfigForm(BaseModel):
     OPENAI_API_BASE_URL: str
     OPENAI_API_KEY: str
+    PROVIDER_CONNECTION_ID: str = ''
     OPENAI_PARAMS: Optional[dict] = None
     API_KEY: str
     ENGINE: str
@@ -277,6 +286,7 @@ class TTSConfigForm(BaseModel):
 class STTConfigForm(BaseModel):
     OPENAI_API_BASE_URL: str
     OPENAI_API_KEY: str
+    PROVIDER_CONNECTION_ID: str = ''
     OPENAI_API_REQUEST_FORMAT: str = 'multipart'
     ENGINE: str
     MODEL: str
@@ -324,6 +334,10 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
 
 @router.post('/config/update')
 async def update_audio_config(request: Request, form_data: AudioConfigUpdateForm, user=Depends(get_admin_user)):
+    if form_data.tts.ENGINE == 'provider':
+        await get_media_api_connection(form_data.tts.PROVIDER_CONNECTION_ID, user)
+    if form_data.stt.ENGINE == 'provider':
+        await get_media_api_connection(form_data.stt.PROVIDER_CONNECTION_ID, user)
     if USE_SLIM:
         current = await Config.get_many('audio.stt.engine', 'audio.tts.engine')
         if form_data.stt.ENGINE == '' and current.get('audio.stt.engine') != '':
@@ -434,15 +448,24 @@ async def _write_tts_cache(
         await f.write(JSONCodec.dumps(payload))
 
 
-async def _tts_openai(request, payload, file_path, file_body_path, user):
-    """Generate speech via an OpenAI-compatible TTS endpoint."""
-    payload['model'] = await Config.get('audio.tts.model')
+async def _tts_openai_compatible(
+    request,
+    payload,
+    file_path,
+    file_body_path,
+    user,
+    *,
+    api_key: str,
+    api_base_url: str,
+    model: str,
+    voice: str | None,
+    extra_params: dict | None = None,
+    media_connection=None,
+):
+    payload['model'] = model
     if not payload.get('voice'):
-        payload['voice'] = await Config.get('audio.tts.voice')
-    payload = {**payload, **(await Config.get('audio.tts.openai.params') or {})}
-    api_key = await Config.get('audio.tts.openai.api_key')
-    api_base_url = await Config.get('audio.tts.openai.api_base_url')
-
+        payload['voice'] = voice
+    payload = {**payload, **(extra_params or {})}
     headers = {
         'Content-Type': 'application/json',
         'Authorization': f'Bearer {api_key}',
@@ -452,17 +475,20 @@ async def _tts_openai(request, payload, file_path, file_body_path, user):
 
     r = None
     try:
-        session = await get_session()
-        r = await session.post(
-            url=f'{api_base_url}/audio/speech',
-            json=payload,
-            headers=headers,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-        )
-        r.raise_for_status()
+        async with media_http_session(media_connection) as session:
+            r = await session.post(
+                url=f'{api_base_url}/audio/speech',
+                json=payload,
+                headers=headers,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                allow_redirects=False,
+            )
+            if media_connection and not 200 <= r.status < 300:
+                raise provider_http_error(r.status)
+            r.raise_for_status()
 
-        audio_data = await r.read()
-        content_type = r.headers.get('Content-Type', 'audio/mpeg')
+            audio_data = await r.read()
+            content_type = r.headers.get('Content-Type', 'audio/mpeg')
 
         if USE_SLIM:
             await _write_tts_cache(file_path, audio_data, file_body_path, payload, content_type)
@@ -476,9 +502,49 @@ async def _tts_openai(request, payload, file_path, file_body_path, user):
             await f.write(JSONCodec.dumps(payload))
 
         return FileResponse(file_path)
+    except HTTPException:
+        raise
     except Exception as exc:
+        if media_connection:
+            raise HTTPException(502, 'Could not reach the speech provider') from None
         log.exception(exc)
         await _raise_tts_error(exc, r)
+
+
+async def _tts_openai(request, payload, file_path, file_body_path, user):
+    """Generate speech via the configured OpenAI-compatible endpoint."""
+    return await _tts_openai_compatible(
+        request,
+        payload,
+        file_path,
+        file_body_path,
+        user,
+        api_key=await Config.get('audio.tts.openai.api_key'),
+        api_base_url=await Config.get('audio.tts.openai.api_base_url'),
+        model=await Config.get('audio.tts.model'),
+        voice=await Config.get('audio.tts.voice'),
+        extra_params=await Config.get('audio.tts.openai.params'),
+    )
+
+
+async def _tts_provider(request, payload, file_path, file_body_path, user):
+    """Generate speech with an administrator-selected API-key connection."""
+    connection, api_key = await get_media_api_connection(
+        await Config.get('audio.tts.provider_connection_id'),
+        user,
+    )
+    return await _tts_openai_compatible(
+        request,
+        payload,
+        file_path,
+        file_body_path,
+        user,
+        api_key=api_key,
+        api_base_url=provider_base_url(connection),
+        model=await Config.get('audio.tts.model'),
+        voice=await Config.get('audio.tts.voice'),
+        media_connection=connection,
+    )
 
 
 async def _tts_openai_realtime(request, payload, file_path, file_body_path, user):
@@ -517,7 +583,9 @@ async def _tts_openai_realtime(request, payload, file_path, file_body_path, user
                     event_type = event['type']
                     if event_type == 'error':
                         # Provider messages may contain input text or credentials.
-                        raise HTTPException(502, 'OpenAI Realtime rejected synthesis. Check the model, voice, and key.')
+                        raise HTTPException(
+                            502, 'OpenAI Realtime rejected synthesis. Check the model, voice, and key.'
+                        )
                     if event_type == 'session.created':
                         await ws.send_json(
                             {
@@ -751,6 +819,7 @@ async def _tts_mistral(request, payload, file_path, file_body_path, user):
 # Dispatcher map: engine name -> handler
 _TTS_ENGINES = {
     'openai': _tts_openai,
+    'provider': _tts_provider,
     'openai-realtime': _tts_openai_realtime,
     'elevenlabs': _tts_elevenlabs,
     'azure': _tts_azure,
@@ -775,6 +844,21 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             status_code=status.HTTP_403_FORBIDDEN,
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
+
+    media_cache_scope = b''
+    if engine == 'provider':
+        connection, api_key = await get_media_api_connection(
+            await Config.get('audio.tts.provider_connection_id'), user
+        )
+        media_cache_scope = JSONCodec.dumps(
+            {
+                'connection': connection.id,
+                'credential': connection.credential,
+                'base_url': provider_base_url(connection),
+                'user': user.id,
+                'voice': await Config.get('audio.tts.voice'),
+            }
+        ).encode('utf-8')
 
     body = await request.body()
     payload = None
@@ -805,7 +889,9 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         except ValueError:
             valid = False
         if not valid:
-            raise HTTPException(400, 'OpenAI Realtime requires an HTTP(S) API base URL without credentials or a query.')
+            raise HTTPException(
+                400, 'OpenAI Realtime requires an HTTP(S) API base URL without credentials or a query.'
+            )
         payload = {'input': text, 'model': model.strip(), 'voice': voice.strip(), 'api_base_url': base_url}
         payload['instructions'] = (
             await Config.get('audio.tts.realtime.prompt_template') or DEFAULT_REALTIME_TTS_PROMPT_TEMPLATE
@@ -816,6 +902,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
             body
             + str(engine).encode('utf-8')
             + str(await Config.get('audio.tts.model')).encode('utf-8')
+            + media_cache_scope
             + (b':slim' if USE_SLIM else b'')
         ).hexdigest()
 
@@ -894,68 +981,94 @@ async def _transcribe_whisper(request, file_path, languages, file_dir, id):
     return data
 
 
-async def _transcribe_openai(request, file_path, filename, languages, file_dir, id, user=None):
+async def _transcribe_openai(
+    request,
+    file_path,
+    filename,
+    languages,
+    file_dir,
+    id,
+    user=None,
+    *,
+    use_provider: bool = False,
+):
     """Transcribe audio via an OpenAI-compatible STT endpoint."""
     r = None
     try:
-        session = await get_session()
-        api_key = await Config.get('audio.stt.openai.api_key')
-        api_base_url = await Config.get('audio.stt.openai.api_base_url')
-        request_format = (await Config.get('audio.stt.openai.api_request_format') or 'multipart').lower()
+        connection = None
+        if use_provider:
+            connection, api_key = await get_media_api_connection(
+                await Config.get('audio.stt.provider_connection_id'), user
+            )
+            api_base_url = provider_base_url(connection)
+            request_format = 'multipart'
+        else:
+            api_key = await Config.get('audio.stt.openai.api_key')
+            api_base_url = await Config.get('audio.stt.openai.api_base_url')
+            request_format = (await Config.get('audio.stt.openai.api_request_format') or 'multipart').lower()
 
         headers = {'Authorization': f'Bearer {api_key}'}
         if user and ENABLE_FORWARD_USER_INFO_HEADERS:
             headers = include_user_info_headers(headers, user)
 
-        for language in languages:
-            payload = {'model': await Config.get('audio.stt.model')}
-            if language:
-                payload['language'] = language
+        async with media_http_session(connection) as session:
+            for language in languages:
+                payload = {'model': await Config.get('audio.stt.model')}
+                if language:
+                    payload['language'] = language
 
-            if request_format == 'json':
-                ext = os.path.splitext(filename)[1].lower().lstrip('.') or 'wav'
-                async with aiofiles.open(file_path, 'rb') as f:
-                    payload['input_audio'] = {
-                        'data': base64.b64encode(await f.read()).decode('utf-8'),
-                        'format': 'ogg' if ext == 'oga' else ext,
-                    }
+                if request_format == 'json':
+                    ext = os.path.splitext(filename)[1].lower().lstrip('.') or 'wav'
+                    async with aiofiles.open(file_path, 'rb') as f:
+                        payload['input_audio'] = {
+                            'data': base64.b64encode(await f.read()).decode('utf-8'),
+                            'format': 'ogg' if ext == 'oga' else ext,
+                        }
 
-                r = await session.post(
-                    url=f'{api_base_url}/audio/transcriptions',
-                    headers={**headers, 'Content-Type': 'application/json'},
-                    json=payload,
-                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
-                )
-            else:
-                form_data = aiohttp.FormData()
-                for key, value in payload.items():
-                    form_data.add_field(key, str(value))
+                    r = await session.post(
+                        url=f'{api_base_url}/audio/transcriptions',
+                        headers={**headers, 'Content-Type': 'application/json'},
+                        json=payload,
+                        ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                        allow_redirects=False,
+                    )
+                else:
+                    form_data = aiohttp.FormData()
+                    for key, value in payload.items():
+                        form_data.add_field(key, str(value))
 
-                async def audio_chunks():
-                    async with aiofiles.open(file_path, 'rb') as audio_file:
-                        while chunk := await audio_file.read(AIOHTTP_FILE_STREAM_CHUNK_SIZE):
-                            yield chunk
+                    async def audio_chunks():
+                        async with aiofiles.open(file_path, 'rb') as audio_file:
+                            while chunk := await audio_file.read(AIOHTTP_FILE_STREAM_CHUNK_SIZE):
+                                yield chunk
 
-                form_data.add_field('file', audio_chunks(), filename=filename)
+                    form_data.add_field('file', audio_chunks(), filename=filename)
 
-                r = await session.post(
-                    url=f'{api_base_url}/audio/transcriptions',
-                    headers=headers,
-                    data=form_data,
-                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
-                )
-            if r.status == 200:
-                break
+                    r = await session.post(
+                        url=f'{api_base_url}/audio/transcriptions',
+                        headers=headers,
+                        data=form_data,
+                        ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                        allow_redirects=False,
+                    )
+                if r.status == 200:
+                    break
 
-        # raise_for_status releases the response, so read the error body first
-        await r.read()
-        r.raise_for_status()
-        data = await r.json()
+            # raise_for_status releases the response, so read the error body first
+            await r.read()
+            if use_provider and not 200 <= r.status < 300:
+                raise provider_http_error(r.status)
+            r.raise_for_status()
+            data = await r.json()
 
         async with aiofiles.open(os.path.join(file_dir, f'{id}.json'), 'w') as f:
             await f.write(JSONCodec.dumps(data))
         return data
+    except HTTPException:
+        raise
     except Exception as e:
+        if use_provider:
+            raise HTTPException(502, 'Could not reach the transcription provider') from None
         log.exception(e)
         detail = None
         if r is not None:
@@ -1180,6 +1293,17 @@ async def transcription_handler(request, file_path, metadata, user=None):
         return await _transcribe_whisper(request, file_path, languages, file_dir, id)
     elif await Config.get('audio.stt.engine') == 'openai':
         return await _transcribe_openai(request, file_path, filename, languages, file_dir, id, user)
+    elif await Config.get('audio.stt.engine') == 'provider':
+        return await _transcribe_openai(
+            request,
+            file_path,
+            filename,
+            languages,
+            file_dir,
+            id,
+            user,
+            use_provider=True,
+        )
     elif await Config.get('audio.stt.engine') == 'deepgram':
         return await _transcribe_deepgram(request, file_path, languages, file_dir, id)
     elif await Config.get('audio.stt.engine') == 'azure':
@@ -1552,7 +1676,10 @@ async def get_available_models(request: Request) -> list[dict]:
     engine = await Config.get('audio.tts.engine')
     _timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
 
-    if engine == 'openai':
+    if engine == 'provider':
+        model = await Config.get('audio.tts.model')
+        available_models = [{'id': model}] if model else []
+    elif engine == 'openai':
         base_url = await Config.get('audio.tts.openai.api_base_url')
         if not base_url.startswith('https://api.openai.com'):
             session = await get_session()
@@ -1634,6 +1761,9 @@ async def get_available_voices(request) -> dict:
             voice: voice
             for voice in ('alloy', 'ash', 'ballad', 'coral', 'echo', 'sage', 'shimmer', 'verse', 'marin', 'cedar')
         }
+
+    if engine == 'provider':
+        return dict(_OPENAI_DEFAULT_VOICES)
 
     if engine == 'openai':
         base_url = await Config.get('audio.tts.openai.api_base_url')

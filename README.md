@@ -70,3 +70,7 @@ docker build -t open-webui-backend:dev .
 
 不要把 `.env`、密钥、数据库、上传、备份和真实聊天提交到此公共仓库。已有 `LICENSE`、`LICENSE_NOTICE` 和 `LICENSE_HISTORY` 说明适用的上游许可；官方说明备份在 [UPSTREAM_README.md](docs/UPSTREAM_README.md)。
 
+
+## 厂商接入
+
+新厂商账号、共享 API 和 ChatGPT 首次授权见 [厂商连接指南](docs/provider-connections.md)。

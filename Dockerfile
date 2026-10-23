@@ -19,6 +19,7 @@ COPY package.json CHANGELOG.md backend.upstream.json frontend.lock.json /app/
 COPY LICENSE LICENSE_HISTORY LICENSE_NOTICE CONTRIBUTOR_LICENSE_AGREEMENT /app/licenses/
 COPY .build/frontend/ /app/build/
 COPY scripts/frontend_archive.py /app/backend-build/frontend_archive.py
+COPY scripts/chatgpt-authorize.py /app/scripts/chatgpt-authorize.py
 
 ENV FRONTEND_BUILD_DIR=/app/build \
     FRONTEND_LOCK_FILE=/app/frontend.lock.json \

@@ -32,7 +32,7 @@ from open_webui.utils.filter import (
     process_filter_functions,
 )
 from open_webui.utils.json_codec import JSONCodec
-from open_webui.utils.models import check_model_access, get_all_models
+from open_webui.utils.models import check_model_access, get_all_models, get_request_models, load_provider_models
 from open_webui.utils.payload import apply_system_prompt_to_body, convert_payload_openai_to_ollama
 from open_webui.utils.response import (
     convert_response_ollama_to_openai,
@@ -152,6 +152,7 @@ async def generate_chat_completion(
     bypass_filter: bool = False,
     bypass_system_prompt: bool = False,
 ):
+    await load_provider_models(request, user)
     log.debug('generate_chat_completion: %s', form_data)
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
@@ -178,12 +179,12 @@ async def generate_chat_completion(
         # dict(...items()) is one HGETALL on a Redis-backed pool; ``{**pool}``
         # would issue HKEYS plus one HGET per model.
         models = {
-            **dict(request.app.state.MODELS.items()),
+            **dict(get_request_models(request).items()),
             request.state.model['id']: request.state.model,
         }
         log.debug('direct connection to model: %s', request.state.model['id'])
     else:
-        models = request.app.state.MODELS
+        models = get_request_models(request)
 
     model_id = form_data['model']
     # Single lookup — membership check plus getitem would be two Redis
@@ -220,7 +221,7 @@ async def generate_chat_completion(
             if model_ids and filter_mode == 'exclude':
                 model_ids = [
                     available_model['id']
-                    for available_model in list(request.app.state.MODELS.values())
+                    for available_model in list(get_request_models(request).values())
                     if available_model.get('owned_by') != 'arena' and available_model['id'] not in model_ids
                 ]
 
@@ -229,7 +230,7 @@ async def generate_chat_completion(
             else:
                 model_ids = [
                     available_model['id']
-                    for available_model in list(request.app.state.MODELS.values())
+                    for available_model in list(get_request_models(request).values())
                     if available_model.get('owned_by') != 'arena'
                 ]
                 selected_model_id = random.choice(model_ids)
@@ -238,7 +239,7 @@ async def generate_chat_completion(
 
             # bypass_filter recursion below skips the line-200 check; gate the resolved model here.
             if not bypass_filter and user.role == 'user':
-                selected_model = request.app.state.MODELS.get(selected_model_id)
+                selected_model = get_request_models(request).get(selected_model_id)
                 if selected_model:
                     await check_model_access(user, selected_model)
 
@@ -276,6 +277,11 @@ async def generate_chat_completion(
                 if not isinstance(response, dict):
                     return response
                 return {**response, 'selected_model_id': selected_model_id}
+
+        if model_id.startswith('provider:'):
+            from open_webui.utils.providers import provider_chat_completion
+
+            return await provider_chat_completion(model_id, form_data, user)
 
         if model.get('pipe'):
             # Below does not require bypass_filter because this is the only route the uses this function and it is already bypassing the filter
@@ -317,16 +323,17 @@ chat_completion = generate_chat_completion
 
 
 async def chat_completed(request: Request, form_data: dict, user: Any):
-    if not request.app.state.MODELS:
+    await load_provider_models(request, user)
+    if not get_request_models(request):
         await get_all_models(request, user=user)
 
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
-            **dict(request.app.state.MODELS.items()),
+            **dict(get_request_models(request).items()),
             request.state.model['id']: request.state.model,
         }
     else:
-        models = request.app.state.MODELS
+        models = get_request_models(request)
 
     data = form_data
 

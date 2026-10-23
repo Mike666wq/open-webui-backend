@@ -44,6 +44,12 @@ from open_webui.utils.images.comfyui import (
 )
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.session_pool import get_session
+from open_webui.utils.providers import (
+    get_media_api_connection,
+    media_http_session,
+    provider_base_url,
+    provider_http_error,
+)
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -70,6 +76,7 @@ IMAGE_CONFIG_KEYS = {
     'ENABLE_IMAGE_PROMPT_GENERATION': 'image_generation.prompt.enable',
     'IMAGE_GENERATION_ENGINE': 'image_generation.engine',
     'IMAGE_GENERATION_MODEL': 'image_generation.model',
+    'IMAGES_PROVIDER_CONNECTION_ID': 'image_generation.provider_connection_id',
     'IMAGE_SIZE': 'image_generation.size',
     'IMAGE_STEPS': 'image_generation.steps',
     'IMAGES_OPENAI_API_BASE_URL': 'image_generation.openai.api_base_url',
@@ -89,6 +96,7 @@ IMAGE_CONFIG_KEYS = {
     'ENABLE_IMAGE_EDIT': 'images.edit.enable',
     'IMAGE_EDIT_ENGINE': 'images.edit.engine',
     'IMAGE_EDIT_MODEL': 'images.edit.model',
+    'IMAGES_EDIT_PROVIDER_CONNECTION_ID': 'images.edit.provider_connection_id',
     'IMAGE_EDIT_SIZE': 'images.edit.size',
     'IMAGES_EDIT_OPENAI_API_BASE_URL': 'images.edit.openai.api_base_url',
     'IMAGES_EDIT_OPENAI_API_KEY': 'images.edit.openai.api_key',
@@ -205,7 +213,9 @@ async def get_image_model(request):
     if image_config.IMAGE_GENERATION_ENGINE == 'openai':
         return image_config.IMAGE_GENERATION_MODEL if image_config.IMAGE_GENERATION_MODEL else 'dall-e-2'
     elif image_config.IMAGE_GENERATION_ENGINE == 'gemini':
-        return image_config.IMAGE_GENERATION_MODEL if image_config.IMAGE_GENERATION_MODEL else 'imagen-3.0-generate-002'
+        return (
+            image_config.IMAGE_GENERATION_MODEL if image_config.IMAGE_GENERATION_MODEL else 'imagen-3.0-generate-002'
+        )
     elif image_config.IMAGE_GENERATION_ENGINE == 'comfyui':
         return image_config.IMAGE_GENERATION_MODEL if image_config.IMAGE_GENERATION_MODEL else ''
     elif image_config.IMAGE_GENERATION_ENGINE == 'automatic1111' or image_config.IMAGE_GENERATION_ENGINE == '':
@@ -232,6 +242,7 @@ class ImagesConfig(BaseModel):
 
     IMAGE_GENERATION_ENGINE: str
     IMAGE_GENERATION_MODEL: str
+    IMAGES_PROVIDER_CONNECTION_ID: str = ''
     IMAGE_SIZE: str | None
     IMAGE_STEPS: int | None
 
@@ -256,6 +267,7 @@ class ImagesConfig(BaseModel):
     ENABLE_IMAGE_EDIT: bool
     IMAGE_EDIT_ENGINE: str
     IMAGE_EDIT_MODEL: str
+    IMAGES_EDIT_PROVIDER_CONNECTION_ID: str = ''
     IMAGE_EDIT_SIZE: str | None
 
     IMAGES_EDIT_OPENAI_API_BASE_URL: str
@@ -276,6 +288,10 @@ async def get_config(request: Request, user=Depends(get_admin_user)):
 
 @router.post('/config/update')
 async def update_config(request: Request, form_data: ImagesConfig, user=Depends(get_admin_user)):
+    if form_data.IMAGE_GENERATION_ENGINE == 'provider':
+        await get_media_api_connection(form_data.IMAGES_PROVIDER_CONNECTION_ID, user)
+    if form_data.IMAGE_EDIT_ENGINE == 'provider':
+        await get_media_api_connection(form_data.IMAGES_EDIT_PROVIDER_CONNECTION_ID, user)
     if form_data.IMAGE_SIZE == 'auto' and not re.match(
         IMAGE_AUTO_SIZE_MODELS_REGEX_PATTERN, form_data.IMAGE_GENERATION_MODEL
     ):
@@ -364,7 +380,11 @@ async def verify_connection(form_data: ConnectionVerificationForm, user=Depends(
 async def get_models(request: Request, user=Depends(get_verified_user)):
     image_config = await get_image_config()
     try:
-        if image_config.IMAGE_GENERATION_ENGINE == 'openai':
+        if image_config.IMAGE_GENERATION_ENGINE == 'provider':
+            await get_media_api_connection(image_config.IMAGES_PROVIDER_CONNECTION_ID, user)
+            model = image_config.IMAGE_GENERATION_MODEL
+            return [{'id': model, 'name': model}] if model else []
+        elif image_config.IMAGE_GENERATION_ENGINE == 'openai':
             return [
                 {'id': 'dall-e-2', 'name': 'DALL·E 2'},
                 {'id': 'dall-e-3', 'name': 'DALL·E 3'},
@@ -499,6 +519,7 @@ async def get_image_data(data: str, headers=None, trusted_base_url: str | None =
                     data,
                     headers=headers,
                     ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                    allow_redirects=False,
                 ) as r,
             ):
                 r.raise_for_status()
@@ -606,6 +627,15 @@ async def image_generations(
     user=None,
 ):
     image_config = await get_image_config()
+    media_connection = None
+    if image_config.IMAGE_GENERATION_ENGINE == 'provider':
+        media_connection, api_key = await get_media_api_connection(image_config.IMAGES_PROVIDER_CONNECTION_ID, user)
+        image_config.IMAGE_GENERATION_ENGINE = 'openai'
+        image_config.IMAGES_OPENAI_API_BASE_URL = provider_base_url(media_connection)
+        image_config.IMAGES_OPENAI_API_KEY = api_key
+        image_config.IMAGES_OPENAI_API_VERSION = ''
+        image_config.IMAGES_OPENAI_API_PARAMS = {}
+
     # if IMAGE_SIZE = 'auto', default WidthxHeight to the 512x512 default
     # This is only relevant when the user has set IMAGE_SIZE to 'auto' with an
     # image model other than gpt-image-1, which is warned about on settings save
@@ -621,7 +651,11 @@ async def image_generations(
 
     metadata = metadata or {}
 
-    model = await get_image_model(request)
+    model = image_config.IMAGE_GENERATION_MODEL if media_connection else await get_image_model(request)
+    if media_connection and not model:
+        raise HTTPException(400, 'Select an image model for this provider connection')
+    if media_connection and form_data.model and form_data.model != model:
+        raise HTTPException(400, 'Use the configured image model for this provider connection')
 
     try:
         if image_config.IMAGE_GENERATION_ENGINE == 'openai':
@@ -650,20 +684,25 @@ async def image_generations(
                     {}
                     if re.match(
                         IMAGE_URL_RESPONSE_MODELS_REGEX_PATTERN,
-                        image_config.IMAGE_GENERATION_MODEL,
+                        model,
                     )
                     else {'response_format': 'b64_json'}
                 ),
                 **({} if not image_config.IMAGES_OPENAI_API_PARAMS else image_config.IMAGES_OPENAI_API_PARAMS),
             }
 
-            session = await get_session()
-            async with session.post(
-                url=url,
-                json=data,
-                headers=headers,
-                ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            ) as r:
+            async with (
+                media_http_session(media_connection) as session,
+                session.post(
+                    url=url,
+                    json=data,
+                    headers=headers,
+                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                    allow_redirects=False,
+                ) as r,
+            ):
+                if media_connection and not 200 <= r.status < 300:
+                    raise provider_http_error(r.status)
                 r.raise_for_status()
                 res = await r.json(content_type=None)
 
@@ -673,9 +712,11 @@ async def image_generations(
                 if image_url := image.get('url', None):
                     image_data, content_type = await get_image_data(
                         image_url,
-                        {k: v for k, v in headers.items() if k != 'Content-Type'}
-                        if _is_same_origin(image_url, image_config.IMAGES_OPENAI_API_BASE_URL)
-                        else None,
+                        (
+                            {k: v for k, v in headers.items() if k != 'Content-Type'}
+                            if _is_same_origin(image_url, image_config.IMAGES_OPENAI_API_BASE_URL)
+                            else None
+                        ),
                     )
                 else:
                     image_data, content_type = await get_image_data(image['b64_json'])
@@ -844,6 +885,8 @@ async def image_generations(
                 )
                 images.append(image_file)
             return images
+    except HTTPException:
+        raise
     except Exception as e:
         error = e
         if isinstance(e, aiohttp.ClientResponseError):
@@ -906,6 +949,16 @@ async def image_edits(
     user=Depends(get_verified_user),
 ):
     image_config = await get_image_config()
+    media_connection = None
+    if image_config.IMAGE_EDIT_ENGINE == 'provider':
+        media_connection, api_key = await get_media_api_connection(
+            image_config.IMAGES_EDIT_PROVIDER_CONNECTION_ID, user
+        )
+        image_config.IMAGE_EDIT_ENGINE = 'openai'
+        image_config.IMAGES_EDIT_OPENAI_API_BASE_URL = provider_base_url(media_connection)
+        image_config.IMAGES_EDIT_OPENAI_API_KEY = api_key
+        image_config.IMAGES_EDIT_OPENAI_API_VERSION = ''
+
     size = None
     width, height = None, None
     metadata = metadata or {}
@@ -917,6 +970,12 @@ async def image_edits(
         width, height = tuple(map(int, size.split('x')))
 
     model = image_config.IMAGE_EDIT_MODEL if form_data.model is None else form_data.model
+    if media_connection:
+        if not image_config.IMAGE_EDIT_MODEL:
+            raise HTTPException(400, 'Select an image edit model for this provider connection')
+        if form_data.model and form_data.model != image_config.IMAGE_EDIT_MODEL:
+            raise HTTPException(400, 'Use the configured image edit model for this provider connection')
+        model = image_config.IMAGE_EDIT_MODEL
 
     try:
 
@@ -999,7 +1058,7 @@ async def image_edits(
                     {}
                     if re.match(
                         IMAGE_URL_RESPONSE_MODELS_REGEX_PATTERN,
-                        image_config.IMAGE_EDIT_MODEL,
+                        model,
                     )
                     else {'response_format': 'b64_json'}
                 ),
@@ -1036,13 +1095,18 @@ async def image_edits(
                     content_type=content_type_val,
                 )
 
-            session = await get_session()
-            async with session.post(
-                url=f'{image_config.IMAGES_EDIT_OPENAI_API_BASE_URL}/images/edits{url_search_params}',
-                headers=headers,
-                data=form,
-                ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            ) as r:
+            async with (
+                media_http_session(media_connection) as session,
+                session.post(
+                    url=f'{image_config.IMAGES_EDIT_OPENAI_API_BASE_URL}/images/edits{url_search_params}',
+                    headers=headers,
+                    data=form,
+                    ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                    allow_redirects=False,
+                ) as r,
+            ):
+                if media_connection and not 200 <= r.status < 300:
+                    raise provider_http_error(r.status)
                 r.raise_for_status()
                 res = await r.json(content_type=None)
 
@@ -1051,9 +1115,11 @@ async def image_edits(
                 if image_url := image.get('url', None):
                     image_data, content_type = await get_image_data(
                         image_url,
-                        {k: v for k, v in headers.items() if k != 'Content-Type'}
-                        if _is_same_origin(image_url, image_config.IMAGES_EDIT_OPENAI_API_BASE_URL)
-                        else None,
+                        (
+                            {k: v for k, v in headers.items() if k != 'Content-Type'}
+                            if _is_same_origin(image_url, image_config.IMAGES_EDIT_OPENAI_API_BASE_URL)
+                            else None
+                        ),
                     )
                 else:
                     image_data, content_type = await get_image_data(image['b64_json'])
@@ -1202,6 +1268,8 @@ async def image_edits(
                 images.append(image_file)
 
             return images
+    except HTTPException:
+        raise
     except Exception as e:
         error = e
         if isinstance(e, aiohttp.ClientResponseError):

@@ -2,6 +2,7 @@ import asyncio
 import copy
 import logging
 import sys
+from collections import ChainMap
 
 from fastapi import Request
 from open_webui.config import (
@@ -87,6 +88,20 @@ async def get_all_base_models(request: Request, user: UserModel = None):
     return function_models + openai_models + ollama_models
 
 
+def get_request_models(request):
+    """Overlay private provider models without ever publishing them to app/Redis state."""
+    provider_models = getattr(request.state, 'provider_models', {})
+    return ChainMap(provider_models, request.app.state.MODELS) if provider_models else request.app.state.MODELS
+
+
+async def load_provider_models(request, user):
+    from open_webui.utils.providers import list_visible_models
+
+    models = await list_visible_models(user) if user is not None else []
+    request.state.provider_models = {model['id']: model for model in models}
+    return models
+
+
 async def get_all_models(request, refresh: bool = False, user: UserModel = None):
     config = await Config.get_many(
         'models.base_models_cache',
@@ -131,7 +146,7 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
 
     # If there are no models, return an empty list
     if len(models) == 0:
-        return []
+        return await load_provider_models(request, user)
 
     # Add arena models
     if config.get('evaluation.arena.enable'):
@@ -487,10 +502,15 @@ async def get_all_models(request, refresh: bool = False, user: UserModel = None)
     else:
         request.app.state.MODELS = models_dict
 
-    return models
+    return models + await load_provider_models(request, user)
 
 
 async def check_model_access(user, model, model_info=None, db=None):
+    if model.get('id', '').startswith('provider:'):
+        from open_webui.utils.providers import resolve_model
+
+        await resolve_model(model['id'], user, db)
+        return
     if model.get('arena'):
         meta = model.get('info', {}).get('meta', {})
         access_grants = meta.get('access_grants', [])
@@ -555,6 +575,13 @@ async def check_model_access(user, model, model_info=None, db=None):
 
 
 async def get_filtered_models(models, user, db=None):
+    from open_webui.utils.providers import list_visible_models
+
+    provider_models = [model for model in models if model.get('id', '').startswith('provider:')]
+    models = [model for model in models if not model.get('id', '').startswith('provider:')]
+    if provider_models:
+        visible_ids = {model['id'] for model in await list_visible_models(user, db)}
+        provider_models = [model for model in provider_models if model['id'] in visible_ids]
     # Filter out models that the user does not have access to
     if (
         user.role == 'user' or (user.role == 'admin' and not BYPASS_ADMIN_ACCESS_CONTROL)
@@ -608,6 +635,6 @@ async def get_filtered_models(models, user, db=None):
                 # only admins can see unconfigured models.
                 filtered_models.append(model)
 
-        return filtered_models
+        return filtered_models + provider_models
     else:
-        return models
+        return models + provider_models
