@@ -64,6 +64,8 @@ from open_webui.utils.providers import (
     media_http_session,
     provider_base_url,
     provider_http_error,
+    resolve_configured_media,
+    resolve_media_model,
 )
 from open_webui.utils.session_pool import get_session
 from pydantic import BaseModel, Field
@@ -335,9 +337,9 @@ async def get_audio_config(request: Request, user=Depends(get_admin_user)):
 @router.post('/config/update')
 async def update_audio_config(request: Request, form_data: AudioConfigUpdateForm, user=Depends(get_admin_user)):
     if form_data.tts.ENGINE == 'provider':
-        await get_media_api_connection(form_data.tts.PROVIDER_CONNECTION_ID, user)
+        await resolve_configured_media(form_data.tts.PROVIDER_CONNECTION_ID, form_data.tts.MODEL, user, 'speech')
     if form_data.stt.ENGINE == 'provider':
-        await get_media_api_connection(form_data.stt.PROVIDER_CONNECTION_ID, user)
+        await resolve_configured_media(form_data.stt.PROVIDER_CONNECTION_ID, form_data.stt.MODEL, user, 'transcription')
     if USE_SLIM:
         current = await Config.get_many('audio.stt.engine', 'audio.tts.engine')
         if form_data.stt.ENGINE == '' and current.get('audio.stt.engine') != '':
@@ -529,10 +531,10 @@ async def _tts_openai(request, payload, file_path, file_body_path, user):
 
 async def _tts_provider(request, payload, file_path, file_body_path, user):
     """Generate speech with an administrator-selected API-key connection."""
-    connection, api_key = await get_media_api_connection(
-        await Config.get('audio.tts.provider_connection_id'),
-        user,
+    resolved = await resolve_configured_media(
+        await Config.get('audio.tts.provider_connection_id'), await Config.get('audio.tts.model'), user, 'speech'
     )
+    connection, api_key = await get_media_api_connection(resolved.connection.id, user)
     return await _tts_openai_compatible(
         request,
         payload,
@@ -541,7 +543,7 @@ async def _tts_provider(request, payload, file_path, file_body_path, user):
         user,
         api_key=api_key,
         api_base_url=provider_base_url(connection),
-        model=await Config.get('audio.tts.model'),
+        model=resolved.upstream_model_id,
         voice=await Config.get('audio.tts.voice'),
         media_connection=connection,
     )
@@ -583,9 +585,7 @@ async def _tts_openai_realtime(request, payload, file_path, file_body_path, user
                     event_type = event['type']
                     if event_type == 'error':
                         # Provider messages may contain input text or credentials.
-                        raise HTTPException(
-                            502, 'OpenAI Realtime rejected synthesis. Check the model, voice, and key.'
-                        )
+                        raise HTTPException(502, 'OpenAI Realtime rejected synthesis. Check the model, voice, and key.')
                     if event_type == 'session.created':
                         await ws.send_json(
                             {
@@ -847,8 +847,9 @@ async def speech(request: Request, user=Depends(get_verified_user)):
 
     media_cache_scope = b''
     if engine == 'provider':
-        connection, api_key = await get_media_api_connection(
-            await Config.get('audio.tts.provider_connection_id'), user
+        connection, api_key = await get_media_api_connection(await Config.get('audio.tts.provider_connection_id'), user)
+        await resolve_configured_media(
+            await Config.get('audio.tts.provider_connection_id'), await Config.get('audio.tts.model'), user, 'speech'
         )
         media_cache_scope = JSONCodec.dumps(
             {
@@ -889,9 +890,7 @@ async def speech(request: Request, user=Depends(get_verified_user)):
         except ValueError:
             valid = False
         if not valid:
-            raise HTTPException(
-                400, 'OpenAI Realtime requires an HTTP(S) API base URL without credentials or a query.'
-            )
+            raise HTTPException(400, 'OpenAI Realtime requires an HTTP(S) API base URL without credentials or a query.')
         payload = {'input': text, 'model': model.strip(), 'voice': voice.strip(), 'api_base_url': base_url}
         payload['instructions'] = (
             await Config.get('audio.tts.realtime.prompt_template') or DEFAULT_REALTIME_TTS_PROMPT_TEMPLATE
@@ -992,15 +991,26 @@ async def _transcribe_openai(
     *,
     use_provider: bool = False,
     response_format: str | None = None,
+    model_ref: str | None = None,
 ):
     """Transcribe audio via an OpenAI-compatible STT endpoint."""
+    from open_webui.utils.provider_capabilities import provider_family
+
     r = None
     try:
         connection = None
         if use_provider:
-            connection, api_key = await get_media_api_connection(
-                await Config.get('audio.stt.provider_connection_id'), user
+            resolved = (
+                await resolve_media_model(model_ref, user, 'transcription')
+                if model_ref
+                else await resolve_configured_media(
+                    await Config.get('audio.stt.provider_connection_id'),
+                    await Config.get('audio.stt.model'),
+                    user,
+                    'transcription',
+                )
             )
+            connection, api_key = await get_media_api_connection(resolved.connection.id, user)
             api_base_url = provider_base_url(connection)
             request_format = 'multipart'
         else:
@@ -1014,7 +1024,10 @@ async def _transcribe_openai(
 
         async with media_http_session(connection) as session:
             for language in languages:
-                payload = {'model': await Config.get('audio.stt.model')}
+                payload = {'model': resolved.upstream_model_id if use_provider else await Config.get('audio.stt.model')}
+                if connection and provider_family(connection) == 'siliconflow':
+                    language = None
+                    response_format = None
                 if response_format:
                     payload['response_format'] = response_format
                 if language:
@@ -1294,11 +1307,32 @@ async def transcription_handler(request, file_path, metadata, user=None):
     if metadata.get('_recording_single_attempt'):
         languages = languages[:1]
 
+    if metadata.get('_provider_model_ref'):
+        return await _transcribe_openai(
+            request,
+            file_path,
+            filename,
+            languages,
+            file_dir,
+            id,
+            user,
+            use_provider=True,
+            model_ref=metadata['_provider_model_ref'],
+            response_format=metadata.get('_recording_response_format'),
+        )
     if await Config.get('audio.stt.engine') == '':
         return await _transcribe_whisper(request, file_path, languages, file_dir, id)
     elif await Config.get('audio.stt.engine') == 'openai':
-        return await _transcribe_openai(request, file_path, filename, languages, file_dir, id, user,
-            response_format=metadata.get('_recording_response_format'))
+        return await _transcribe_openai(
+            request,
+            file_path,
+            filename,
+            languages,
+            file_dir,
+            id,
+            user,
+            response_format=metadata.get('_recording_response_format'),
+        )
     elif await Config.get('audio.stt.engine') == 'provider':
         return await _transcribe_openai(
             request,
@@ -1758,7 +1792,7 @@ _OPENAI_DEFAULT_VOICES = {
 }
 
 
-async def get_available_voices(request) -> dict:
+async def get_available_voices(request, user=None) -> dict:
     """Return ``{voice_id: voice_name}`` for the configured TTS engine."""
     engine = await Config.get('audio.tts.engine')
     _timeout = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_LIST)
@@ -1770,6 +1804,16 @@ async def get_available_voices(request) -> dict:
         }
 
     if engine == 'provider':
+        from open_webui.utils.provider_capabilities import SILICONFLOW_PRESET_VOICES, provider_family
+
+        resolved = await resolve_configured_media(
+            await Config.get('audio.tts.provider_connection_id'), await Config.get('audio.tts.model'), user, 'speech'
+        )
+        if provider_family(resolved.connection) == 'siliconflow':
+            return {
+                f'{resolved.upstream_model_id}:{voice}': voice
+                for voice in SILICONFLOW_PRESET_VOICES
+            }
         return dict(_OPENAI_DEFAULT_VOICES)
 
     if engine == 'openai':
@@ -1859,4 +1903,4 @@ async def get_available_voices(request) -> dict:
 
 @router.get('/voices')
 async def get_voices(request: Request, user=Depends(get_verified_user)):
-    return {'voices': [{'id': k, 'name': v} for k, v in (await get_available_voices(request)).items()]}
+    return {'voices': [{'id': k, 'name': v} for k, v in (await get_available_voices(request, user)).items()]}

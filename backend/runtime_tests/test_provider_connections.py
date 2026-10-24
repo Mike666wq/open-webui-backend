@@ -38,7 +38,15 @@ class ProviderConnectionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(provider=provider_id):
                 self.connection.provider_id = provider_id
                 model_id = providers.stable_model_id(self.connection.id, 'text-model')
-                models = [{'id': model_id, 'upstream_id': 'text-model', 'capabilities': [], 'features': features}]
+                models = [
+                    {
+                        'id': model_id,
+                        'upstream_id': 'text-model',
+                        'capabilities': [],
+                        'features': features,
+                        'uses': {'chat': 'openai-chat'},
+                    }
+                ]
                 db = SimpleNamespace(
                     get=AsyncMock(return_value=self.connection),
                     scalars=AsyncMock(return_value=SimpleNamespace(all=lambda: [self.connection])),

@@ -18,17 +18,23 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 from open_webui.env import VERSION, WEBUI_SECRET_KEY
+from open_webui.internal.db import get_async_db_context
 from open_webui.models.access_grants import AccessGrants
-from open_webui.models.provider_connections import ProviderConnection
+from open_webui.models.provider_connections import ProviderConnection, new_provider_connection
 from open_webui.utils.apps import AppTCPConnector, validate_app_url
+from open_webui.utils.provider_capabilities import normalize_model, provider_family
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from open_webui.internal.db import get_async_db_context
-from open_webui.models.provider_connections import new_provider_connection
 
 log = logging.getLogger(__name__)
 
 PROVIDER_CATALOG = [
+    {
+        'id': 'siliconflow',
+        'name': 'SiliconFlow',
+        'auth_types': ['api_key'],
+        'default_base_url': 'https://api.siliconflow.cn/v1',
+    },
     {'id': 'openai', 'name': 'OpenAI', 'auth_types': ['api_key'], 'default_base_url': 'https://api.openai.com/v1'},
     {
         'id': 'deepseek',
@@ -105,7 +111,7 @@ def decrypt_credential(value: str | None) -> str | None:
 
 def public_connection(connection: ProviderConnection) -> dict:
     config = dict(connection.config or {})
-    config.pop('_models_by_user', None)
+    config = {key: value for key, value in config.items() if not key.startswith('_')}
     for key in ('host_id', 'client_id', 'subject', 'device_id'):
         config.pop(key, None)
     return {
@@ -117,7 +123,7 @@ def public_connection(connection: ProviderConnection) -> dict:
         'owner_id': connection.owner_id,
         'config': config,
         'status': connection.status,
-        'models': connection.models or [],
+        'models': [normalize_model(connection, model) for model in connection.models or []],
         'configured': bool(connection.credential)
         or (connection.auth_type == 'oauth' and connection.status != 'disconnected'),
         'created_at': connection.created_at,
@@ -334,6 +340,23 @@ async def discover_connection_models(connection: ProviderConnection, user) -> li
             raise
         except Exception:
             raise HTTPException(502, 'Could not discover ChatGPT models') from None
+    elif provider_family(connection) == 'siliconflow':
+        base = provider_base_url(connection)
+        payload = await _request_json(connection, user, f'{base}/models')
+        records_by_id = {
+            r['id']: dict(r, uses={}) for r in payload.get('data', []) if isinstance(r, dict) and r.get('id')
+        }
+        for sub_type, use, adapter in (
+            ('chat', 'chat', 'openai-chat'),
+            ('speech-to-text', 'transcription', 'openai-transcription'),
+            ('text-to-image', 'image', 'siliconflow-image'),
+        ):
+            typed = await _request_json(connection, user, f'{base}/models', params={'sub_type': sub_type})
+            for record in typed.get('data', []):
+                if isinstance(record, dict) and record.get('id'):
+                    item = records_by_id.setdefault(record['id'], dict(record, uses={}))
+                    item['uses'][use] = adapter
+        records = list(records_by_id.values())
     elif connection.provider_id == 'bailian':
         models_url = _bailian_models_url(connection)
         records = []
@@ -381,6 +404,7 @@ async def discover_connection_models(connection: ProviderConnection, user) -> li
                     'provider_id': connection.provider_id,
                     'connection_id': connection.id,
                     'capabilities': capabilities,
+                    'uses': record.get('uses', {}),
                     'features': features,
                     'model_info': record.get('model_info') if isinstance(record.get('model_info'), dict) else {},
                 }
@@ -398,7 +422,7 @@ async def discover_connection_models(connection: ProviderConnection, user) -> li
                     'connection_id': connection.id,
                 }
             )
-    return models
+    return [normalize_model(connection, model) for model in models]
 
 
 async def verify_provider_connection(connection: ProviderConnection, user) -> bool:
@@ -430,9 +454,36 @@ async def verify_provider_connection(connection: ProviderConnection, user) -> bo
         raise
 
 
+async def initialize_model_catalog(connection):
+    if (connection.config or {}).get('_catalog_version'):
+        return
+    from open_webui.models.config import Config
+
+    config = dict(connection.config or {})
+    overrides = dict(config.get('_model_overrides', {}))
+    for purpose, prefix in (('transcription', 'audio.stt'), ('speech', 'audio.tts'), ('image', 'image_generation')):
+        if (
+            await Config.get(f'{prefix}.engine') == 'provider'
+            and await Config.get(f'{prefix}.provider_connection_id') == connection.id
+        ):
+            model = await Config.get(f'{prefix}.model')
+            if model and not model.startswith('provider:'):
+                adapter = {'transcription': 'openai-transcription', 'speech': 'openai-speech', 'image': 'openai-image'}[
+                    purpose
+                ]
+                overrides[model] = {**overrides.get(model, {}), purpose: adapter}
+    connection.config = {
+        **config,
+        '_catalog_version': 1,
+        '_model_overrides': overrides,
+        '_legacy_chat_ids': [m['upstream_id'] for m in connection.models or [] if m.get('upstream_id')],
+    }
+
+
 async def visible_connection_models(connection: ProviderConnection, user, db: AsyncSession) -> list[dict]:
     if connection.status == 'disconnected' or not connection.credential:
         return []
+    await initialize_model_catalog(connection)
     cache = dict((connection.config or {}).get('_models_by_user') or {})
     current_credential_hash = hashlib.sha256((connection.credential or '').encode()).hexdigest()
     entry = cache.get(user.id)
@@ -441,7 +492,7 @@ async def visible_connection_models(connection: ProviderConnection, user, db: As
         and entry.get('credential_hash') == current_credential_hash
         and isinstance(entry.get('models'), list)
     ):
-        return entry['models']
+        return [normalize_model(connection, model) for model in entry['models']]
     models = await discover_connection_models(connection, user)
     cache[user.id] = {'credential_hash': current_credential_hash, 'models': models}
     connection.config = {**(connection.config or {}), '_models_by_user': cache}
@@ -478,6 +529,7 @@ async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
                         },
                     }
                     for model in await visible_connection_models(connection, user, db)
+                    if 'chat' in model.get('uses', {})
                 )
             except HTTPException as exc:
                 log.info(
@@ -499,7 +551,7 @@ async def _resolve_model(model_id: str, user, db: AsyncSession) -> ResolvedProvi
         raise HTTPException(404, 'Provider model not found')
     available = await visible_connection_models(connection, user, db)
     metadata = next((model for model in available if model['upstream_id'] == upstream_id), None)
-    if metadata is None:
+    if metadata is None or 'chat' not in metadata.get('uses', {}):
         raise HTTPException(404, 'Provider model not found')
     metadata = {
         **metadata,
@@ -578,7 +630,11 @@ async def provider_chat_completion(model_id: str, payload: dict, user, db: Async
         connection = resolved.connection
         token = await _authorization(connection, user)
         body = _openai_payload(payload, resolved.upstream_model_id)
-        api_type = (connection.config or {}).get('api_type', 'openai')
+        api_type = (
+            'responses'
+            if resolved.model_metadata.get('uses', {}).get('chat') == 'responses'
+            else (connection.config or {}).get('api_type', 'openai')
+        )
         if api_type == 'responses':
             from open_webui.routers.openai import convert_to_responses_payload
 
@@ -620,6 +676,7 @@ async def provider_chat_completion(model_id: str, payload: dict, user, db: Async
                 session,
                 require_completed=(
                     resolved.connection.provider_id == 'chatgpt'
+                    or resolved.model_metadata.get('uses', {}).get('chat') == 'responses'
                     or (resolved.connection.config or {}).get('api_type') == 'responses'
                 ),
             ),
@@ -657,7 +714,11 @@ async def provider_chat_completion(model_id: str, payload: dict, user, db: Async
             result = convert_responses_result(completed)
             result['model'] = model_id
             return result
-        api_type = (resolved.connection.config or {}).get('api_type', 'openai')
+        api_type = (
+            'responses'
+            if resolved.model_metadata.get('uses', {}).get('chat') == 'responses'
+            else (resolved.connection.config or {}).get('api_type', 'openai')
+        )
         try:
             result = json.loads(raw)
         except (ValueError, UnicodeDecodeError):
@@ -804,9 +865,7 @@ async def delete_provider_connection(
         connection.credential = None
         connection.is_active = True
         connection.models = []
-        connection.config = {
-            key: value for key, value in (connection.config or {}).items() if key != '_models_by_user'
-        }
+        connection.config = {key: value for key, value in (connection.config or {}).items() if key != '_models_by_user'}
         connection.status = 'disconnected'
         await session.commit()
         return connection
@@ -850,3 +909,36 @@ async def media_http_session(connection: ProviderConnection | None = None):
         trust_env=False,
     ) as session:
         yield session
+
+
+async def resolve_media_model(model_id, user, purpose, db=None):
+    """Resolve stable IDs with server-side purpose and connection authorization."""
+    async with _provider_db_scope(db) as session:
+        connection_id, upstream_id = parse_model_id(model_id)
+        connection = await session.get(ProviderConnection, connection_id)
+        await require_connection_access(connection, user, session)
+        if not connection.is_active:
+            raise HTTPException(404, 'Provider model not found')
+        if connection.auth_type != 'api_key':
+            raise HTTPException(400, 'This connection does not support media API calls')
+        models = await visible_connection_models(connection, user, session)
+        model = next((m for m in models if m['upstream_id'] == upstream_id), None)
+        if not model or purpose not in model.get('uses', {}):
+            raise HTTPException(400, 'Select a model supporting this purpose')
+        return ResolvedProviderModel(connection, upstream_id, user.id, model)
+
+
+async def resolve_configured_media(connection_id, model_id, user, purpose):
+    # Existing provider settings store a connection and raw upstream ID. New clients
+    # submit a stable model reference in the same model field.
+    if not connection_id or not model_id:
+        raise HTTPException(400, 'Select a connection and model')
+    stable_id = (
+        model_id
+        if isinstance(model_id, str) and model_id.startswith('provider:')
+        else stable_model_id(connection_id, model_id)
+    )
+    resolved = await resolve_media_model(stable_id, user, purpose)
+    if resolved.connection.id != connection_id:
+        raise HTTPException(400, 'Model does not belong to the selected connection')
+    return resolved

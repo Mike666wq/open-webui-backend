@@ -11,9 +11,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
-from PIL import Image
 from open_webui.routers import audio, images
 from open_webui.utils import providers
+from PIL import Image
 
 
 @asynccontextmanager
@@ -34,6 +34,18 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             credential=providers.encrypt_credential('saved-key'),
             config={},
         )
+
+        async def resolve(connection_id, model_id, user, purpose):
+            return SimpleNamespace(
+                connection=self.connection,
+                upstream_model_id=model_id,
+                model_metadata={'uses': {purpose: 'openai-image' if purpose == 'image' else 'openai-speech'}},
+            )
+
+        for module in (audio, images):
+            scoped = patch.object(module, 'resolve_configured_media', side_effect=resolve)
+            scoped.start()
+            self.addCleanup(scoped.stop)
 
     async def test_media_resolver_rejects_private_oauth_and_missing_connections(self):
         db = SimpleNamespace(get=AsyncMock(return_value=self.connection))
@@ -139,6 +151,168 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(kwargs['url'].endswith('/images/edits' if editing else '/images/generations'))
             self.assertEqual(upload.await_args.args[1], buffer.getvalue())
 
+    async def test_siliconflow_image_uses_native_payload_and_response(self):
+        self.connection.provider_id = 'siliconflow'
+        self.connection.config = {'base_url': 'https://api.siliconflow.cn/v1'}
+        config = SimpleNamespace(
+            IMAGE_GENERATION_ENGINE='provider',
+            IMAGES_PROVIDER_CONNECTION_ID='saved',
+            IMAGE_GENERATION_MODEL='image-model',
+            IMAGE_SIZE='1024x1024',
+        )
+        resolved = SimpleNamespace(
+            connection=self.connection,
+            upstream_model_id='image-model',
+            model_metadata={'uses': {'image': 'siliconflow-image'}},
+        )
+        response = SimpleNamespace(
+            status=200,
+            raise_for_status=Mock(),
+            json=AsyncMock(
+                return_value={'images': [{'url': 'https://api.siliconflow.cn/generated.png'}]}
+            ),
+        )
+
+        @asynccontextmanager
+        async def response_context():
+            yield response
+
+        session = SimpleNamespace(post=Mock(return_value=response_context()))
+        upload = AsyncMock(return_value=(None, {'id': 'generated', 'url': '/files/generated'}))
+        image_data = AsyncMock(return_value=(b'png-data', 'image/png'))
+        with (
+            patch.object(images, 'get_image_config', new=AsyncMock(return_value=config)),
+            patch.object(images, 'get_media_api_connection', new=AsyncMock(return_value=(self.connection, 'saved-key'))),
+            patch.object(
+                images,
+                'resolve_configured_media',
+                new=AsyncMock(return_value=resolved),
+            ),
+            patch.object(images, 'media_http_session', side_effect=lambda c: fake_session(session)),
+            patch.object(images, 'get_image_data', new=image_data),
+            patch.object(images, 'upload_image', new=upload),
+            patch.object(images, 'ENABLE_FORWARD_USER_INFO_HEADERS', False),
+        ):
+            result = await images.image_generations(
+                None,
+                images.CreateImageForm(prompt='generate', size='768x1024'),
+                user=self.owner,
+            )
+
+        self.assertEqual(result[0]['id'], 'generated')
+        request = session.post.call_args.kwargs
+        self.assertEqual(
+            request['json'],
+            {
+                'model': 'image-model',
+                'prompt': 'generate',
+                'image_size': '768x1024',
+            },
+        )
+        image_data.assert_awaited_once()
+        upload.assert_awaited_once()
+        self.assertEqual(upload.await_args.args[1], b'png-data')
+
+    async def test_siliconflow_compatible_asr_omits_unsupported_fields(self):
+        self.connection.provider_id = 'custom'
+        self.connection.config = {'base_url': 'https://api.siliconflow.cn/v1'}
+        resolved = SimpleNamespace(
+            connection=self.connection,
+            upstream_model_id='asr-model',
+            model_metadata={'uses': {'transcription': 'openai-transcription'}},
+        )
+        response = SimpleNamespace(
+            status=200,
+            raise_for_status=Mock(),
+            read=AsyncMock(return_value=b''),
+            json=AsyncMock(return_value={'text': 'hello'}),
+        )
+        session = SimpleNamespace(post=AsyncMock(return_value=response))
+
+        class CapturingFormData:
+            def __init__(self):
+                self.fields = {}
+
+            def add_field(self, name, value, **kwargs):
+                self.fields[name] = value
+
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(audio, 'resolve_media_model', new=AsyncMock(return_value=resolved)),
+            patch.object(
+                audio,
+                'get_media_api_connection',
+                new=AsyncMock(return_value=(self.connection, 'saved-key')),
+            ),
+            patch.object(audio, 'media_http_session', side_effect=lambda c: fake_session(session)),
+            patch.object(audio.aiohttp, 'FormData', CapturingFormData),
+            patch.object(audio, 'ENABLE_FORWARD_USER_INFO_HEADERS', False),
+        ):
+            path = Path(directory)
+            audio_path = path / 'speech.mp3'
+            audio_path.write_bytes(b'audio')
+            result = await audio._transcribe_openai(
+                None,
+                str(audio_path),
+                'speech.mp3',
+                ['zh-CN', 'en'],
+                str(path),
+                'siliconflow-transcript',
+                self.owner,
+                use_provider=True,
+                response_format='verbose_json',
+                model_ref='provider:media-connection:asr-model',
+            )
+
+        self.assertEqual(result, {'text': 'hello'})
+        form_data = session.post.await_args.kwargs['data']
+        self.assertEqual(form_data.fields['model'], 'asr-model')
+        self.assertIn('file', form_data.fields)
+        self.assertNotIn('language', form_data.fields)
+        self.assertNotIn('response_format', form_data.fields)
+        self.assertEqual(session.post.await_count, 1)
+
+    async def test_siliconflow_speech_uses_model_scoped_voice(self):
+        self.connection.provider_id = 'siliconflow'
+        self.connection.config = {'base_url': 'https://api.siliconflow.cn/v1'}
+        config = {
+            'audio.tts.model': 'speech-model',
+            'audio.tts.voice': 'speech-model:alex',
+            'audio.tts.provider_connection_id': 'saved',
+        }
+
+        async def get_config(key, *args):
+            return config.get(key)
+
+        response = SimpleNamespace(
+            status=200,
+            headers={'Content-Type': 'audio/mpeg'},
+            raise_for_status=Mock(),
+            read=AsyncMock(return_value=b'audio-bytes'),
+        )
+        session = SimpleNamespace(post=AsyncMock(return_value=response))
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(audio.Config, 'get', new=get_config),
+            patch.object(audio, 'get_media_api_connection', new=AsyncMock(return_value=(self.connection, 'saved-key'))),
+            patch.object(audio, 'media_http_session', side_effect=lambda c: fake_session(session)),
+            patch.object(audio, 'ENABLE_FORWARD_USER_INFO_HEADERS', False),
+            patch.object(audio, 'USE_SLIM', True),
+        ):
+            path = Path(directory)
+            await audio._tts_provider(
+                None,
+                {'input': 'hello'},
+                path / 'speech.mp3',
+                path / 'speech.json',
+                self.owner,
+            )
+
+        request = session.post.await_args.kwargs
+        self.assertEqual(request['url'], 'https://api.siliconflow.cn/v1/audio/speech')
+        self.assertEqual(request['json']['model'], 'speech-model')
+        self.assertEqual(request['json']['voice'], 'speech-model:alex')
+
     async def test_tts_and_transcription_use_saved_key_and_do_not_fall_back(self):
         config = {
             'audio.tts.model': 'tts-test',
@@ -162,9 +336,7 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.object(audio.Config, 'get', new=get_config),
-            patch.object(
-                audio, 'get_media_api_connection', new=AsyncMock(return_value=(self.connection, 'saved-key'))
-            ),
+            patch.object(audio, 'get_media_api_connection', new=AsyncMock(return_value=(self.connection, 'saved-key'))),
             patch.object(audio, 'media_http_session', side_effect=lambda c: fake_session(session)),
             patch.object(audio, 'ENABLE_FORWARD_USER_INFO_HEADERS', False),
             patch.object(audio, 'USE_SLIM', True),

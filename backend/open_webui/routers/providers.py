@@ -1,7 +1,7 @@
 """Provider connection catalog and user-scoped connections."""
 
-import time
 import re
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from open_webui.internal.db import get_async_session
@@ -12,17 +12,20 @@ from open_webui.models.provider_connections import (
     ProviderConnectionUpdate,
     new_provider_connection,
 )
+from open_webui.utils.apps import validate_app_url
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.provider_capabilities import ADAPTERS, normalize_model, provider_family
 from open_webui.utils.providers import (
     PROVIDER_CATALOG,
     can_access_connection,
     discover_connection_models,
     encrypt_credential,
+    initialize_model_catalog,
     public_connection,
     require_connection_access,
     verify_provider_connection,
 )
-from open_webui.utils.apps import validate_app_url
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -143,12 +146,13 @@ async def verify_ephemeral_connection(form: ProviderConnectionCreate, user=Depen
         auth_type=form.auth_type,
         visibility=form.visibility,
         owner_id=user.id,
-        config=config,
+        config={**config, '_catalog_version': 1},
         credential=encrypt_credential(form.api_key.get_secret_value() if form.api_key else None),
         status='configured',
         models=[],
         is_active=True,
     )
+    await initialize_model_catalog(connection)
     verified = await verify_provider_connection(connection, user)
     models = await discover_connection_models(connection, user)
     return {'ok': verified, 'status': 'connected' if verified else 'manual', 'models': models}
@@ -165,7 +169,7 @@ async def create_connection(
         auth_type=form.auth_type,
         visibility=form.visibility,
         owner_id=user.id,
-        config=config,
+        config={**config, '_catalog_version': 1},
         credential=encrypt_credential(form.api_key.get_secret_value() if form.api_key else None),
         status='configured',
         models=[],
@@ -257,7 +261,7 @@ async def update_connection(
             or any(not isinstance(x, str) or not x or len(x) > 256 for x in model_ids)
         ):
             raise HTTPException(400, 'model_ids must be a list of at most 500 non-empty strings')
-        connection.config = config
+        connection.config = {**{k: v for k, v in (connection.config or {}).items() if k.startswith('_')}, **config}
     if connection.provider_id == 'chatgpt' and connection.auth_type == 'oauth':
         if api_key or 'visibility' in values or grants is not None:
             raise HTTPException(400, 'Manage ChatGPT OAuth through its provider settings')
@@ -301,6 +305,7 @@ async def verify_connection(
     connection_id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
     connection = await _connection_with_manage_access(connection_id, user, db)
+    await initialize_model_catalog(connection)
     verified = await verify_provider_connection(connection, user)
     models = await discover_connection_models(connection, user)
     connection.status = 'connected' if verified else 'configured'
@@ -315,7 +320,9 @@ async def refresh_models(
     connection_id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
     connection = await _connection_with_manage_access(connection_id, user, db)
+    await initialize_model_catalog(connection)
     verified = await verify_provider_connection(connection, user)
+    await initialize_model_catalog(connection)
     models = await discover_connection_models(connection, user)
     cache = dict((connection.config or {}).get('_models_by_user') or {})
     cache[user.id] = models
@@ -328,11 +335,354 @@ async def refresh_models(
 
 
 @router.get('/models')
-async def get_visible_models(user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+async def get_visible_models(
+    purpose: str = 'chat', user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+):
     from open_webui.utils.providers import list_visible_models
 
-    models = await list_visible_models(user, db)
+    if purpose == 'chat':
+        models = await list_visible_models(user, db)
+    else:
+        from open_webui.utils.provider_capabilities import ADAPTERS
+        from open_webui.utils.providers import visible_connection_models
+
+        if purpose not in (*ADAPTERS, 'all'):
+            raise HTTPException(400, 'Unknown model purpose')
+        models = []
+        for connection in (
+            await db.scalars(select(ProviderConnection).where(ProviderConnection.is_active.is_(True)))
+        ).all():
+            if await can_access_connection(connection, user, db):
+                models.extend(
+                    {**m, 'connection_name': connection.name}
+                    for m in await visible_connection_models(connection, user, db)
+                    if purpose == 'all' or purpose in m.get('uses', {})
+                )
     return {
         'object': 'list',
         'data': models,
     }
+
+
+class ModelUses(BaseModel):
+    upstream_id: str = Field(min_length=1, max_length=256)
+    uses: dict[str, str]
+
+
+@router.put('/connections/{connection_id}/model-uses')
+async def set_model_uses(
+    connection_id: str, form: ModelUses, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+):
+    connection = await _connection_with_manage_access(connection_id, user, db)
+    if connection.auth_type != 'api_key':
+        raise HTTPException(400, 'Account model capabilities cannot be overridden')
+    if any(use not in ADAPTERS or adapter not in ADAPTERS[use] for use, adapter in form.uses.items()):
+        raise HTTPException(400, 'Unsupported purpose or adapter')
+    if form.uses.get('image') == 'siliconflow-image' and provider_family(connection) != 'siliconflow':
+        raise HTTPException(400, 'SiliconFlow image adapter requires a SiliconFlow connection')
+    config = dict(connection.config or {})
+    config['_model_overrides'] = {**config.get('_model_overrides', {}), form.upstream_id: form.uses}
+    config.pop('_models_by_user', None)
+    if not any(m['upstream_id'] == form.upstream_id for m in connection.models or []):
+        from open_webui.utils.providers import stable_model_id
+
+        config['model_ids'] = list(dict.fromkeys([*config.get('model_ids', []), form.upstream_id]))
+        connection.models = [
+            *(connection.models or []),
+            {
+                'id': stable_model_id(connection.id, form.upstream_id),
+                'upstream_id': form.upstream_id,
+                'name': form.upstream_id,
+            },
+        ]
+    connection.config = config
+    await db.commit()
+    return public_connection(connection)
+
+
+class ModelTest(BaseModel):
+    upstream_id: str = Field(min_length=1, max_length=256)
+    purpose: str
+    voice: str = Field(default='', max_length=256)
+    audio_base64: str | None = Field(default=None, max_length=2_800_000)
+    filename: str | None = Field(default=None, max_length=256)
+
+
+@router.post('/connections/{connection_id}/model-test')
+async def test_model(
+    connection_id: str, form: ModelTest, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+):
+    import base64
+
+    import aiohttp
+    from open_webui.utils.provider_capabilities import fingerprint
+    from open_webui.utils.providers import (
+        get_media_api_connection,
+        media_http_session,
+        provider_base_url,
+        provider_http_error,
+        read_bounded_response,
+        resolve_media_model,
+        resolve_model,
+        stable_model_id,
+    )
+
+    connection = await _connection_with_manage_access(connection_id, user, db)
+    if connection.auth_type != 'api_key':
+        raise HTTPException(400, 'Use an ordinary chat to test account models')
+    model_id = stable_model_id(connection_id, form.upstream_id)
+    resolved = (
+        await resolve_model(model_id, user, db)
+        if form.purpose == 'chat'
+        else await resolve_media_model(model_id, user, form.purpose, db)
+    )
+    before = fingerprint(connection, resolved.model_metadata)
+    connection, key = await get_media_api_connection(connection_id, user, db)
+    base = provider_base_url(connection)
+    payload = None
+    data = None
+    if form.purpose == 'chat':
+        if resolved.model_metadata['uses']['chat'] == 'responses':
+            path, payload = '/responses', {'model': form.upstream_id, 'input': 'Reply OK.', 'max_output_tokens': 32}
+        else:
+            path, payload = (
+                '/chat/completions',
+                {'model': form.upstream_id, 'messages': [{'role': 'user', 'content': 'Reply OK.'}], 'max_tokens': 32},
+            )
+    elif form.purpose == 'transcription':
+        try:
+            audio = base64.b64decode(form.audio_base64 or '', validate=True)
+        except ValueError:
+            raise HTTPException(400, 'Invalid audio sample') from None
+        if not audio or len(audio) > 2 * 1024 * 1024:
+            raise HTTPException(400, 'Select a short audio sample under 2 MB')
+        from pathlib import Path
+
+        extension = Path(form.filename or '').suffix.lower()
+        if extension not in ('.wav', '.mp3', '.m4a', '.ogg', '.webm', '.flac', '.aac'):
+            raise HTTPException(400, 'Unsupported audio sample format')
+        data = aiohttp.FormData()
+        data.add_field('model', form.upstream_id)
+        data.add_field('file', audio, filename='sample' + extension, content_type='application/octet-stream')
+        path = '/audio/transcriptions'
+    elif form.purpose == 'speech':
+        if not form.voice.strip():
+            raise HTTPException(400, 'Select a voice for this model')
+        path, payload = (
+            '/audio/speech',
+            {'model': form.upstream_id, 'voice': form.voice, 'input': '你好，这是语音测试。', 'response_format': 'mp3'},
+        )
+    elif form.purpose == 'image':
+        silicon = resolved.model_metadata['uses']['image'] == 'siliconflow-image'
+        path, payload = (
+            '/images/generations',
+            {
+                'model': form.upstream_id,
+                'prompt': 'A simple blue circle on white.',
+                **({'image_size': '1024x1024'} if silicon else {'size': '1024x1024', 'n': 1}),
+            },
+        )
+    else:
+        raise HTTPException(400, 'Unsupported test purpose')
+    outcome = 'passed'
+    try:
+        # Explicit test only: exactly one upstream inference, never retry uncertain calls.
+        async with media_http_session(connection) as session:
+            async with session.post(
+                base + path,
+                json=payload,
+                data=data,
+                headers={'Authorization': f'Bearer {key}'},
+                allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as response:
+                if not 200 <= response.status < 300:
+                    raise provider_http_error(response.status)
+                raw = await read_bounded_response(response)
+                if form.purpose == 'speech':
+                    if not raw or not response.headers.get('Content-Type', '').startswith('audio/'):
+                        raise HTTPException(502, 'Provider did not return audio')
+                else:
+                    import json
+
+                    result = json.loads(raw)
+                    if form.purpose == 'transcription' and not isinstance(result.get('text'), str):
+                        raise HTTPException(502, 'Provider did not return transcription text')
+                    if form.purpose == 'image' and not (result.get('images') or result.get('data')):
+                        raise HTTPException(502, 'Provider did not return images')
+                    if form.purpose == 'chat' and not (result.get('choices') or result.get('output')):
+                        raise HTTPException(502, 'Provider did not return a chat response')
+    except Exception:
+        # Never persist or expose upstream error bodies which may contain credentials.
+        outcome = 'failed'
+    await db.refresh(connection)
+    current = normalize_model(connection, resolved.model_metadata)
+    if fingerprint(connection, current) != before:
+        raise HTTPException(409, 'Configuration changed during the test; result was not saved')
+    config = dict(connection.config or {})
+    tests = dict(config.get('_model_tests', {}))
+    tests[form.upstream_id] = {
+        **tests.get(form.upstream_id, {}),
+        form.purpose: {'status': outcome, 'tested_at': int(time.time()), 'fingerprint': before},
+    }
+    connection.config = {**config, '_model_tests': tests}
+    await db.commit()
+    return {
+        'status': outcome,
+        'message': 'No automatic retry. A failed or timed-out request may already have been charged.',
+    }
+
+
+_MEDIA_SETTINGS = {
+    'transcription': (
+        'audio.stt',
+        'engine',
+        'openai',
+        'openai.api_base_url',
+        'openai.api_key',
+        'model',
+        'provider_connection_id',
+    ),
+    'speech': (
+        'audio.tts',
+        'engine',
+        'openai',
+        'openai.api_base_url',
+        'openai.api_key',
+        'model',
+        'provider_connection_id',
+    ),
+    'image': ('image_generation', 'engine', 'openai', None, None, 'model', 'provider_connection_id'),
+}
+
+
+async def _migration_source(purpose, db=None):
+    import hashlib
+    import json
+
+    from open_webui.models.config import Config
+
+    if purpose not in _MEDIA_SETTINGS:
+        raise HTTPException(400, 'Unsupported migration purpose')
+    prefix, engine, old_engine, url, key, model, reference = _MEDIA_SETTINGS[purpose]
+    url_key = f'{prefix}.{url}' if url else 'image_generation.openai.api_base_url'
+    secret_key = f'{prefix}.{key}' if key else 'image_generation.openai.api_key'
+
+    async def read(key):
+        if db is None or not Config.persistent_enabled_for(key):
+            return await Config.get(key)
+        row = await db.get(Config, key)
+        return row.value if row else Config.default_value(key)
+
+    values = {
+        'engine': await read(f'{prefix}.{engine}'),
+        'url': await read(url_key),
+        'key': await read(secret_key),
+        'model': await read(f'{prefix}.{model}'),
+    }
+    digest = hashlib.sha256(json.dumps({'purpose': purpose, **values}, sort_keys=True).encode()).hexdigest()
+    return values, digest
+
+
+@router.get('/media-migration')
+async def migration_preview(user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
+    from open_webui.utils.providers import decrypt_credential, provider_base_url
+
+    result = []
+    connections = (
+        await db.scalars(
+            select(ProviderConnection).where(
+                ProviderConnection.owner_id == user.id,
+                ProviderConnection.visibility == 'private',
+                ProviderConnection.is_active.is_(True),
+            )
+        )
+    ).all()
+    for purpose in _MEDIA_SETTINGS:
+        values, digest = await _migration_source(purpose, db)
+        if values['engine'] != 'openai':
+            continue
+        candidates = [
+            c.id
+            for c in connections
+            if c.auth_type == 'api_key'
+            and provider_base_url(c) == (values['url'] or '').rstrip('/')
+            and decrypt_credential(c.credential) == values['key']
+        ]
+        result.append(
+            {
+                'purpose': purpose,
+                'base_url': values['url'],
+                'model': values['model'],
+                'configured': bool(values['url'] and values['key'] and values['model']),
+                'fingerprint': digest,
+                'visibility': 'private',
+                'matching_connections': candidates,
+            }
+        )
+    return result
+
+
+class MediaMigration(BaseModel):
+    purpose: str
+    fingerprint: str = Field(min_length=64, max_length=64)
+
+
+@router.post('/media-migration')
+async def migrate_media(
+    form: MediaMigration, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
+):
+    import uuid
+    from urllib.parse import urlsplit
+
+    from open_webui.models.config import Config
+    from open_webui.utils.providers import stable_model_id
+
+    purpose = form.purpose
+    values, digest = await _migration_source(purpose, db)
+    # A deterministic migration marker makes retries idempotent, without exposing secrets.
+    rows = (await db.scalars(select(ProviderConnection).where(ProviderConnection.owner_id == user.id))).all()
+    existing = next((c for c in rows if (c.config or {}).get('_migration') == form.fingerprint and c.is_active), None)
+    if values['engine'] == 'provider' and existing:
+        return public_connection(existing)
+    if values['engine'] != 'openai' or digest != form.fingerprint:
+        raise HTTPException(409, 'Legacy settings changed; refresh migration preview')
+    if not all(values.get(key) for key in ('url', 'key', 'model')):
+        raise HTTPException(400, 'Legacy configuration is incomplete')
+    host = urlsplit(values['url']).hostname
+    provider = 'siliconflow' if host in ('api.siliconflow.cn', 'api.siliconflow.com') else 'custom'
+    validate_app_url(values['url'])
+    from open_webui.utils.provider_capabilities import DEFAULT_ADAPTER
+
+    adapter = 'siliconflow-image' if provider == 'siliconflow' and purpose == 'image' else DEFAULT_ADAPTER[purpose]
+    connection = new_provider_connection(
+        provider_id=provider,
+        name=f'Imported {purpose}',
+        auth_type='api_key',
+        visibility='private',
+        owner_id=user.id,
+        credential=encrypt_credential(values['key']),
+        status='configured',
+        is_active=True,
+        models=[],
+        config={
+            'base_url': values['url'],
+            'model_ids': [values['model']],
+            '_catalog_version': 1,
+            '_migration': form.fingerprint,
+            '_model_overrides': {values['model']: {purpose: adapter}},
+        },
+    )
+    connection.id = str(uuid.uuid5(uuid.NAMESPACE_URL, f'media-migration:{user.id}:{form.fingerprint}'))
+    db.add(connection)
+    prefix, engine, _, _, _, model, reference = _MEDIA_SETTINGS[purpose]
+    await Config.upsert(
+        {
+            f'{prefix}.{engine}': 'provider',
+            f'{prefix}.{reference}': connection.id,
+            f'{prefix}.{model}': stable_model_id(connection.id, values['model']),
+        },
+        db=db,
+    )
+    await db.commit()
+    return public_connection(connection)

@@ -5,12 +5,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
-from open_webui.internal.db import get_async_db_context
-from sqlalchemy import delete
 
 from fastapi import HTTPException
-from open_webui.utils import chatgpt_auth, providers
+from open_webui.internal.db import get_async_db_context
 from open_webui.routers import provider_auth
+from open_webui.utils import chatgpt_auth, providers
+from sqlalchemy import delete
 
 
 class ChunkedContent:
@@ -27,7 +27,7 @@ class ProviderTransportTests(unittest.IsolatedAsyncioTestCase):
         response = SimpleNamespace(status=status, headers={}, content=ChunkedContent(chunks), release=Mock())
         session = SimpleNamespace(close=AsyncMock(), post=AsyncMock(return_value=response))
         connection = SimpleNamespace(provider_id=provider_id, config={})
-        resolved = SimpleNamespace(connection=connection, upstream_model_id='gpt-test')
+        resolved = SimpleNamespace(connection=connection, upstream_model_id='gpt-test', model_metadata={})
         with (
             patch.object(providers, 'resolve_model', new=AsyncMock(return_value=resolved)),
             patch.object(chatgpt_auth, 'chatgpt_chat_completion', new=AsyncMock(return_value=(response, session))),
@@ -213,7 +213,7 @@ class ProviderTransportTests(unittest.IsolatedAsyncioTestCase):
         )
         session = SimpleNamespace(close=AsyncMock())
         connection = SimpleNamespace(provider_id='chatgpt', config={})
-        resolved = SimpleNamespace(connection=connection, upstream_model_id='gpt-test')
+        resolved = SimpleNamespace(connection=connection, upstream_model_id='gpt-test', model_metadata={})
         with (
             patch.object(providers, 'resolve_model', new=AsyncMock(return_value=resolved)),
             patch.object(chatgpt_auth, 'chatgpt_chat_completion', new=AsyncMock(return_value=(response, session))),

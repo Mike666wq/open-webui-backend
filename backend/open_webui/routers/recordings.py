@@ -37,6 +37,18 @@ async def get_config(user=Depends(get_verified_user)):
     result['effective_max_size_mb'] = (
         min(result['max_size_mb'], float(rag_limit)) if rag_limit else result['max_size_mb']
     )
+    from open_webui.utils.providers import stable_model_id
+
+    model = await Config.get('audio.stt.model') or ''
+    result['default_model_ref'] = (
+        (
+            model
+            if model.startswith('provider:')
+            else stable_model_id(await Config.get('audio.stt.provider_connection_id'), model)
+        )
+        if await Config.get('audio.stt.engine') == 'provider' and model
+        else ''
+    )
     result['configured'] = True
     try:
         await service.authorize(user, stt=True)
@@ -86,10 +98,20 @@ async def create_recording(
     request: Request,
     file: UploadFile = File(...),
     language: str = Form('zh'),
+    model_ref: str | None = Form(None),
     idempotency_key: str = Header(..., max_length=100),
     user=Depends(get_verified_user),
 ):
-    await service.authorize(user, stt=True)
+    if not model_ref and await Config.get('audio.stt.engine') == 'provider':
+        from open_webui.utils.providers import stable_model_id
+
+        selected = await Config.get('audio.stt.model')
+        model_ref = (
+            selected
+            if selected.startswith('provider:')
+            else stable_model_id(await Config.get('audio.stt.provider_connection_id'), selected)
+        )
+    await service.authorize(user, stt=True, model_ref=model_ref)
     if not idempotency_key.strip() or len(language) > 20:
         raise HTTPException(400, 'Invalid request key or language')
     async with get_async_db_context() as db:
@@ -99,7 +121,7 @@ async def create_recording(
         if existing:
             return service.public(existing)
     config = await service.settings()
-    reference = await service.references()
+    reference = await service.references(model_ref, user)
     limit = config['max_size_mb'] * 1024 * 1024
     rag_limit = await Config.get('rag.file.max_size')
     if rag_limit:
@@ -188,11 +210,14 @@ async def cancel_recording(id: str, user=Depends(get_verified_user)):
         return service.public(job)
 
 
+class RecordingRetry(BaseModel):
+    model_ref: str | None = None
+    restart: bool = False
+
+
 @router.post('/{id}/retry', status_code=202)
-async def retry_recording(id: str, user=Depends(get_verified_user)):
+async def retry_recording(id: str, form: RecordingRetry | None = None, user=Depends(get_verified_user)):
     await service.get_owned(id, user)
-    await service.authorize(user, stt=True)
-    reference = await service.references()
     async with get_async_db_context() as db:
         job = await db.get(Recording, id, with_for_update=True)
         if job.state not in ('failed', 'interrupted', 'cancelled') or not job.source_present:
@@ -201,7 +226,14 @@ async def retry_recording(id: str, user=Depends(get_verified_user)):
         if job.lease_token and job.lease_until >= service.now():
             raise HTTPException(409, 'The previous request is stopping; retry shortly')
         data = dict(job.data)
-        if data['config'] != reference:
+        selected_ref = form.model_ref if form and form.model_ref else data['config'].get('model_ref')
+        if selected_ref != data['config'].get('model_ref') and not (form and form.restart):
+            raise HTTPException(409, 'Confirm restarting the full transcript to change the model')
+        await service.authorize(user, stt=True, model_ref=selected_ref)
+        reference = await service.references(selected_ref, user)
+        if data['config'].get('model_ref') and data['config'] != reference and not (form and form.restart):
+            raise HTTPException(409, 'Selected model configuration changed; explicitly choose a model to restart')
+        if data['config'] != reference or (form and form.restart):
             data['chunks'] = []
         data['config'] = reference
         data['response_format'] = reference['response_format']

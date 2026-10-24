@@ -317,9 +317,7 @@ async def emit_chat_list_event(metadata: dict, chat_id: str):
 class SPAStaticFiles(StaticFiles):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.page_policy = FrontendRoutePolicy(
-            self.directory, os.getenv('FRONTEND_LOCK_FILE')
-        )
+        self.page_policy = FrontendRoutePolicy(self.directory, os.getenv('FRONTEND_LOCK_FILE'))
 
     async def get_response(self, path: str, scope):
         try:
@@ -380,6 +378,7 @@ async def lifespan(app: FastAPI):
     # This allows sync functions to schedule work on the main loop without blocking health checks
     from open_webui.utils.resource_visibility import install_resource_visibility
     from open_webui.utils.resource_service import resource_worker
+
     install_resource_visibility()
     app.state.main_loop = asyncio.get_running_loop()
 
@@ -517,6 +516,7 @@ async def lifespan(app: FastAPI):
             log.warning(f'License data retrieval failed during startup: {e}')
 
     from open_webui.utils.recordings import recording_worker
+
     app.state.recording_worker = asyncio.create_task(recording_worker(app))
     app.state.resource_worker = asyncio.create_task(resource_worker())
     app.state.startup_complete = True
@@ -882,6 +882,7 @@ if ENABLE_COMPRESSION_MIDDLEWARE:
 # `open_webui.utils.asgi_middleware` for the rationale.
 app.add_middleware(AppHTTPMiddleware)
 from open_webui.utils.resource_visibility import ResourceContextMiddleware
+
 app.add_middleware(ResourceContextMiddleware)
 
 
@@ -2459,6 +2460,7 @@ async def get_app_config(request: Request):
                     'enable_direct_connections': config.get('direct.enable'),
                     'enable_provider_connections': True,
                     'enable_provider_media_connections': True,
+                    'enable_provider_model_capabilities': True,
                     'enable_recording_documents': True,
                     'enable_direct_integrations': ENABLE_TOOL_SERVERS
                     and config.get('direct.integrations.enable', False),
