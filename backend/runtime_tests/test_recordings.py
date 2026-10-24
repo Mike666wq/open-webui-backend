@@ -383,3 +383,28 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
         result = await self.upload(body=b'#EXTM3U\n#EXTINF:50,\nhttps://example.invalid/private.wav\n')
         self.assertEqual(result.status_code, 400)
         self.assertEqual(list(Path(self.temp.name).iterdir()), [])
+
+    async def test_audio_probes_and_conversion_have_bounded_concurrency(self):
+        running = 0
+        maximum = 0
+
+        class Process:
+            returncode = 0
+
+            async def communicate(self):
+                nonlocal running, maximum
+                running += 1
+                maximum = max(maximum, running)
+                await asyncio.sleep(0.02)
+                running -= 1
+                return b'output', b''
+
+        with (
+            patch.object(service, 'COMMAND_SLOTS', asyncio.Semaphore(2)),
+            patch.object(
+                service.asyncio, 'create_subprocess_exec', new=AsyncMock(side_effect=lambda *a, **kw: Process())
+            ),
+        ):
+            result = await asyncio.gather(*(service.command('synthetic-decoder') for _ in range(5)))
+        self.assertEqual(maximum, 2)
+        self.assertEqual(result, [b'output'] * 5)

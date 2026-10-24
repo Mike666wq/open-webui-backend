@@ -30,6 +30,7 @@ from sqlalchemy.exc import IntegrityError
 log = logging.getLogger(__name__)
 ROOT = Path(DATA_DIR) / 'recordings'
 CHUNK_SECONDS = 600
+COMMAND_SLOTS = asyncio.Semaphore(2)
 AUDIO_FORMATS = 'wav,mp3,mov,matroska,webm,ogg,flac,aac,amr,asf,avi,au,aiff,caf'
 ACTIVE = ('preparing', 'transcribing', 'saving')
 DEFAULTS = {'max_size_mb': 500, 'max_duration_seconds': 7200, 'response_format': 'json'}
@@ -89,6 +90,12 @@ async def references():
 
 
 async def command(*args, timeout=120):
+    # Bound both upload probes (including WebM scans) and worker conversion.
+    async with COMMAND_SLOTS:
+        return await run_command(*args, timeout=timeout)
+
+
+async def run_command(*args, timeout=120):
     process = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
