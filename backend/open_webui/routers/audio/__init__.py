@@ -991,6 +991,7 @@ async def _transcribe_openai(
     user=None,
     *,
     use_provider: bool = False,
+    response_format: str | None = None,
 ):
     """Transcribe audio via an OpenAI-compatible STT endpoint."""
     r = None
@@ -1014,6 +1015,8 @@ async def _transcribe_openai(
         async with media_http_session(connection) as session:
             for language in languages:
                 payload = {'model': await Config.get('audio.stt.model')}
+                if response_format:
+                    payload['response_format'] = response_format
                 if language:
                     payload['language'] = language
 
@@ -1288,11 +1291,14 @@ async def transcription_handler(request, file_path, metadata, user=None):
         metadata.get('language', None) if not WHISPER_LANGUAGE else WHISPER_LANGUAGE,
         None,  # Always fallback to None in case transcription fails
     ]
+    if metadata.get('_recording_single_attempt'):
+        languages = languages[:1]
 
     if await Config.get('audio.stt.engine') == '':
         return await _transcribe_whisper(request, file_path, languages, file_dir, id)
     elif await Config.get('audio.stt.engine') == 'openai':
-        return await _transcribe_openai(request, file_path, filename, languages, file_dir, id, user)
+        return await _transcribe_openai(request, file_path, filename, languages, file_dir, id, user,
+            response_format=metadata.get('_recording_response_format'))
     elif await Config.get('audio.stt.engine') == 'provider':
         return await _transcribe_openai(
             request,
@@ -1303,6 +1309,7 @@ async def transcription_handler(request, file_path, metadata, user=None):
             id,
             user,
             use_provider=True,
+            response_format=metadata.get('_recording_response_format'),
         )
     elif await Config.get('audio.stt.engine') == 'deepgram':
         return await _transcribe_deepgram(request, file_path, languages, file_dir, id)

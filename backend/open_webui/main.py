@@ -159,6 +159,7 @@ from open_webui.routers import (
     channels,
     chats,
     resources,
+    recordings,
     configs,
     evaluations,
     files,
@@ -515,6 +516,8 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             log.warning(f'License data retrieval failed during startup: {e}')
 
+    from open_webui.utils.recordings import recording_worker
+    app.state.recording_worker = asyncio.create_task(recording_worker(app))
     app.state.resource_worker = asyncio.create_task(resource_worker())
     app.state.startup_complete = True
     await publish_event(app, EVENTS.SYSTEM_STARTUP_COMPLETED, source='system')
@@ -527,6 +530,8 @@ async def lifespan(app: FastAPI):
     # Shutdown: clean up shared resources
     from open_webui.utils.session_pool import close_session
 
+    app.state.recording_worker.cancel()
+    await asyncio.gather(app.state.recording_worker, return_exceptions=True)
     await close_session()
 
     if hasattr(app.state, 'redis_task_command_listener'):
@@ -939,6 +944,7 @@ app.include_router(terminals.router, prefix='/api/v1/terminals', tags=['terminal
 app.include_router(automations.router, prefix='/api/v1/automations', tags=['automations'])
 app.include_router(calendar.router, prefix='/api/v1/calendars', tags=['calendars'])
 app.include_router(resources.router, prefix='/api/v1/resources', tags=['resources'])
+app.include_router(recordings.router, prefix='/api/v1/recordings', tags=['recordings'])
 
 # SCIM 2.0 API for identity management
 if ENABLE_SCIM:
@@ -2453,6 +2459,7 @@ async def get_app_config(request: Request):
                     'enable_direct_connections': config.get('direct.enable'),
                     'enable_provider_connections': True,
                     'enable_provider_media_connections': True,
+                    'enable_recording_documents': True,
                     'enable_direct_integrations': ENABLE_TOOL_SERVERS
                     and config.get('direct.integrations.enable', False),
                     'enable_plugins': ENABLE_PLUGINS,

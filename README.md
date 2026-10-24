@@ -74,3 +74,7 @@ docker build -t open-webui-backend:dev .
 ## 厂商接入
 
 新厂商账号、共享 API 和 ChatGPT 首次授权见 [厂商连接指南](docs/provider-connections.md)。
+
+## 录音转文档
+
+配置、长录音任务、模型兼容性及验收方式见 [录音转文档](docs/recording-documents.md)。
