@@ -365,3 +365,21 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
                     db=SimpleNamespace(),
                 )
             read_file.assert_not_awaited()
+
+    async def test_browser_webm_without_duration_header_is_bounded_and_supported(self):
+        import json
+
+        metadata = json.dumps({'format': {}, 'streams': [{'codec_type': 'audio'}]}).encode()
+        with patch.object(
+            service, 'command', new=AsyncMock(side_effect=[metadata, b'out_time_us=3000000000\nprogress=end\n'])
+        ) as command:
+            duration = await service.probe(Path('browser.webm'), 7200)
+        self.assertEqual(duration, 3000)
+        arguments = command.await_args_list[1].args
+        self.assertIn('7201', arguments)
+        self.assertIn('file,pipe', arguments)
+
+    async def test_playlist_inputs_are_rejected(self):
+        result = await self.upload(body=b'#EXTM3U\n#EXTINF:50,\nhttps://example.invalid/private.wav\n')
+        self.assertEqual(result.status_code, 400)
+        self.assertEqual(list(Path(self.temp.name).iterdir()), [])

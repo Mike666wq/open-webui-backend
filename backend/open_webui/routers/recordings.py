@@ -112,7 +112,7 @@ async def create_recording(
         size = await copy_upload(file, directory / 'source', limit)
         if not size:
             raise HTTPException(400, 'Recording is empty')
-        duration = await service.probe(directory / 'source')
+        duration = await service.probe(directory / 'source', config['max_duration_seconds'])
         if duration > config['max_duration_seconds']:
             raise HTTPException(413, 'Recording exceeds the configured duration limit')
         title = (file.filename or 'Recording').replace('\\', '/').rsplit('/', 1)[-1][:200]

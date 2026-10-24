@@ -104,7 +104,7 @@ async def command(*args, timeout=120):
     return stdout
 
 
-async def probe(path):
+async def probe(path, max_duration=7200):
     if not shutil.which('ffprobe') or not shutil.which('ffmpeg'):
         raise HTTPException(503, 'Recording transcription requires ffmpeg and ffprobe in the backend image')
     try:
@@ -124,7 +124,41 @@ async def probe(path):
                 str(path),
             )
         )
-        duration = float(info['format']['duration'])
+        if not any(s.get('codec_type') == 'audio' for s in info['streams']):
+            raise ValueError()
+        duration = info.get('format', {}).get('duration')
+        if duration is None or duration == 'N/A':
+            # Browser MediaRecorder WebM often has no duration header. Decode on
+            # disk with a hard duration cap instead of rejecting a valid recording.
+            progress = await command(
+                'ffmpeg',
+                '-nostdin',
+                '-v',
+                'error',
+                '-protocol_whitelist',
+                'file,pipe',
+                '-format_whitelist',
+                AUDIO_FORMATS,
+                '-i',
+                str(path),
+                '-t',
+                str(max_duration + 1),
+                '-map',
+                '0:a:0',
+                '-progress',
+                'pipe:1',
+                '-nostats',
+                '-f',
+                'null',
+                '-',
+            )
+            times = [
+                int(line.split(b'=', 1)[1])
+                for line in progress.splitlines()
+                if line.startswith(b'out_time_us=') and line.split(b'=', 1)[1].isdigit()
+            ]
+            duration = max(times, default=0) / 1_000_000
+        duration = float(duration)
         if (
             not math.isfinite(duration)
             or duration <= 0
