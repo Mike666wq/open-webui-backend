@@ -55,20 +55,64 @@ ChatGPT 仅显示官方目录允许列出的模型；不自动回退到按量计
 
 本实现参考 [Kimi CLI OAuth 源码](https://github.com/MoonshotAI/kimi-cli/blob/main/src/kimi_cli/auth/oauth.py)、[官方 OAuth 配置](https://github.com/MoonshotAI/kimi-code/blob/main/packages/oauth/src/constants.ts)和[客户端身份约定](https://github.com/MoonshotAI/kimi-code/blob/main/packages/oauth/src/identity.ts)，使用其公开客户端 ID 和 `https://auth.kimi.com/api/oauth/*` 设备授权协议。模型发现和推理走 `https://api.kimi.com/coding/v1`。厂商若拒绝本项目身份，需要单独申请/确认接入资格，不会静默切换到官方客户端身份或收费 API Key。遵循 [Kimi Code 使用准则](https://www.kimi.com/en/help/kimi-code/community-guidelines)，不得共享订阅账号池。
 
-## 生图、语音合成与转写
+## 统一模型目录、图片与语音
 
-可以复用已保存在服务器上的 OpenAI 或兼容 API Key，无需在各媒体设置中重复粘贴密钥：
+聊天、录音转写、语音合成和生图现在使用同一个服务端模型目录。API Key 只需在
+**管理面板 → 连接** 保存一次，然后在图片和语音设置中按能力选择模型；这两个页面
+不再重复保存 Key 或 Base URL。
 
-1. 在管理面板 → 连接中创建 API Key 连接；如需给其他用户使用，配置相应用户/分组共享权限。
-2. 在管理面板 → 图片中，将生成或编辑引擎改为 **已保存的厂商连接**，选择连接，并填写该厂商支持的图片模型 ID。
-3. 在管理面板 → 音频中，将转写或语音合成引擎改为 **已保存的厂商连接**，选择连接，填写模型 ID；语音合成还需选择音色。
-4. 保存后生成一张图片、合成一句语音或上传一小段音频验证真实模型权限。
+需要区分以下四种状态：
 
-接口分别为 `/images/generations`、`/images/edits`、`/audio/speech` 和 multipart `/audio/transcriptions`。模型/音色的实际支持取决于服务商；本实现不会根据同名聊天模型推断它具备媒体能力。媒体默认模型由管理员配置，个人设置当前不提供单独的媒体默认值。
+1. **连接成功**：只证明服务端能使用保存的凭据访问配置的地址。
+2. **模型被发现**：证明厂商模型列表可以读取，不证明某个能力已经真实调用成功。
+3. **能力已声明**：模型被厂商元数据或明确适配标记为聊天、转写、语音合成或生图；
+   管理员手动声明也属于这一层，浏览器不会因此假装已经验证。
+4. **测试通过**：管理员明确点击“测试模型”并完成一次可能计费的推理。测试结果与
+   连接地址、加密凭据、模型和用途绑定；其中任一项改变后会回到“未测试”。
 
-每次调用均检查连接权限，包括语音缓存命中。选中管理员私有连接不会使其自动变成全站共享连接；未获授权的用户会被拒绝。媒体 API Key 不发给浏览器，不写入生成文件元数据，连接失效后不会回退使用另一把全局密钥。图片和音频传输使用连接层 DNS 检查并禁止跟随重定向。
+以硅基流动为例：
 
-Realtime 通话继续使用原有独立 OpenAI/Azure API Key 设置，本轮未改成保存连接模式。ChatGPT/Kimi 套餐令牌不会用于 Realtime。[ChatGPT OAuth 限制](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)、[OpenAI 图片 API](https://developers.openai.com/api/docs/guides/image-generation)、[OpenAI 音频 API](https://developers.openai.com/api/docs/guides/audio)。
+1. 在 **外部连接** 添加 SiliconFlow，填写 API Key 和 Base URL。
+2. 获取模型并将模型分类为聊天、转写、语音合成或生图；无法识别的模型进入
+   “待分类”，不会自动出现在聊天选择器。
+3. 在 **语音** 中分别选择默认转写、语音合成模型和音色；在 **图片** 中选择默认
+   生图模型。聊天选择器只读取带聊天用途的模型。
+4. 录音页会预选管理员设置的转写模型，也允许切换本次任务使用的模型。上传后任务
+   固定提交时的稳定模型引用；排队期间修改全局默认值不会换模型。
+5. 保存配置不会自动调用模型。需要真实验证时，管理员主动点击“测试模型”；失败后
+   系统不会自动重试可能已经计费的请求。
+
+模型引用采用“连接 ID + 上游模型 ID”的稳定格式。服务端在每次聊天或媒体调用时都会
+重新检查模型用途、适配器、连接启用状态和当前用户权限，不能只依赖前端筛选。私有
+连接不会因为被设为默认值而自动共享；共享后也始终只返回连接名称，不返回密钥。
+
+硅基流动适配使用其原生差异：
+
+- 转写走 multipart `/audio/transcriptions`，只发送 `model` 和文件。当前官方接口
+  不提供本项目可依赖的 `language`、`response_format`、时间戳或说话人参数，因此
+  不能仅修改模型名就声称支持这些能力。
+- 语音合成走 `/audio/speech`。系统预置音色必须使用
+  `模型名:音色` 格式，例如 `FunAudioLLM/CosyVoice2-0.5B:alex`；当前适配提供
+  Alex、Benjamin、Charles、David、Anna、Bella、Claire、Diana 八种预置音色。
+- 生图走 `/images/generations`，请求使用 `image_size`，响应从 `images` 读取，而
+  非 OpenAI 风格的分页结构。其他 OpenAI 兼容厂商仍使用各自适配器。
+
+接口分别为 `/images/generations`、`/images/edits`、`/audio/speech` 和
+multipart `/audio/transcriptions`。图片和音频传输使用连接层 DNS 检查并禁止跟随
+重定向；媒体 API Key 不发给浏览器，也不写入生成文件元数据。
+
+旧版 OpenAI 媒体配置不会被静默改写。管理员可先查看迁移预览；确认迁移后才创建
+私有 API Key 连接并切换默认模型。迁移重复执行是幂等的，原配置在确认前保持可用。
+
+ChatGPT 套餐登录仍只覆盖其官方允许的文本/多模态 Responses 请求；Kimi Code 登录
+同样不会自动获得生图、转写、TTS 或 Realtime。Realtime 通话继续使用原有独立
+OpenAI/Azure API Key 设置。[ChatGPT OAuth 限制](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)、
+[OpenAI 图片 API](https://developers.openai.com/api/docs/guides/image-generation)、
+[OpenAI 音频 API](https://developers.openai.com/api/docs/guides/audio)。
+硅基流动的语音、转写和生图接口分别见
+[语音合成](https://docs.siliconflow.cn/docs/userguide/capabilities/text-to-speech)、
+[语音转写](https://docs.siliconflow.cn/docs/api/audio-transcriptions-post) 和
+[图片生成](https://docs.siliconflow.cn/docs/userguide/capabilities/images)。
 
 ## 验证与发布
 

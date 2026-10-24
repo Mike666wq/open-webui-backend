@@ -50,7 +50,7 @@ async def settings():
     return {key: await Config.get(f'recordings.{key}', value) for key, value in DEFAULTS.items()}
 
 
-async def authorize(user, *, stt=False):
+async def authorize(user, *, stt=False, model_ref=None):
     if not user or user.role not in ('user', 'admin'):
         raise HTTPException(403, 'User is no longer active')
     async with get_async_db_context() as db:
@@ -60,6 +60,11 @@ async def authorize(user, *, stt=False):
             raise HTTPException(503, 'Recording transcription requires ffmpeg and ffprobe in the backend image')
         if user.role != 'admin' and not await has_permission(user.id, 'chat.stt', await Config.get('user.permissions')):
             raise HTTPException(403, 'Speech-to-text permission is required')
+        if model_ref:
+            from open_webui.utils.providers import resolve_media_model
+
+            await resolve_media_model(model_ref, user, 'transcription')
+            return
         engine = await Config.get('audio.stt.engine')
         if engine not in ('provider', 'openai', 'azure', 'deepgram', 'mistral'):
             raise HTTPException(400, 'Configure a server-side cloud ASR in Admin Settings → Audio first')
@@ -78,7 +83,23 @@ async def authorize(user, *, stt=False):
             raise HTTPException(400, 'Configure a transcription model first')
 
 
-async def references():
+async def references(model_ref=None, user=None):
+    if model_ref:
+        from open_webui.utils.providers import provider_base_url, resolve_media_model
+
+        resolved = await resolve_media_model(model_ref, user, 'transcription')
+        return {
+            'engine': 'provider',
+            'model_ref': model_ref,
+            'model': resolved.upstream_model_id,
+            'provider_connection_id': resolved.connection.id,
+            'response_format': await Config.get('recordings.response_format', 'json'),
+            'endpoint_fingerprint': hashlib.sha256(
+                json.dumps(
+                    [provider_base_url(resolved.connection), resolved.model_metadata['uses']], sort_keys=True
+                ).encode()
+            ).hexdigest(),
+        }
     result = {key: await Config.get(f'audio.stt.{key}') for key in REFERENCE_KEYS}
     endpoints = [
         await Config.get(f'audio.stt.{key}')
@@ -318,6 +339,7 @@ class ExistingASRAdapter:
             {
                 'language': job.data['language'],
                 '_recording_single_attempt': True,
+                '_provider_model_ref': job.data['config'].get('model_ref'),
                 '_recording_response_format': job.data.get('response_format', 'json'),
             },
             user,
@@ -348,8 +370,8 @@ async def run_job(app, job_id, token, adapter=None):
         data.pop('error', None)
         for index in range(len(data.get('chunks', [])), math.ceil(job.duration / CHUNK_SECONDS)):
             user = await Users.get_user_by_id(job.user_id)
-            await authorize(user, stt=True)
-            if await references() != data['config']:
+            await authorize(user, stt=True, model_ref=data['config'].get('model_ref'))
+            if await references(data['config'].get('model_ref'), user) != data['config']:
                 raise HTTPException(409, 'ASR configuration changed; retry to restart with the new model')
             await change(job_id, token, state='preparing')
             offset = index * CHUNK_SECONDS
@@ -389,7 +411,9 @@ async def run_job(app, job_id, token, adapter=None):
             chunk_path.unlink(missing_ok=True)
             chunk_path.with_suffix('.json').unlink(missing_ok=True)
         user = await Users.get_user_by_id(job.user_id)
-        await authorize(user, stt=True)
+        await authorize(user, stt=True, model_ref=data['config'].get('model_ref'))
+        if await references(data['config'].get('model_ref'), user) != data['config']:
+            raise HTTPException(409, 'ASR configuration changed during transcription')
         if not any(chunk['text'].strip() for chunk in data['chunks']):
             raise HTTPException(422, 'No speech was recognized in this recording')
         await change(job_id, token, state='saving')

@@ -4,11 +4,11 @@
 import asyncio
 import json
 import os
-from pathlib import Path
-from types import SimpleNamespace
 import secrets
 import sys
 import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from dev_backend import REPO_ROOT, configuration
@@ -31,7 +31,7 @@ async def verify():
         assert request.headers['Authorization'].startswith('Bearer synthetic-')
         return web.json_response(
             {
-                'data': [{'id': 'same-model'}],
+                'data': [{'id': 'same-model', 'capabilities': ['chat']}],
                 'models': [{'slug': 'same-model', 'display_name': 'Synthetic ChatGPT', 'visibility': 'list'}],
             }
         )
@@ -209,7 +209,7 @@ async def verify():
             # A disconnected registration remains available for explicit reconnect but contributes no models.
 
             # Browser/manual callback requires no local helper or token import.
-            from urllib.parse import parse_qs, urlsplit, urlencode
+            from urllib.parse import parse_qs, urlencode, urlsplit
 
             browser = await call('POST', auth_prefix + '/start', {'mode': 'browser'}, alice['token'])
             assert 'authorization_url' in browser and 'command' not in browser and 'pairing_code' not in browser
@@ -265,10 +265,10 @@ async def verify():
                 )
                 ids[account['id']] = stable_model_id(connection['id'], 'same-model')
                 assert 'credential' not in connection and 'api_key' not in connection
-                await call('POST', f"/api/v1/providers/connections/{connection['id']}/verify", {}, account['token'])
+                await call('POST', f'/api/v1/providers/connections/{connection["id"]}/verify', {}, account['token'])
                 # Even administrator privileges must not expose other people's private connections.
                 await call(
-                    'GET', f"/api/v1/providers/connections/{connection['id']}", token=admin['token'], expected=404
+                    'GET', f'/api/v1/providers/connections/{connection["id"]}', token=admin['token'], expected=404
                 )
 
             # Keep legacy model discovery offline; provider traffic still reaches the loopback upstream.
@@ -292,9 +292,9 @@ async def verify():
                         json={**payload, 'stream': True},
                         headers={'Authorization': 'Bearer ' + account['token']},
                     )
-                    assert (
-                        stream.status_code == 200 and 'synthetic reply' in stream.text and '[DONE]' in stream.text
-                    ), stream.text
+                    assert stream.status_code == 200 and 'synthetic reply' in stream.text and '[DONE]' in stream.text, (
+                        stream.text
+                    )
                     denied = await client.post(
                         '/api/chat/completions',
                         json={**payload, 'model': ids[other['id']]},
@@ -333,7 +333,7 @@ async def verify():
                     listing = await call('GET', '/api/models', token=account['token'])
                     assert (shared_id in {model['id'] for model in listing['data']}) == expected
                 await call(
-                    'PATCH', f"/api/v1/providers/connections/{shared['id']}", {'access_control': []}, admin['token']
+                    'PATCH', f'/api/v1/providers/connections/{shared["id"]}', {'access_control': []}, admin['token']
                 )
                 payload = {
                     'model': shared_id,
@@ -409,8 +409,8 @@ async def verify():
                     alice['token'],
                 )
                 from open_webui import main as main_module
-                from open_webui.tools import builtin
                 from open_webui.tasks import tasks as running_tasks
+                from open_webui.tools import builtin
 
                 emitter = AsyncMock()
                 search = AsyncMock(

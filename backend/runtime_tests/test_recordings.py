@@ -408,3 +408,78 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
             result = await asyncio.gather(*(service.command('synthetic-decoder') for _ in range(5)))
         self.assertEqual(maximum, 2)
         self.assertEqual(result, [b'output'] * 5)
+
+    async def test_selected_provider_model_is_fixed_despite_global_default_change(self):
+        from open_webui.models.provider_connections import ProviderConnection, new_provider_connection
+        from open_webui.utils import providers
+
+        connection = new_provider_connection(
+            provider_id='custom',
+            name='Selected ASR',
+            auth_type='api_key',
+            visibility='private',
+            owner_id=self.owner.id,
+            config={
+                'base_url': 'https://example.com/v1',
+                '_catalog_version': 1,
+                'model_ids': ['selected-asr'],
+                '_model_overrides': {'selected-asr': {'transcription': 'openai-transcription'}},
+            },
+            credential=providers.encrypt_credential('synthetic-key'),
+            status='connected',
+            models=[],
+            is_active=True,
+        )
+        async with get_async_db_context() as db:
+            db.add(connection)
+            await db.commit()
+        model_ref = providers.stable_model_id(connection.id, 'selected-asr')
+        with patch.object(providers, '_request_json', new=AsyncMock(return_value={'data': []})):
+            response = await self.client.post(
+                '/api/v1/recordings',
+                headers={'Idempotency-Key': str(uuid.uuid4())},
+                files={'file': ('class.wav', self.wav(), 'audio/wav')},
+                data={'model_ref': model_ref},
+            )
+            self.assertEqual(response.status_code, 202, response.text)
+            id = response.json()['id']
+            self.assertEqual(response.json()['config']['model_ref'], model_ref)
+            await Config.upsert({'audio.stt.model': 'a-different-global-default', 'audio.stt.engine': ''})
+            adapter = SimpleNamespace(transcribe=AsyncMock(return_value={'text': '固定模型的原文'}))
+            claim = await service.claim()
+            await service.run_job(self.app, *claim, adapter)
+            self.assertEqual((await self.row(id)).state, 'completed')
+            self.assertEqual(adapter.transcribe.await_args.args[2].data['config']['model_ref'], model_ref)
+            async with get_async_db_context() as db:
+                stored = await db.get(Recording, id)
+                stored.state = 'failed'
+                await db.commit()
+            # Removing access stops retry; there is no fallback to the server default.
+            async with get_async_db_context() as db:
+                c = await db.get(ProviderConnection, connection.id)
+                c.is_active = False
+                await db.commit()
+            denied = await self.client.post(f'/api/v1/recordings/{id}/retry')
+            self.assertEqual(denied.status_code, 404)
+
+    async def test_switching_recording_model_requires_explicit_full_restart(self):
+        id = await self.create_job(1)
+        async with get_async_db_context() as db:
+            job = await db.get(Recording, id)
+            job.state = 'failed'
+            await db.commit()
+        with (
+            patch.object(service, 'authorize', new=AsyncMock()),
+            patch.object(
+                service,
+                'references',
+                new=AsyncMock(return_value={'model_ref': 'provider:new:asr', 'response_format': 'json'}),
+            ),
+        ):
+            result = await self.client.post(f'/api/v1/recordings/{id}/retry', json={'model_ref': 'provider:new:asr'})
+            self.assertEqual(result.status_code, 409)
+            result = await self.client.post(
+                f'/api/v1/recordings/{id}/retry', json={'model_ref': 'provider:new:asr', 'restart': True}
+            )
+            self.assertEqual(result.status_code, 202, result.text)
+            self.assertEqual(result.json()['config']['model_ref'], 'provider:new:asr')

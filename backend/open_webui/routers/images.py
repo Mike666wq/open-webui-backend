@@ -8,10 +8,8 @@ import mimetypes
 import re
 import uuid
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
@@ -26,7 +24,6 @@ from open_webui.config import (
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.env import AIOHTTP_CLIENT_ALLOW_REDIRECTS, AIOHTTP_CLIENT_SESSION_SSL, ENABLE_FORWARD_USER_INFO_HEADERS
 from open_webui.events import EVENTS, publish_event
-from open_webui.internal.db import get_async_session
 from open_webui.models.chats import Chats
 from open_webui.models.config import Config
 from open_webui.retrieval.web.utils import get_ssrf_safe_session, validate_url
@@ -43,16 +40,16 @@ from open_webui.utils.images.comfyui import (
     comfyui_upload_image,
 )
 from open_webui.utils.json_codec import JSONCodec
-from open_webui.utils.session_pool import get_session
 from open_webui.utils.providers import (
     get_media_api_connection,
     media_http_session,
     provider_base_url,
     provider_http_error,
+    resolve_configured_media,
 )
+from open_webui.utils.session_pool import get_session
 from PIL import Image, ImageOps
 from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
 
@@ -213,9 +210,7 @@ async def get_image_model(request):
     if image_config.IMAGE_GENERATION_ENGINE == 'openai':
         return image_config.IMAGE_GENERATION_MODEL if image_config.IMAGE_GENERATION_MODEL else 'dall-e-2'
     elif image_config.IMAGE_GENERATION_ENGINE == 'gemini':
-        return (
-            image_config.IMAGE_GENERATION_MODEL if image_config.IMAGE_GENERATION_MODEL else 'imagen-3.0-generate-002'
-        )
+        return image_config.IMAGE_GENERATION_MODEL if image_config.IMAGE_GENERATION_MODEL else 'imagen-3.0-generate-002'
     elif image_config.IMAGE_GENERATION_ENGINE == 'comfyui':
         return image_config.IMAGE_GENERATION_MODEL if image_config.IMAGE_GENERATION_MODEL else ''
     elif image_config.IMAGE_GENERATION_ENGINE == 'automatic1111' or image_config.IMAGE_GENERATION_ENGINE == '':
@@ -289,7 +284,9 @@ async def get_config(request: Request, user=Depends(get_admin_user)):
 @router.post('/config/update')
 async def update_config(request: Request, form_data: ImagesConfig, user=Depends(get_admin_user)):
     if form_data.IMAGE_GENERATION_ENGINE == 'provider':
-        await get_media_api_connection(form_data.IMAGES_PROVIDER_CONNECTION_ID, user)
+        await resolve_configured_media(
+            form_data.IMAGES_PROVIDER_CONNECTION_ID, form_data.IMAGE_GENERATION_MODEL, user, 'image'
+        )
     if form_data.IMAGE_EDIT_ENGINE == 'provider':
         await get_media_api_connection(form_data.IMAGES_EDIT_PROVIDER_CONNECTION_ID, user)
     if form_data.IMAGE_SIZE == 'auto' and not re.match(
@@ -652,9 +649,12 @@ async def image_generations(
     metadata = metadata or {}
 
     model = image_config.IMAGE_GENERATION_MODEL if media_connection else await get_image_model(request)
+    if media_connection:
+        resolved_image = await resolve_configured_media(media_connection.id, model, user, 'image')
+        model = resolved_image.upstream_model_id
     if media_connection and not model:
         raise HTTPException(400, 'Select an image model for this provider connection')
-    if media_connection and form_data.model and form_data.model != model:
+    if media_connection and form_data.model and form_data.model not in (model, image_config.IMAGE_GENERATION_MODEL):
         raise HTTPException(400, 'Use the configured image model for this provider connection')
 
     try:
@@ -691,6 +691,12 @@ async def image_generations(
                 **({} if not image_config.IMAGES_OPENAI_API_PARAMS else image_config.IMAGES_OPENAI_API_PARAMS),
             }
 
+            if media_connection and resolved_image.model_metadata['uses']['image'] == 'siliconflow-image':
+                data = {
+                    'model': model,
+                    'prompt': form_data.prompt,
+                    'image_size': form_data.size or image_config.IMAGE_SIZE,
+                }
             async with (
                 media_http_session(media_connection) as session,
                 session.post(
@@ -708,7 +714,11 @@ async def image_generations(
 
             images = []
 
-            for image in res['data']:
+            for image in (
+                res.get('images', [])
+                if media_connection and resolved_image.model_metadata['uses']['image'] == 'siliconflow-image'
+                else res['data']
+            ):
                 if image_url := image.get('url', None):
                     image_data, content_type = await get_image_data(
                         image_url,
