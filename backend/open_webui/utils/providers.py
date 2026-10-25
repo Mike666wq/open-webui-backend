@@ -20,6 +20,7 @@ from fastapi.responses import StreamingResponse
 from open_webui.env import VERSION, WEBUI_SECRET_KEY
 from open_webui.internal.db import get_async_db_context
 from open_webui.models.access_grants import AccessGrants
+from open_webui.models.models import Model
 from open_webui.models.provider_connections import ProviderConnection, new_provider_connection
 from open_webui.utils.apps import AppTCPConnector, validate_app_url
 from open_webui.utils.provider_capabilities import normalize_model, provider_family
@@ -500,8 +501,15 @@ async def visible_connection_models(connection: ProviderConnection, user, db: As
     return models
 
 
+async def disabled_provider_model_ids(db: AsyncSession) -> set[str]:
+    # Provider models are request-private and appended after the normal model
+    # overlay. Read saved switches here as well, including on every inference.
+    return set(await db.scalars(select(Model.id).where(Model.is_active.is_(False), Model.id.startswith('provider:'))))
+
+
 async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
     connections = (await db.scalars(select(ProviderConnection).where(ProviderConnection.is_active.is_(True)))).all()
+    disabled_ids = await disabled_provider_model_ids(db)
     result = []
     for connection in connections:
         if await can_access_connection(connection, user, db):
@@ -529,7 +537,7 @@ async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
                         },
                     }
                     for model in await visible_connection_models(connection, user, db)
-                    if 'chat' in model.get('uses', {})
+                    if 'chat' in model.get('uses', {}) and model['id'] not in disabled_ids
                 )
             except HTTPException as exc:
                 log.info(
@@ -547,7 +555,7 @@ async def _resolve_model(model_id: str, user, db: AsyncSession) -> ResolvedProvi
     connection_id, upstream_id = parse_model_id(model_id)
     connection = await db.get(ProviderConnection, connection_id)
     await require_connection_access(connection, user, db)
-    if not connection.is_active:
+    if not connection.is_active or model_id in await disabled_provider_model_ids(db):
         raise HTTPException(404, 'Provider model not found')
     available = await visible_connection_models(connection, user, db)
     metadata = next((model for model in available if model['upstream_id'] == upstream_id), None)
