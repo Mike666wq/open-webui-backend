@@ -33,6 +33,7 @@ class RecordingSettings(BaseModel):
 async def get_config(user=Depends(get_verified_user)):
     await service.authorize(user)
     result = await service.settings()
+    result['can_delete_tasks'] = True
     rag_limit = await Config.get('rag.file.max_size')
     result['effective_max_size_mb'] = (
         min(result['max_size_mb'], float(rag_limit)) if rag_limit else result['max_size_mb']
@@ -260,6 +261,28 @@ async def delete_audio(id: str, user=Depends(get_verified_user)):
         await db.commit()
     (service.directory(id) / 'source').unlink(missing_ok=True)
     return {'deleted': True}
+
+
+@router.delete('/{id}')
+async def delete_recording(id: str, user=Depends(get_verified_user)):
+    await service.get_owned(id, user)
+    async with get_async_db_context() as db:
+        job = await db.get(Recording, id, with_for_update=True)
+        if not job or job.user_id != user.id:
+            raise HTTPException(404, 'Recording not found')
+        if (
+            job.state == 'queued'
+            or job.state in service.ACTIVE
+            or (job.lease_token and job.lease_until >= service.now())
+            or (job.summary_token and job.summary_until >= service.now())
+        ):
+            raise HTTPException(409, 'Wait for recording and summary processing to stop before deleting the task')
+        if job.source_present or (service.directory(id) / 'source').exists():
+            raise HTTPException(409, 'Delete the original audio before deleting the task record')
+        # Only the private job/snapshot is removed. Notes and knowledge files have independent lifecycles.
+        await db.delete(job)
+        await db.commit()
+    return {'deleted': True, 'notes_retained': True}
 
 
 class SpeakerNames(BaseModel):
