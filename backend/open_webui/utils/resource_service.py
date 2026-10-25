@@ -906,7 +906,7 @@ async def legacy_delete_many(user, kind, ids, *, options=None):
     return True
 
 
-async def knowledge_cleanup(user, knowledge_id, *, file_ids=(), directory_ids=(), move_files=False):
+async def knowledge_cleanup(user, knowledge_id, *, file_ids=(), directory_ids=(), move_files=False, confirm_shared=False):
     """All old detach/reset/sync paths retain associations for seven days."""
     from open_webui.models.knowledge import KnowledgeDirectory, KnowledgeFile
     async with get_async_db() as db:
@@ -927,7 +927,8 @@ async def knowledge_cleanup(user, knowledge_id, *, file_ids=(), directory_ids=()
         items.extend({'type': 'knowledge_file', 'id': row.id} for row in links if row.id not in covered)
         if not items:
             return True
-        preview = await make_preview(db, user, 'recycle', items, {'move_files': move_files}, knowledge_write=True)
+        preview = await make_preview(db, user, 'recycle', items,
+                                     {'move_files': move_files, 'include_shared': confirm_shared}, knowledge_write=True)
         if preview['allowed'] != len(items):
             raise HTTPException(409, {'reason': 'Protected knowledge content; review impact first', 'items': preview['items']})
         task = await submit(db, user, preview['id'], uid())

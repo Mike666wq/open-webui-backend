@@ -182,7 +182,11 @@ async def create_recording(
 
 @router.get('/{id}')
 async def get_recording(id: str, user=Depends(get_verified_user)):
-    return service.public(await service.get_owned(id, user))
+    job = await service.get_owned(id, user)
+    result = service.public(job)
+    # Older versions could mark deletion before unlink failed. Keep cleanup available.
+    result['source_present'] = bool(job.source_present or (service.directory(id) / 'source').is_file())
+    return result
 
 
 @router.get('/{id}/audio')

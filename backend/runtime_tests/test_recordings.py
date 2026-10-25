@@ -169,6 +169,18 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
         (service.directory(id) / 'source').unlink()
         self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 409)
 
+    async def test_legacy_failed_audio_unlink_remains_cleanable(self):
+        id = await self.create_job(1)
+        async with get_async_db_context() as db:
+            job = await db.get(Recording, id)
+            job.state, job.source_present = 'failed', 0
+            await db.commit()
+        detail = await self.client.get(f'/api/v1/recordings/{id}')
+        self.assertTrue(detail.json()['source_present'])
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 409)
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}/audio')).status_code, 200)
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 200)
+
     async def test_unconfigured_asr_does_not_start_local_models(self):
         await Config.upsert({'audio.stt.engine': ''})
         config = await self.client.get('/api/v1/recordings/config')
