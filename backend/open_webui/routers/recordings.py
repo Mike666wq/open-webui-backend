@@ -257,9 +257,12 @@ async def delete_audio(id: str, user=Depends(get_verified_user)):
             or (job.lease_token and job.lease_until >= service.now())
         ):
             raise HTTPException(409, 'Stop the task and wait for the request to finish before deleting its audio')
+        try:
+            (service.directory(id) / 'source').unlink(missing_ok=True)
+        except OSError:
+            raise HTTPException(503, 'Could not delete the original audio; no task state was changed') from None
         job.source_present, job.updated_at = 0, service.now()
         await db.commit()
-    (service.directory(id) / 'source').unlink(missing_ok=True)
     return {'deleted': True}
 
 

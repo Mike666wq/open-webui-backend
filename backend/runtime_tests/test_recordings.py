@@ -144,6 +144,9 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
             await service.run_job(self.app, *(await service.claim()), adapter)
         note_id = (await self.row(id)).note_id
         self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 409)
+        with patch.object(Path, 'unlink', side_effect=PermissionError('synthetic disk failure')):
+            self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}/audio')).status_code, 503)
+        self.assertEqual((await self.row(id)).source_present, 1)
         self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}/audio')).status_code, 200)
         self.app.dependency_overrides[get_verified_user] = lambda: self.other
         self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 404)
