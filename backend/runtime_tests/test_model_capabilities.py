@@ -78,6 +78,40 @@ class ModelCapabilitiesTests(unittest.IsolatedAsyncioTestCase):
                 await providers.resolve_model(providers.stable_model_id(self.connection.id, 'unknown'), self.owner, db)
             self.assertEqual(error.exception.status_code, 404)
 
+    async def test_saved_model_switch_filters_chat_and_blocks_stale_calls(self):
+        from open_webui.models.models import Model
+        from sqlalchemy import update
+
+        await self.save_uses('switch-model', {'chat': 'openai-chat'})
+        model_id = self.model('switch-model')['id']
+        async with get_async_db_context() as db:
+            db.add(
+                Model(
+                    id=model_id,
+                    user_id=self.owner.id,
+                    name='Switch',
+                    base_model_id=None,
+                    params={},
+                    meta={},
+                    is_active=False,
+                    created_at=1,
+                    updated_at=1,
+                )
+            )
+            await db.commit()
+            self.assertEqual(await providers.list_visible_models(self.owner, db), [])
+            with self.assertRaises(HTTPException) as error:
+                await providers.resolve_model(model_id, self.owner, db)
+            self.assertEqual(error.exception.status_code, 404)
+            await db.execute(update(Model).where(Model.id == model_id).values(is_active=True))
+            await db.commit()
+            self.assertIn(model_id, [m['id'] for m in await providers.list_visible_models(self.owner, db)])
+            self.assertEqual(
+                (await providers.resolve_model(model_id, self.owner, db)).upstream_model_id, 'switch-model'
+            )
+            await db.execute(delete(Model).where(Model.id == model_id))
+            await db.commit()
+
     async def test_refresh_preserves_overrides_and_no_inference(self):
         await self.save_uses('manual-asr', {'transcription': 'openai-transcription'})
         response = await self.client.post(f'/providers/connections/{self.connection.id}/models/refresh')
