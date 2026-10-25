@@ -137,6 +137,50 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.upload(body=b'x' * (1024 * 1024))).status_code, 413)
         self.assertEqual(list(Path(self.temp.name).iterdir()), [])
 
+    async def test_task_removal_requires_audio_removal_and_preserves_notes(self):
+        id = await self.create_job(1)
+        adapter = SimpleNamespace(transcribe=AsyncMock(return_value={'text': '保留笔记'}))
+        with patch.object(service, 'command', new=AsyncMock(return_value=b'')):
+            await service.run_job(self.app, *(await service.claim()), adapter)
+        note_id = (await self.row(id)).note_id
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 409)
+        with patch.object(Path, 'unlink', side_effect=PermissionError('synthetic disk failure')):
+            self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}/audio')).status_code, 503)
+        self.assertEqual((await self.row(id)).source_present, 1)
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}/audio')).status_code, 200)
+        self.app.dependency_overrides[get_verified_user] = lambda: self.other
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 404)
+        self.app.dependency_overrides[get_verified_user] = lambda: self.owner
+        deleted = await self.client.delete(f'/api/v1/recordings/{id}')
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertIsNone(await self.row(id))
+        async with get_async_db_context() as db:
+            note = await db.get(Note, note_id)
+            self.assertEqual(note.data['content']['md'], '保留笔记')
+
+    async def test_active_task_cannot_be_removed(self):
+        id = await self.create_job(1)
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 409)
+        async with get_async_db_context() as db:
+            job = await db.get(Recording, id)
+            job.state, job.source_present = 'completed', 0
+            job.summary_token, job.summary_until = 'synthetic-summary', service.now() + 60
+            await db.commit()
+        (service.directory(id) / 'source').unlink()
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 409)
+
+    async def test_legacy_failed_audio_unlink_remains_cleanable(self):
+        id = await self.create_job(1)
+        async with get_async_db_context() as db:
+            job = await db.get(Recording, id)
+            job.state, job.source_present = 'failed', 0
+            await db.commit()
+        detail = await self.client.get(f'/api/v1/recordings/{id}')
+        self.assertTrue(detail.json()['source_present'])
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 409)
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}/audio')).status_code, 200)
+        self.assertEqual((await self.client.delete(f'/api/v1/recordings/{id}')).status_code, 200)
+
     async def test_unconfigured_asr_does_not_start_local_models(self):
         await Config.upsert({'audio.stt.engine': ''})
         config = await self.client.get('/api/v1/recordings/config')

@@ -348,10 +348,23 @@ async def verify():
         await Config.upsert({'user.permissions': permissions})
         collaborator = await Users.get_user_by_id(other['id'])
         grant_id = secrets.token_hex(16)
+        await call('POST', f"/api/v1/knowledge/{knowledge['id']}/file/remove",
+                   {'file_id': knowledge_file_id, 'confirm_shared': True}, other['token'], 400)
         async with get_async_db() as db:
             db.add(AccessGrant(id=grant_id, resource_type='knowledge', resource_id=knowledge['id'],
                                principal_type='user', principal_id=other['id'], permission='write', created_at=service.now()))
             await db.commit()
+        # A normal shared-KB detach needs explicit confirmation, not a hidden bypass.
+        await call('POST', f"/api/v1/knowledge/{knowledge['id']}/file/remove",
+                   {'file_id': knowledge_file_id}, token, 409)
+        await call('POST', f"/api/v1/knowledge/{knowledge['id']}/file/remove",
+                   {'file_id': knowledge_file_id, 'confirm_shared': True}, token)
+        async with get_async_db() as db:
+            assert await db.get(KnowledgeFile, link_id) is None
+        await act('restore', 'knowledge_file', link_id)
+        async with get_async_db() as db:
+            assert await db.get(KnowledgeFile, link_id)
+        passed += ['shared_knowledge_detach_requires_confirmation', 'shared_knowledge_detach_restore']
         denied = await preview('recycle', 'knowledge', knowledge['id'], other['token'], {'include_shared': True})
         assert denied['allowed'] == 0, denied
         await call('POST', '/api/v1/resources/preflight', {

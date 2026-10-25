@@ -1591,11 +1591,15 @@ async def update_file_from_knowledge_by_id(
 ############################
 
 
+class KnowledgeFileRemovalForm(KnowledgeFileIdForm):
+    confirm_shared: bool = False
+
+
 @router.post('/{id}/file/remove', response_model=KnowledgeFilesResponse | None)
 async def remove_file_from_knowledge_by_id(
     request: Request,
     id: str,
-    form_data: KnowledgeFileIdForm,
+    form_data: KnowledgeFileRemovalForm,
     delete_file: bool = Query(not ENABLE_KNOWLEDGE_FILE_RETENTION),
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
@@ -1642,7 +1646,7 @@ async def remove_file_from_knowledge_by_id(
     # The relationship, original file and vectors survive until expiry.
     # Other uses of this file are never removed by detaching it here.
     from open_webui.utils.resource_service import knowledge_cleanup
-    await knowledge_cleanup(user, id, file_ids=[form_data.file_id])
+    await knowledge_cleanup(user, id, file_ids=[form_data.file_id], confirm_shared=form_data.confirm_shared)
 
     if knowledge:
         response = KnowledgeFilesResponse(
