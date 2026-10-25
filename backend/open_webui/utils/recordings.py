@@ -472,6 +472,9 @@ async def run_job(app, job_id, token, adapter=None):
                     diagnostic += f'; HTTP {status_code}'
                 if isinstance(error, TimeoutError) or status_code == 504:
                     diagnostic += '; request timed out'
+                trace_id = (error.headers or {}).get('X-ASR-Trace-Id', '') if isinstance(error, HTTPException) else ''
+                if re.fullmatch(r'[0-9a-f]{32}', trace_id):
+                    diagnostic += f'; trace {trace_id}'
                 safe_provider_errors = {
                     'Transcription provider TLS certificate validation failed',
                     'Could not connect to the transcription provider (DNS or network failure)',
