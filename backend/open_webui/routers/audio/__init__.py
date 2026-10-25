@@ -1058,7 +1058,12 @@ async def _transcribe_openai(
                             while chunk := await audio_file.read(AIOHTTP_FILE_STREAM_CHUNK_SIZE):
                                 yield chunk
 
-                    form_data.add_field('file', audio_chunks(), filename=filename)
+                    form_data.add_field(
+                        'file',
+                        audio_chunks(),
+                        filename=filename,
+                        content_type=mimetypes.guess_type(filename)[0] or 'application/octet-stream',
+                    )
 
                     r = await session.post(
                         url=f'{api_base_url}/audio/transcriptions',
@@ -1082,8 +1087,15 @@ async def _transcribe_openai(
         return data
     except HTTPException:
         raise
+    except TimeoutError:
+        raise HTTPException(504, 'Transcription provider timed out; the request may have been charged') from None
+    except aiohttp.ClientConnectorCertificateError:
+        raise HTTPException(502, 'Transcription provider TLS certificate validation failed') from None
+    except aiohttp.ClientConnectorError:
+        raise HTTPException(502, 'Could not connect to the transcription provider (DNS or network failure)') from None
     except Exception as e:
         if use_provider:
+            log.warning('Provider transcription failed (%s)', type(e).__name__)
             raise HTTPException(502, 'Could not reach the transcription provider') from None
         log.exception(e)
         detail = None
@@ -1810,10 +1822,7 @@ async def get_available_voices(request, user=None) -> dict:
             await Config.get('audio.tts.provider_connection_id'), await Config.get('audio.tts.model'), user, 'speech'
         )
         if provider_family(resolved.connection) == 'siliconflow':
-            return {
-                f'{resolved.upstream_model_id}:{voice}': voice
-                for voice in SILICONFLOW_PRESET_VOICES
-            }
+            return {f'{resolved.upstream_model_id}:{voice}': voice for voice in SILICONFLOW_PRESET_VOICES}
         return dict(_OPENAI_DEFAULT_VOICES)
 
     if engine == 'openai':

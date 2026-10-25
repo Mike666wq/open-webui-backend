@@ -191,6 +191,18 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(service.public(await self.row(id))['text'], '老师讲课。')
         self.assertEqual((await self.client.post(f'/api/v1/recordings/{id}/retry')).status_code, 409)
 
+    async def test_server_failure_diagnostics_do_not_store_raw_details(self):
+        id = await self.create_job(20)
+        adapter = SimpleNamespace(transcribe=AsyncMock(side_effect=HTTPException(502, 'secret upstream response')))
+        with patch.object(service, 'command', new=AsyncMock(return_value=b'')):
+            await service.run_job(self.app, *(await service.claim()), adapter)
+        row = await self.row(id)
+        self.assertEqual(row.state, 'failed')
+        self.assertIn('provider transcription (segment 1); HTTP 502', row.data['error'])
+        self.assertNotIn('secret upstream response', str(row.data))
+        self.assertEqual(row.data['error_diagnostic']['segment'], 1)
+        self.assertEqual(adapter.transcribe.await_count, 1)
+
     async def test_long_audio_failure_checkpoint_and_manual_resume(self):
         id = await self.create_job(3000)  # A 50-minute class, five bounded chunks.
         calls = []
@@ -209,6 +221,8 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
             await service.run_job(self.app, *(await service.claim()), adapter)
             row = await self.row(id)
             self.assertEqual(row.state, 'failed')
+            self.assertIn('provider transcription (segment 2)', row.data['error'])
+            self.assertIn('request timed out', row.data['error'])
             self.assertEqual(len(row.data['chunks']), 1)
             self.assertEqual(len(calls), 2)  # No hidden retry of an uncertain response.
             result = await self.client.post(f'/api/v1/recordings/{id}/retry')

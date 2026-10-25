@@ -9,6 +9,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import shutil
 import time
 import uuid
@@ -350,6 +351,8 @@ async def run_job(app, job_id, token, adapter=None):
     adapter = adapter or ExistingASRAdapter()
     heartbeat_task = asyncio.create_task(heartbeat(job_id, token, asyncio.current_task()))
     chunk_path = directory(job_id) / f'{token}.mp3'
+    stage = 'authorization'
+    chunk_number = None
     try:
         async with get_async_db_context() as db:
             job = await db.get(Recording, job_id)
@@ -368,12 +371,16 @@ async def run_job(app, job_id, token, adapter=None):
         )
         data = dict(job.data)
         data.pop('error', None)
+        data.pop('error_diagnostic', None)
         for index in range(len(data.get('chunks', [])), math.ceil(job.duration / CHUNK_SECONDS)):
+            chunk_number = index + 1
+            stage = 'authorization'
             user = await Users.get_user_by_id(job.user_id)
             await authorize(user, stt=True, model_ref=data['config'].get('model_ref'))
             if await references(data['config'].get('model_ref'), user) != data['config']:
                 raise HTTPException(409, 'ASR configuration changed; retry to restart with the new model')
             await change(job_id, token, state='preparing')
+            stage = 'audio preparation'
             offset = index * CHUNK_SECONDS
             await command(
                 'ffmpeg',
@@ -401,8 +408,10 @@ async def run_job(app, job_id, token, adapter=None):
                 str(chunk_path),
             )
             await change(job_id, token, state='transcribing')
+            stage = 'provider transcription'
             # No automatic retry: a timeout or lost response could already be charged.
             raw = await asyncio.wait_for(adapter.transcribe(request, chunk_path, job, user), 900)
+            stage = 'transcription response processing'
             data['chunks'] = [
                 *data.get('chunks', []),
                 normalize(raw, offset, index, min(CHUNK_SECONDS, job.duration - offset)),
@@ -417,6 +426,7 @@ async def run_job(app, job_id, token, adapter=None):
         if not any(chunk['text'].strip() for chunk in data['chunks']):
             raise HTTPException(422, 'No speech was recognized in this recording')
         await change(job_id, token, state='saving')
+        stage = 'note saving'
         # Persist note and job completion together. A crash cannot create duplicate notes.
         async with get_async_db_context() as db:
             current = await db.get(Recording, job_id, with_for_update=True)
@@ -441,16 +451,47 @@ async def run_job(app, job_id, token, adapter=None):
         # Cancellation/shutdown leaves saved chunks intact; lease expiry marks interrupted.
         raise
     except Exception as error:
-        log.warning('Recording job %s stopped (%s)', job_id, type(error).__name__)
+        status_code = error.status_code if isinstance(error, HTTPException) else None
+        log.warning(
+            'Recording job %s stopped: stage=%s chunk=%s exception=%s status=%s',
+            job_id,
+            stage,
+            chunk_number,
+            type(error).__name__,
+            status_code,
+        )
         async with get_async_db_context() as db:
             current = await db.get(Recording, job_id)
             if current and current.lease_token == token and current.state in ACTIVE:
                 data = dict(current.data)
+                # Never persist raw exception strings or upstream response bodies.
+                diagnostic = f'Failed during {stage}'
+                if chunk_number is not None:
+                    diagnostic += f' (segment {chunk_number})'
+                if status_code is not None:
+                    diagnostic += f'; HTTP {status_code}'
+                if isinstance(error, TimeoutError) or status_code == 504:
+                    diagnostic += '; request timed out'
+                safe_provider_errors = {
+                    'Transcription provider TLS certificate validation failed',
+                    'Could not connect to the transcription provider (DNS or network failure)',
+                    'Could not reach the transcription provider',
+                }
+                if (
+                    isinstance(error, HTTPException)
+                    and isinstance(error.detail, str)
+                    and (
+                        error.detail in safe_provider_errors
+                        or re.fullmatch(r'Provider request failed with HTTP [1-5][0-9]{2}', error.detail)
+                    )
+                ):
+                    diagnostic += '; ' + error.detail
                 data['error'] = (
                     str(error.detail)
                     if isinstance(error, HTTPException) and error.status_code < 500
-                    else 'Transcription did not finish. The last request may have been charged; retry manually.'
+                    else diagnostic + '. The last request may have been charged; retry manually.'
                 )
+                data['error_diagnostic'] = {'stage': stage, 'segment': chunk_number, 'http_status': status_code}
                 current.data, current.state = data, 'failed'
                 current.lease_token, current.lease_until, current.updated_at = None, 0, now()
                 await db.commit()
