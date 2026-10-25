@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from open_webui.internal.db import get_async_db_context
 from open_webui.models.config import Config
 from open_webui.models.provider_connections import ProviderConnection, new_provider_connection
@@ -86,6 +86,47 @@ class ModelCapabilitiesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(model['uses'], {'transcription': 'openai-transcription'})
         self.assertEqual(model['verification']['transcription']['status'], 'untested')
         self.assertTrue(all(call.args[2].endswith('/models') for call in self.remote_mock.call_args_list))
+
+    async def test_failed_catalog_does_not_hide_other_models_or_leak_private_connections(self):
+        broken = new_provider_connection(
+            provider_id='custom',
+            name='Broken catalog',
+            auth_type='api_key',
+            visibility='private',
+            owner_id=self.owner.id,
+            config={'base_url': 'https://example.com/v1'},
+            credential=providers.encrypt_credential('synthetic-key'),
+            status='connected',
+            models=[],
+            is_active=True,
+        )
+        async with get_async_db_context() as db:
+            db.add(broken)
+            await db.commit()
+
+        async def discover(connection, user, db):
+            if connection.id == broken.id:
+                raise HTTPException(502, 'Provider request failed with HTTP 404')
+            return [self.model(uses={'transcription': 'openai-transcription'})]
+
+        with patch.object(providers, 'visible_connection_models', side_effect=discover):
+            result = await self.client.get('/providers/models?purpose=transcription')
+            self.assertEqual(result.status_code, 200)
+            self.assertEqual(len(result.json()['data']), 1)
+            self.assertEqual(
+                result.json()['errors'],
+                [
+                    {
+                        'connection_id': broken.id,
+                        'connection_name': 'Broken catalog',
+                        'status': 502,
+                    }
+                ],
+            )
+            self.app.dependency_overrides[get_verified_user] = lambda: self.other
+            private = await self.client.get('/providers/models?purpose=transcription')
+            self.assertEqual(private.json()['data'], [])
+            self.assertEqual(private.json()['errors'], [])
 
     async def test_private_models_and_management_are_not_accessible_to_other_admin(self):
         await self.save_uses('private-asr', {'transcription': 'openai-transcription'})

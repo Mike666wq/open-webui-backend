@@ -340,6 +340,7 @@ async def get_visible_models(
 ):
     from open_webui.utils.providers import list_visible_models
 
+    errors = []
     if purpose == 'chat':
         models = await list_visible_models(user, db)
     else:
@@ -353,14 +354,27 @@ async def get_visible_models(
             await db.scalars(select(ProviderConnection).where(ProviderConnection.is_active.is_(True)))
         ).all():
             if await can_access_connection(connection, user, db):
+                try:
+                    connection_models = await visible_connection_models(connection, user, db)
+                except HTTPException as exc:
+                    # One unavailable catalog must not hide other authorized models.
+                    errors.append(
+                        {
+                            'connection_id': connection.id,
+                            'connection_name': connection.name,
+                            'status': exc.status_code,
+                        }
+                    )
+                    continue
                 models.extend(
                     {**m, 'connection_name': connection.name}
-                    for m in await visible_connection_models(connection, user, db)
+                    for m in connection_models
                     if purpose == 'all' or purpose in m.get('uses', {})
                 )
     return {
         'object': 'list',
         'data': models,
+        'errors': errors,
     }
 
 
