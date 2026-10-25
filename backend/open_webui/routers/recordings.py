@@ -238,6 +238,7 @@ async def retry_recording(id: str, form: RecordingRetry | None = None, user=Depe
         data['config'] = reference
         data['response_format'] = reference['response_format']
         data.pop('error', None)
+        data.pop('error_diagnostic', None)
         job.data, job.state, job.updated_at = data, 'queued', service.now()
         job.lease_token, job.lease_until = None, 0
         await db.commit()

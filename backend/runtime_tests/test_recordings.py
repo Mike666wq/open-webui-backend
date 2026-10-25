@@ -209,6 +209,8 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
             await service.run_job(self.app, *(await service.claim()), adapter)
             row = await self.row(id)
             self.assertEqual(row.state, 'failed')
+            self.assertIn('provider transcription (segment 2)', row.data['error'])
+            self.assertIn('request timed out', row.data['error'])
             self.assertEqual(len(row.data['chunks']), 1)
             self.assertEqual(len(calls), 2)  # No hidden retry of an uncertain response.
             result = await self.client.post(f'/api/v1/recordings/{id}/retry')
