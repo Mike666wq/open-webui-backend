@@ -1019,6 +1019,10 @@ async def _transcribe_openai(
             request_format = (await Config.get('audio.stt.openai.api_request_format') or 'multipart').lower()
 
         headers = {'Authorization': f'Bearer {api_key}'}
+        trace_id = None
+        if connection and provider_family(connection) == 'siliconflow':
+            trace_id = uuid.uuid4().hex
+            headers['X-Trace-Id'] = trace_id
         if user and ENABLE_FORWARD_USER_INFO_HEADERS:
             headers = include_user_info_headers(headers, user)
 
@@ -1053,32 +1057,33 @@ async def _transcribe_openai(
                     for key, value in payload.items():
                         form_data.add_field(key, str(value))
 
-                    async def audio_chunks():
-                        async with aiofiles.open(file_path, 'rb') as audio_file:
-                            while chunk := await audio_file.read(AIOHTTP_FILE_STREAM_CHUNK_SIZE):
-                                yield chunk
-
-                    form_data.add_field(
-                        'file',
-                        audio_chunks(),
-                        filename=filename,
-                        content_type=mimetypes.guess_type(filename)[0] or 'application/octet-stream',
-                    )
-
-                    r = await session.post(
-                        url=f'{api_base_url}/audio/transcriptions',
-                        headers=headers,
-                        data=form_data,
-                        ssl=AIOHTTP_CLIENT_SESSION_SSL,
-                        allow_redirects=False,
-                    )
+                    # A disk file lets aiohttp calculate Content-Length while streaming.
+                    # An async generator forces chunked uploads, rejected by some ASR gateways.
+                    with open(file_path, 'rb') as audio_file:
+                        form_data.add_field(
+                            'file',
+                            audio_file,
+                            filename=filename,
+                            content_type=mimetypes.guess_type(filename)[0] or 'application/octet-stream',
+                        )
+                        r = await session.post(
+                            url=f'{api_base_url}/audio/transcriptions',
+                            headers=headers,
+                            data=form_data,
+                            ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                            allow_redirects=False,
+                        )
                 if r.status == 200:
                     break
 
             # raise_for_status releases the response, so read the error body first
             await r.read()
             if use_provider and not 200 <= r.status < 300:
-                raise provider_http_error(r.status)
+                failure = provider_http_error(r.status)
+                if trace_id:
+                    log.warning('Transcription provider returned HTTP %s (trace %s)', r.status, trace_id)
+                    failure.headers = {'X-ASR-Trace-Id': trace_id}
+                raise failure
             r.raise_for_status()
             data = await r.json()
 

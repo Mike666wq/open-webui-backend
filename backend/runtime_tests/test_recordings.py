@@ -302,7 +302,12 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
         upstream_status = 200
 
         async def transcribe(request):
+            # Exercise gateways that cannot parse chunked multipart uploads.
+            if request.headers.get('Transfer-Encoding') or not request.content_length:
+                return web.json_response({'message': 'length required by gateway'}, status=500)
             form = await request.post()
+            self.assertEqual(form['file'].content_type, 'audio/mpeg')
+            self.assertGreater(len(form['file'].file.read()), 0)
             received.append((request.headers.get('Authorization'), dict(form)))
             if upstream_status != 200:
                 return web.json_response({'error': {'message': 'invalid synthetic credential'}}, status=401)

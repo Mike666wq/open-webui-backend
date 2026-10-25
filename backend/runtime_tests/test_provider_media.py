@@ -270,6 +270,7 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('file', form_data.fields)
         self.assertNotIn('language', form_data.fields)
         self.assertNotIn('response_format', form_data.fields)
+        self.assertRegex(session.post.await_args.kwargs['headers']['X-Trace-Id'], r'^[0-9a-f]{32}$')
         self.assertEqual(session.post.await_count, 1)
 
     async def test_siliconflow_speech_uses_model_scoped_voice(self):
