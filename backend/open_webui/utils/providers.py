@@ -380,16 +380,26 @@ async def discover_connection_models(connection: ProviderConnection, user) -> li
                     break
                 page += 1
         except HTTPException as exc:
-            if exc.status_code in (401, 403, 429) or not (connection.config or {}).get('model_ids'):
+            if (
+                exc.status_code in (401, 403, 429)
+                or exc.detail == 'Provider returned an invalid model catalog'
+                or not (connection.config or {}).get('model_ids')
+            ):
                 raise
             records = []
     else:
         base = provider_base_url(connection)
         try:
             payload = await _request_json(connection, user, f'{base}/models')
-            records = payload.get('data', []) if isinstance(payload, dict) else []
+            records = payload.get('data') if isinstance(payload, dict) else None
+            if not isinstance(records, list):
+                raise HTTPException(502, 'Provider returned an invalid model catalog')
         except HTTPException as exc:
-            if exc.status_code in (401, 403, 429) or not (connection.config or {}).get('model_ids'):
+            if (
+                exc.status_code in (401, 403, 429)
+                or exc.detail == 'Provider returned an invalid model catalog'
+                or not (connection.config or {}).get('model_ids')
+            ):
                 raise
             records = []
     models = []

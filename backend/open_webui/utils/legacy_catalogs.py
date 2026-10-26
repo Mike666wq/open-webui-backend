@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import time
+from urllib.parse import urlsplit
 
 from open_webui.env import WEBUI_SECRET_KEY
 from open_webui.models.config import Config
@@ -34,7 +35,7 @@ async def cached_legacy_catalog(request, url, key, user, config, fetch):
         except Exception:
             value = None
         records = value if isinstance(value, list) else value.get('data') if isinstance(value, dict) else None
-        if isinstance(records, list):
+        if isinstance(records, list) and not (isinstance(value, dict) and value.get('error')):
             updated = {'models': value, 'updated_at': int(time.time()), 'error': None}
         else:
             status = value.get('catalog_error_status', 502) if isinstance(value, dict) else 502
@@ -76,7 +77,7 @@ async def cached_legacy_catalog(request, url, key, user, config, fetch):
         statuses = dict(getattr(request.state, 'legacy_catalog_statuses', {}))
         statuses[storage] = {
             'connection_id': 'legacy:' + storage.rsplit('.', 1)[-1],
-            'connection_name': f'旧版 OpenAI ({url.split("://")[-1].split("/")[0]})',
+            'connection_name': f'旧版 OpenAI ({urlsplit(str(url)).hostname or "未知来源"})',
             'updated_at': entry.get('updated_at'),
             'stale': stale,
             'error': entry.get('error'),

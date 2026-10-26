@@ -22,6 +22,7 @@ from open_webui.utils.providers import (
     discover_connection_models,
     encrypt_credential,
     initialize_model_catalog,
+    legacy_model_access,
     public_connection,
     refresh_connection_catalog,
     require_connection_access,
@@ -123,6 +124,10 @@ async def list_connections(user=Depends(get_verified_user), db: AsyncSession = D
     for connection in connections:
         if await can_access_connection(connection, user, db):
             item = public_connection(connection)
+            if user.role != 'admin' and connection.owner_id != user.id:
+                item['models'] = [
+                    m for m in item['models'] if await legacy_model_access(connection, m['upstream_id'], user, db)
+                ]
             aliases = (connection.config or {}).get('_legacy_aliases', {})
             for model in item['models']:
                 if model['id'] in disabled or any(

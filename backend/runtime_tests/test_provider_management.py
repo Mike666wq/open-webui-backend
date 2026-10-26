@@ -316,3 +316,10 @@ class ProviderManagementTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(models[0]['enabled'])
             self.assertEqual(models[0]['id'], self.mid)
             self.mock.assert_not_awaited()
+
+    async def test_malformed_success_is_not_allowed_to_erase_catalog(self):
+        await self.refresh()
+        self.mock.return_value = {'message': 'not a catalog'}
+        self.assertEqual((await self.refresh()).status_code, 502)
+        result = await self.client.get('/providers/models')
+        self.assertEqual([m['upstream_id'] for m in result.json()['data']], ['old'])
