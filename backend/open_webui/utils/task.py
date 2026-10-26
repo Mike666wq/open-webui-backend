@@ -14,18 +14,11 @@ log = logging.getLogger(__name__)
 
 # Let the right tool be given for the work at hand,
 # not the one that flatters, but the one that serves.
-def get_task_model_id(default_model_id: str, task_model: str, task_model_external: str, models) -> str:
-    # Set the task model
-    task_model_id = default_model_id
-    # Check if the user has a custom task model and use that model
-    if models.get(task_model_id, {}).get('connection_type') == 'local':
-        if task_model and task_model in models:
-            task_model_id = task_model
-    else:
-        if task_model_external and task_model_external in models:
-            task_model_id = task_model_external
-
-    return task_model_id
+def get_task_model_id(default_model_id: str, task_model: str, task_model_external: str, models) -> str | None:
+    configured = (
+        task_model if models.get(default_model_id, {}).get('connection_type') == 'local' else task_model_external
+    )
+    return configured if configured and configured in models else None
 
 
 def prompt_variables_template(template: str, variables: dict[str, str]) -> str:

@@ -519,6 +519,9 @@ async def lifespan(app: FastAPI):
 
     app.state.recording_worker = asyncio.create_task(recording_worker(app))
     app.state.resource_worker = asyncio.create_task(resource_worker())
+    from open_webui.models.provider_calls import call_retention_worker
+
+    app.state.provider_call_retention = asyncio.create_task(call_retention_worker())
     app.state.startup_complete = True
     await publish_event(app, EVENTS.SYSTEM_STARTUP_COMPLETED, source='system')
 
@@ -530,6 +533,8 @@ async def lifespan(app: FastAPI):
     # Shutdown: clean up shared resources
     from open_webui.utils.session_pool import close_session
 
+    app.state.provider_call_retention.cancel()
+    await asyncio.gather(app.state.provider_call_retention, return_exceptions=True)
     app.state.recording_worker.cancel()
     await asyncio.gather(app.state.recording_worker, return_exceptions=True)
     await close_session()
@@ -1005,7 +1010,13 @@ async def get_models(request: Request, refresh: bool = False, user=Depends(get_v
         log.debug(
             f'/api/models returned filtered models accessible to the user: {JSONCodec.dumps([model.get("id") for model in models])}'
         )
-    return {'data': models}
+    from open_webui.utils.providers import visible_catalog_statuses
+
+    return {
+        'data': models,
+        'catalogs': await visible_catalog_statuses(user)
+        + list(getattr(request.state, 'legacy_catalog_statuses', {}).values()),
+    }
 
 
 @app.get('/api/models/base')

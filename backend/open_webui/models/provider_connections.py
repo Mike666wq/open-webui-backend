@@ -6,7 +6,7 @@ from typing import Literal
 
 from open_webui.internal.db import Base
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
-from sqlalchemy import BigInteger, Boolean, Column, Index, JSON, Text
+from sqlalchemy import JSON, BigInteger, Boolean, Column, Index, Text
 
 
 class ProviderConnection(Base):
@@ -67,3 +67,10 @@ class ProviderConnectionResponse(BaseModel):
 def new_provider_connection(**values):
     now = int(time.time())
     return ProviderConnection(id=str(uuid.uuid4()), created_at=now, updated_at=now, **values)
+
+
+class ProviderCatalogLease(Base):
+    __tablename__ = 'provider_catalog_lease'
+    id = Column(Text, primary_key=True)
+    token = Column(Text, nullable=False)
+    expires_at = Column(BigInteger, nullable=False)

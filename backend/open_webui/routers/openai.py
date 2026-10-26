@@ -110,6 +110,8 @@ async def send_get_request(
                 cookies=cookies,
                 ssl=AIOHTTP_CLIENT_SESSION_SSL,
             ) as response:
+                if response.status >= 400:
+                    return {'catalog_error_status': response.status}
                 return await response.json(loads=JSONCodec.loads)
     except Exception as e:
         # Handle connection error here
@@ -124,9 +126,14 @@ async def get_models_request(
     user: UserModel = None,
     config=None,
 ):
-    if is_anthropic_url(url):
-        return await get_anthropic_models(url, key, user=user)
-    return await send_get_request(request, f'{url}/models', key, user=user, config=config)
+    from open_webui.utils.legacy_catalogs import cached_legacy_catalog
+
+    async def fetch():
+        if is_anthropic_url(url):
+            return await get_anthropic_models(url, key, user=user)
+        return await send_get_request(request, f'{url}/models', key, user=user, config=config)
+
+    return await cached_legacy_catalog(request, url, key, user, config, fetch)
 
 
 def openai_reasoning_model_handler(payload):
@@ -257,6 +264,8 @@ async def get_openai_connection(idx: int) -> tuple[str, str, dict]:
     url = api_base_urls[idx]
     key = api_keys[idx]
     api_config = api_configs.get(str(idx), api_configs.get(url, {}))
+    if not api_config.get('enable', True):
+        raise HTTPException(503, 'This OpenAI connection is disabled')
     return url, key, api_config
 
 

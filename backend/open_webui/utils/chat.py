@@ -34,6 +34,7 @@ from open_webui.utils.filter import (
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.models import check_model_access, get_all_models, get_request_models, load_provider_models
 from open_webui.utils.payload import apply_system_prompt_to_body, convert_payload_openai_to_ollama
+from open_webui.utils.provider_receipts import record_invocation
 from open_webui.utils.response import (
     convert_response_ollama_to_openai,
     convert_streaming_response_ollama_to_openai,
@@ -145,6 +146,7 @@ async def generate_direct_chat_completion(
         return res
 
 
+@record_invocation
 async def generate_chat_completion(
     request: Request,
     form_data: dict,
@@ -278,10 +280,10 @@ async def generate_chat_completion(
                     return response
                 return {**response, 'selected_model_id': selected_model_id}
 
-        if model_id.startswith('provider:'):
+        if model_id.startswith('provider:') or model.get('provider_model_id'):
             from open_webui.utils.providers import provider_chat_completion
 
-            return await provider_chat_completion(model_id, form_data, user)
+            return await provider_chat_completion(model.get('provider_model_id', model_id), form_data, user)
 
         if model.get('pipe'):
             # Below does not require bypass_filter because this is the only route the uses this function and it is already bypassing the filter

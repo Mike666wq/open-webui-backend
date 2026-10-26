@@ -81,7 +81,9 @@ def normalize_model(connection, model):
         source = 'legacy-unconfirmed'
     if connection.auth_type == 'oauth':
         uses = {'chat': uses.get('chat', 'openai-chat')}
-    result = {**model, 'uses': uses, 'capability_source': source}
+    result = {**model, 'uses': uses, 'capability_source': source,
+              'enabled': config.get('_model_enabled', {}).get(upstream,
+                  not config.get('model_ids') or upstream in config['model_ids'])}
     if provider_family(connection) == 'siliconflow' and 'speech' in uses:
         result['voice_options'] = [
             {'id': f'{upstream}:{voice}', 'name': voice} for voice in SILICONFLOW_PRESET_VOICES
