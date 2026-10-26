@@ -338,6 +338,7 @@ async def _request_json(connection: ProviderConnection, user, url: str, *, metho
 
 
 async def discover_connection_models(connection: ProviderConnection, user) -> list[dict]:
+    discovery_error = None
     if connection.provider_id == 'chatgpt':
         try:
             from open_webui.utils.chatgpt_auth import discover_chatgpt_models
@@ -388,6 +389,7 @@ async def discover_connection_models(connection: ProviderConnection, user) -> li
                 or not (connection.config or {}).get('model_ids')
             ):
                 raise
+            discovery_error = catalog_error(exc)
             records = []
     else:
         base = provider_base_url(connection)
@@ -403,6 +405,7 @@ async def discover_connection_models(connection: ProviderConnection, user) -> li
                 or not (connection.config or {}).get('model_ids')
             ):
                 raise
+            discovery_error = catalog_error(exc)
             records = []
     models = []
     selected = (connection.config or {}).get('model_ids') or []
@@ -437,7 +440,7 @@ async def discover_connection_models(connection: ProviderConnection, user) -> li
                     'connection_id': connection.id,
                 }
             )
-    return [normalize_model(connection, model) for model in models]
+    return [normalize_model(connection, {**model, 'catalog_error': discovery_error}) for model in models]
 
 
 async def verify_provider_connection(connection: ProviderConnection, user) -> bool:
@@ -631,6 +634,12 @@ async def _refresh_connection_catalog(connection, user, db):
         ):
             raise HTTPException(409, 'Connection changed during refresh; fetch the catalog again')
         cache = dict((connection.config or {}).get('_models_by_user') or {})
+    discovery_error = next((m.get('catalog_error') for m in models if m.get('catalog_error')), None)
+    if discovery_error and previous.get('models'):
+        cache[user.id] = {**previous, 'error': discovery_error}
+        connection.config = {**(connection.config or {}), '_models_by_user': cache}
+        await db.commit()
+        return [normalize_model(connection, m) for m in previous['models']]
     config = dict(connection.config or {})
     enabled = dict(config.get('_model_enabled', {}))
     old_ids = {m['upstream_id'] for m in connection.models or []}
@@ -648,13 +657,13 @@ async def _refresh_connection_catalog(connection, user, db):
     cache[user.id] = {
         'fingerprint': stamp,
         'models': models,
-        'updated_at': int(time.time()),
+        'updated_at': 0 if discovery_error else int(time.time()),
         'generation': str(uuid.uuid4()),
-        'error': None,
+        'error': discovery_error,
     }
     connection.config = {**config, '_model_enabled': enabled, '_models_by_user': cache}
     connection.models = models
-    connection.status = 'connected'
+    connection.status = 'configured' if discovery_error else 'connected'
     await db.commit()
     return [normalize_model(connection, model) for model in models]
 

@@ -386,3 +386,17 @@ class ProviderManagementTests(unittest.IsolatedAsyncioTestCase):
         await response.body_iterator.aclose()
         result = await self.client.get('/providers/calls/history')
         self.assertEqual(result.json()['data'][0]['status'], 'completed')
+
+    async def test_manual_ids_do_not_turn_catalog_failure_into_connection_success(self):
+        async with get_async_db_context() as db:
+            connection = await db.get(ProviderConnection, self.connection.id)
+            connection.config = {'model_ids': ['manual']}
+            connection.models = []
+            await db.commit()
+        self.mock.side_effect = providers.provider_http_error(404)
+        result = await self.client.post(f'/providers/connections/{self.connection.id}/verify')
+        self.assertEqual(result.status_code, 200)
+        self.assertFalse(result.json()['ok'])
+        self.assertEqual(result.json()['status'], 'configured')
+        self.assertEqual(result.json()['catalog']['error']['status'], 404)
+        self.assertEqual(result.json()['models'][0]['upstream_id'], 'manual')

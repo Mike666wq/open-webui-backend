@@ -323,7 +323,12 @@ async def verify_connection(
 ):
     connection = await _connection_with_manage_access(connection_id, user, db)
     models = await refresh_connection_catalog(connection, user, db)
-    return {'ok': True, 'status': connection.status, 'models': models, 'catalog': catalog_status(connection, user.id)}
+    return {
+        'ok': connection.status == 'connected',
+        'status': connection.status,
+        'models': models,
+        'catalog': catalog_status(connection, user.id),
+    }
 
 
 @router.post('/connections/{connection_id}/models/refresh')
