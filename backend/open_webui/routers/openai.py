@@ -264,6 +264,8 @@ async def get_openai_connection(idx: int) -> tuple[str, str, dict]:
     url = api_base_urls[idx]
     key = api_keys[idx]
     api_config = api_configs.get(str(idx), api_configs.get(url, {}))
+    if not api_config.get('enable', True):
+        raise HTTPException(503, 'This OpenAI connection is disabled')
     return url, key, api_config
 
 

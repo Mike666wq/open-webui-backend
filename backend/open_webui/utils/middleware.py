@@ -1673,6 +1673,13 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
         if ENABLE_QUERIES_CACHE:
             request.state.cached_queries = queries
 
+    except HTTPException as exc:
+        if exc.status_code != 409:
+            raise
+        await event_emitter({'type': 'status', 'data': {
+            'action': 'auxiliary_model_missing', 'done': True,
+            'description': '未配置辅助模型：本次使用原问题搜索，不额外调用查询生成模型。'}})
+        queries = [user_message or '']
     except Exception as e:
         log.exception(e)
         queries = [user_message or '']
@@ -2125,6 +2132,12 @@ async def chat_completion_files_handler(
                     queries_response = {'queries': [queries_response]}
 
                 queries = queries_response.get('queries', [])
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+                await __event_emitter__({'type': 'status', 'data': {
+                    'action': 'auxiliary_model_missing', 'done': True,
+                    'description': '未配置辅助模型：本次使用原问题检索，不额外调用查询生成模型。'}})
             except Exception:
                 pass
 

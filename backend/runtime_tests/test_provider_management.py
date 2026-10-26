@@ -323,3 +323,40 @@ class ProviderManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.refresh()).status_code, 502)
         result = await self.client.get('/providers/models')
         self.assertEqual([m['upstream_id'] for m in result.json()['data']], ['old'])
+
+    async def test_disabled_legacy_source_cannot_be_called_from_cached_route(self):
+        from open_webui.routers.openai import get_openai_connection
+
+        await Config.upsert(
+            {
+                'openai.api_base_urls': ['https://disabled.invalid/v1'],
+                'openai.api_keys': ['synthetic'],
+                'openai.api_configs': {'0': {'enable': False}},
+            }
+        )
+        with self.assertRaises(HTTPException) as error:
+            await get_openai_connection(0)
+        self.assertEqual(error.exception.status_code, 503)
+
+    async def test_missing_auxiliary_model_is_visible_during_search(self):
+        from open_webui.utils import middleware
+
+        emitter = AsyncMock()
+        with (
+            patch.object(
+                middleware,
+                'generate_queries',
+                new=AsyncMock(side_effect=HTTPException(409, 'Configure auxiliary model')),
+            ),
+            patch.object(middleware, 'process_web_search', new=AsyncMock(return_value=[])) as search,
+        ):
+            await middleware.chat_web_search_handler(
+                SimpleNamespace(),
+                {'model': 'gpt', 'messages': [{'role': 'user', 'content': 'synthetic query'}]},
+                {'__event_emitter__': emitter},
+                self.user,
+            )
+        self.assertTrue(
+            any(c.args[0].get('data', {}).get('action') == 'auxiliary_model_missing' for c in emitter.call_args_list)
+        )
+        self.assertEqual(search.call_args.args[1].queries, ['synthetic query'])
