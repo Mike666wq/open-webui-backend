@@ -1,5 +1,6 @@
 """Provider discovery, authorization and OpenAI-compatible request forwarding."""
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -7,6 +8,8 @@ import logging
 import platform
 import re
 import socket
+import time
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlsplit
@@ -49,7 +52,7 @@ PROVIDER_CATALOG = [
         'auth_types': ['api_key'],
         'default_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     },
-    {'id': 'custom', 'name': 'OpenAI-compatible', 'auth_types': ['api_key'], 'default_base_url': ''},
+    {'id': 'custom', 'name': 'New API / OpenAI-compatible', 'auth_types': ['api_key'], 'default_base_url': ''},
     {'id': 'chatgpt', 'name': 'ChatGPT', 'auth_types': ['oauth'], 'default_base_url': ''},
     {
         'id': 'kimi',
@@ -125,6 +128,7 @@ def public_connection(connection: ProviderConnection) -> dict:
         'config': config,
         'status': connection.status,
         'models': [normalize_model(connection, model) for model in connection.models or []],
+        'catalog': catalog_status(connection),
         'configured': bool(connection.credential)
         or (connection.auth_type == 'oauth' and connection.status != 'disconnected'),
         'created_at': connection.created_at,
@@ -375,8 +379,8 @@ async def discover_connection_models(connection: ProviderConnection, user) -> li
                 if not current or (isinstance(total, int) and len(records) >= total):
                     break
                 page += 1
-        except HTTPException:
-            if not (connection.config or {}).get('model_ids'):
+        except HTTPException as exc:
+            if exc.status_code in (401, 403, 429) or not (connection.config or {}).get('model_ids'):
                 raise
             records = []
     else:
@@ -384,8 +388,8 @@ async def discover_connection_models(connection: ProviderConnection, user) -> li
         try:
             payload = await _request_json(connection, user, f'{base}/models')
             records = payload.get('data', []) if isinstance(payload, dict) else []
-        except HTTPException:
-            if not (connection.config or {}).get('model_ids'):
+        except HTTPException as exc:
+            if exc.status_code in (401, 403, 429) or not (connection.config or {}).get('model_ids'):
                 raise
             records = []
     models = []
@@ -393,8 +397,6 @@ async def discover_connection_models(connection: ProviderConnection, user) -> li
     for record in records or []:
         upstream_id = (record.get('model') or record.get('id')) if isinstance(record, dict) else None
         if isinstance(upstream_id, str) and upstream_id:
-            if selected and upstream_id not in selected:
-                continue
             capabilities = record.get('capabilities') or []
             features = record.get('features') or []
             models.append(
@@ -481,24 +483,211 @@ async def initialize_model_catalog(connection):
     }
 
 
+CATALOG_TTL = 15 * 60
+_catalog_refresh_tasks = {}
+_catalog_locks = {}
+
+
+def catalog_fingerprint(connection):
+    return hashlib.sha256(
+        json.dumps(
+            {
+                'credential': connection.credential,
+                'config': {k: v for k, v in (connection.config or {}).items() if not k.startswith('_')},
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
+
+
+def catalog_status(connection, user_id=None):
+    config = connection.config or {}
+    entry = config.get('_models_by_user', {}).get(user_id or connection.owner_id, {})
+    if not isinstance(entry, dict):
+        entry = {}
+    valid = entry.get('fingerprint') == catalog_fingerprint(connection)
+    return {
+        'updated_at': entry.get('updated_at') if valid and not entry.get('imported') else None,
+        'stale': not valid or bool(entry.get('error')) or time.time() - entry.get('updated_at', 0) >= CATALOG_TTL,
+        'error': entry.get('error') if valid else None,
+        'request_path': 'server',
+    }
+
+
+def catalog_error(exc):
+    status = getattr(exc, 'status_code', 502)
+    category = (
+        'authentication'
+        if status in (401, 403)
+        else 'rate_limit'
+        if status == 429
+        else 'network'
+        if status == 502
+        else 'upstream'
+    )
+    # Never persist upstream bodies, URLs with credentials, or exception strings.
+    return {'category': category, 'status': status, 'at': int(time.time())}
+
+
+@asynccontextmanager
+async def catalog_lease(connection_id, user_id, db):
+    if not isinstance(db, AsyncSession):
+        yield True
+        return
+    from open_webui.models.provider_connections import ProviderCatalogLease
+    from sqlalchemy import delete, update
+    from sqlalchemy.exc import IntegrityError
+
+    key, token = f'{connection_id}:{user_id}', str(uuid.uuid4())
+    owned = False
+    async with get_async_db_context() as session:
+        result = await session.execute(
+            update(ProviderCatalogLease)
+            .where(ProviderCatalogLease.id == key, ProviderCatalogLease.expires_at < int(time.time()))
+            .values(token=token, expires_at=int(time.time()) + 300)
+        )
+        if result.rowcount:
+            owned = True
+            await session.commit()
+        else:
+            try:
+                session.add(ProviderCatalogLease(id=key, token=token, expires_at=int(time.time()) + 300))
+                await session.commit()
+                owned = True
+            except IntegrityError:
+                await session.rollback()
+    try:
+        yield owned
+    finally:
+        if owned:
+            async with get_async_db_context() as session:
+                await session.execute(
+                    delete(ProviderCatalogLease).where(
+                        ProviderCatalogLease.id == key, ProviderCatalogLease.token == token
+                    )
+                )
+                await session.commit()
+
+
+async def refresh_connection_catalog(connection, user, db):
+    generation = (connection.config or {}).get('_models_by_user', {}).get(user.id) or {}
+    generation = generation.get('generation') if isinstance(generation, dict) else None
+    lock = _catalog_locks.setdefault((connection.id, user.id), asyncio.Lock())
+    async with lock, catalog_lease(connection.id, user.id, db) as acquired:
+        if isinstance(db, AsyncSession):
+            await db.refresh(connection)
+        entry = (connection.config or {}).get('_models_by_user', {}).get(user.id, {})
+        if not acquired or (
+            isinstance(entry, dict)
+            and entry.get('generation') != generation
+            and entry.get('fingerprint') == catalog_fingerprint(connection)
+        ):
+            if isinstance(entry, dict) and isinstance(entry.get('models'), list):
+                return [normalize_model(connection, m) for m in entry['models']]
+            raise HTTPException(409, 'Catalog refresh already running; retry shortly')
+        return await _refresh_connection_catalog(connection, user, db)
+
+
+async def _refresh_connection_catalog(connection, user, db):
+    await initialize_model_catalog(connection)
+    stamp = catalog_fingerprint(connection)
+    cache = dict((connection.config or {}).get('_models_by_user') or {})
+    previous = cache.get(user.id, {})
+    previous = previous if isinstance(previous, dict) and previous.get('fingerprint') == stamp else {}
+    try:
+        models = await discover_connection_models(connection, user)
+    except Exception as exc:
+        if isinstance(db, AsyncSession):
+            await db.refresh(connection)
+            if catalog_fingerprint(connection) != stamp:
+                raise HTTPException(409, 'Connection changed during refresh') from None
+            cache = dict((connection.config or {}).get('_models_by_user') or {})
+        cache[user.id] = {**previous, 'fingerprint': stamp, 'error': catalog_error(exc)}
+        connection.config = {**(connection.config or {}), '_models_by_user': cache}
+        await db.commit()
+        raise
+    if isinstance(db, AsyncSession):
+        await db.refresh(connection)
+        if (
+            catalog_fingerprint(connection) != stamp
+            or not connection.is_active
+            or not await can_access_connection(connection, user, db)
+        ):
+            raise HTTPException(409, 'Connection changed during refresh; fetch the catalog again')
+        cache = dict((connection.config or {}).get('_models_by_user') or {})
+    config = dict(connection.config or {})
+    enabled = dict(config.get('_model_enabled', {}))
+    old_ids = {m['upstream_id'] for m in connection.models or []}
+    selected = config.get('model_ids', [])
+    for model in models:
+        upstream = model['upstream_id']
+        enabled.setdefault(upstream, upstream in selected if selected else upstream in old_ids)
+    # Preserve manually added models even when upstream no longer lists them.
+    found = {m['upstream_id'] for m in models}
+    models.extend(
+        m
+        for m in connection.models or []
+        if m['upstream_id'] not in found and m['upstream_id'] in config.get('_model_overrides', {})
+    )
+    cache[user.id] = {
+        'fingerprint': stamp,
+        'models': models,
+        'updated_at': int(time.time()),
+        'generation': str(uuid.uuid4()),
+        'error': None,
+    }
+    connection.config = {**config, '_model_enabled': enabled, '_models_by_user': cache}
+    connection.models = models
+    connection.status = 'connected'
+    await db.commit()
+    return [normalize_model(connection, model) for model in models]
+
+
+async def _refresh_catalog_background(connection_id, user, expected):
+    try:
+        async with get_async_db_context() as db:
+            connection = await db.get(ProviderConnection, connection_id)
+            if (
+                connection
+                and connection.is_active
+                and catalog_fingerprint(connection) == expected
+                and await can_access_connection(connection, user, db)
+            ):
+                await refresh_connection_catalog(connection, user, db)
+    except Exception:
+        log.info('Provider catalog background refresh failed for %s', connection_id)
+
+
 async def visible_connection_models(connection: ProviderConnection, user, db: AsyncSession) -> list[dict]:
     if connection.status == 'disconnected' or not connection.credential:
         return []
     await initialize_model_catalog(connection)
-    cache = dict((connection.config or {}).get('_models_by_user') or {})
-    current_credential_hash = hashlib.sha256((connection.credential or '').encode()).hexdigest()
-    entry = cache.get(user.id)
-    if (
-        isinstance(entry, dict)
-        and entry.get('credential_hash') == current_credential_hash
-        and isinstance(entry.get('models'), list)
-    ):
+    entry = (connection.config or {}).get('_models_by_user', {}).get(user.id, {})
+    stamp = catalog_fingerprint(connection)
+    if isinstance(entry, dict) and entry.get('fingerprint') == stamp and isinstance(entry.get('models'), list):
+        if time.time() - max(entry.get('updated_at', 0), (entry.get('error') or {}).get('at', 0)) >= CATALOG_TTL:
+            key = (connection.id, user.id)
+            if key not in _catalog_refresh_tasks or _catalog_refresh_tasks[key].done():
+                task = asyncio.create_task(_refresh_catalog_background(connection.id, user, stamp))
+                _catalog_refresh_tasks[key] = task
+                task.add_done_callback(
+                    lambda done: (
+                        _catalog_refresh_tasks.pop(key, None) if _catalog_refresh_tasks.get(key) is done else None
+                    )
+                )
         return [normalize_model(connection, model) for model in entry['models']]
-    models = await discover_connection_models(connection, user)
-    cache[user.id] = {'credential_hash': current_credential_hash, 'models': models}
-    connection.config = {**(connection.config or {}), '_models_by_user': cache}
-    await db.commit()
-    return models
+    # Upgrade existing owner catalogs without a network dependency. Other users
+    # never inherit an owner's per-user discovery snapshot.
+    if connection.owner_id == user.id and connection.models and not entry:
+        config = dict(connection.config or {})
+        config['_models_by_user'] = {
+            **config.get('_models_by_user', {}),
+            user.id: {'fingerprint': stamp, 'models': connection.models, 'updated_at': 0},
+        }
+        connection.config = config
+        await db.commit()
+        return await visible_connection_models(connection, user, db)
+    return await refresh_connection_catalog(connection, user, db)
 
 
 async def disabled_provider_model_ids(db: AsyncSession) -> set[str]:
@@ -517,11 +706,13 @@ async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
                 result.extend(
                     {
                         **model,
+                        'connection_id': connection.id,
                         'object': 'model',
                         'owned_by': connection.provider_id,
                         'connection_type': 'external',
                         'provider_visibility': connection.visibility,
                         'connection_name': connection.name,
+                        'catalog': catalog_status(connection, user.id),
                         'info': {
                             'meta': {
                                 'capabilities': {
@@ -537,13 +728,33 @@ async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
                         },
                     }
                     for model in await visible_connection_models(connection, user, db)
-                    if 'chat' in model.get('uses', {}) and model['id'] not in disabled_ids
+                    if model.get('enabled', True)
+                    and 'chat' in model.get('uses', {})
+                    and model['id'] not in disabled_ids
                 )
             except HTTPException as exc:
                 log.info(
                     'Skipping provider model discovery for connection %s (HTTP %s)', connection.id, exc.status_code
                 )
-    return result
+    aliases = []
+    for item in result:
+        connection = next(c for c in connections if c.id == item['connection_id'])
+        if not await legacy_model_access(connection, item['upstream_id'], user, db):
+            continue
+        mappings = (connection.config or {}).get('_legacy_aliases', {})
+        matches = [alias for alias, upstream in mappings.items() if upstream == item['upstream_id']]
+        if matches:
+            for alias in matches:
+                from open_webui.models.models import Models
+
+                saved = await Models.get_model_by_id(alias, db=db)
+                if saved and not saved.is_active:
+                    continue
+                info = saved.model_dump() if saved else item.get('info', {})
+                aliases.append({**item, 'id': alias, 'provider_model_id': item['id'], 'info': info})
+        else:
+            aliases.append(item)
+    return aliases
 
 
 async def list_visible_models(user, db: AsyncSession | None = None) -> list[dict]:
@@ -551,15 +762,44 @@ async def list_visible_models(user, db: AsyncSession | None = None) -> list[dict
         return await _list_visible_models(user, session)
 
 
-async def _resolve_model(model_id: str, user, db: AsyncSession) -> ResolvedProviderModel:
+async def legacy_model_access(connection, upstream_id, user, db):
+    aliases = (connection.config or {}).get('_legacy_access_ids', (connection.config or {}).get('_legacy_aliases', {}))
+    for alias, upstream in aliases.items():
+        if upstream == upstream_id:
+            from open_webui.models.models import Models
+            from open_webui.utils.models import check_model_access
+
+            saved = await Models.get_model_by_id(alias, db=db)
+            if saved and not saved.is_active:
+                return False
+            if user.role != 'admin':
+                if not saved:
+                    return False
+                try:
+                    await check_model_access(user, {'id': alias}, model_info=saved, db=db)
+                except Exception:
+                    return False
+    return True
+
+
+async def _resolve_model(model_id: str, user, db: AsyncSession, allow_disabled=False) -> ResolvedProviderModel:
     connection_id, upstream_id = parse_model_id(model_id)
     connection = await db.get(ProviderConnection, connection_id)
     await require_connection_access(connection, user, db)
-    if not connection.is_active or model_id in await disabled_provider_model_ids(db):
+    if not connection.is_active or (not allow_disabled and model_id in await disabled_provider_model_ids(db)):
         raise HTTPException(404, 'Provider model not found')
+    error = catalog_status(connection, user.id).get('error')
+    if error and error['category'] == 'authentication':
+        raise HTTPException(401, 'Provider authentication failed; refresh after correcting credentials')
     available = await visible_connection_models(connection, user, db)
     metadata = next((model for model in available if model['upstream_id'] == upstream_id), None)
-    if metadata is None or 'chat' not in metadata.get('uses', {}):
+    if (
+        metadata is None
+        or (not allow_disabled and not metadata.get('enabled', True))
+        or 'chat' not in metadata.get('uses', {})
+    ):
+        raise HTTPException(404, 'Provider model not found')
+    if not await legacy_model_access(connection, upstream_id, user, db):
         raise HTTPException(404, 'Provider model not found')
     metadata = {
         **metadata,
@@ -581,9 +821,11 @@ async def _resolve_model(model_id: str, user, db: AsyncSession) -> ResolvedProvi
     return ResolvedProviderModel(connection, upstream_id, user.id, metadata)
 
 
-async def resolve_model(model_id: str, user, db: AsyncSession | None = None) -> ResolvedProviderModel:
+async def resolve_model(
+    model_id: str, user, db: AsyncSession | None = None, *, allow_disabled=False
+) -> ResolvedProviderModel:
     async with _provider_db_scope(db) as session:
-        return await _resolve_model(model_id, user, session)
+        return await _resolve_model(model_id, user, session, allow_disabled=allow_disabled)
 
 
 async def get_connection_credentials(
@@ -623,9 +865,15 @@ def _openai_payload(payload: dict, upstream_model_id: str) -> dict:
     return {key: value for key, value in payload.items() if key in allowed} | {'model': upstream_model_id}
 
 
-async def provider_chat_completion(model_id: str, payload: dict, user, db: AsyncSession | None = None):
+async def provider_chat_completion(
+    model_id: str, payload: dict, user, db: AsyncSession | None = None, *, allow_disabled=False
+):
     """Authorize and forward a completion, returning JSON or an SSE response."""
-    resolved = await resolve_model(model_id, user, db)
+    resolved = (
+        await resolve_model(model_id, user, db, allow_disabled=True)
+        if allow_disabled
+        else await resolve_model(model_id, user, db)
+    )
     if resolved.connection.provider_id == 'chatgpt':
         from open_webui.utils.chatgpt_auth import chatgpt_chat_completion
 
@@ -919,19 +1167,19 @@ async def media_http_session(connection: ProviderConnection | None = None):
         yield session
 
 
-async def resolve_media_model(model_id, user, purpose, db=None):
+async def resolve_media_model(model_id, user, purpose, db=None, *, allow_disabled=False):
     """Resolve stable IDs with server-side purpose and connection authorization."""
     async with _provider_db_scope(db) as session:
         connection_id, upstream_id = parse_model_id(model_id)
         connection = await session.get(ProviderConnection, connection_id)
         await require_connection_access(connection, user, session)
-        if not connection.is_active:
+        if not connection.is_active or (not allow_disabled and model_id in await disabled_provider_model_ids(session)):
             raise HTTPException(404, 'Provider model not found')
         if connection.auth_type != 'api_key':
             raise HTTPException(400, 'This connection does not support media API calls')
         models = await visible_connection_models(connection, user, session)
         model = next((m for m in models if m['upstream_id'] == upstream_id), None)
-        if not model or purpose not in model.get('uses', {}):
+        if not model or (not allow_disabled and not model.get('enabled', True)) or purpose not in model.get('uses', {}):
             raise HTTPException(400, 'Select a model supporting this purpose')
         return ResolvedProviderModel(connection, upstream_id, user.id, model)
 
@@ -950,3 +1198,20 @@ async def resolve_configured_media(connection_id, model_id, user, purpose):
     if resolved.connection.id != connection_id:
         raise HTTPException(400, 'Model does not belong to the selected connection')
     return resolved
+
+
+async def visible_catalog_statuses(user, db=None):
+    async with _provider_db_scope(db) as session:
+        result = []
+        for connection in (
+            await session.scalars(select(ProviderConnection).where(ProviderConnection.is_active.is_(True)))
+        ).all():
+            if await can_access_connection(connection, user, session):
+                result.append(
+                    {
+                        'connection_id': connection.id,
+                        'connection_name': connection.name,
+                        **catalog_status(connection, user.id),
+                    }
+                )
+        return result

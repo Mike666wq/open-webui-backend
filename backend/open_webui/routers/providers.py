@@ -3,7 +3,7 @@
 import re
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from open_webui.internal.db import get_async_session
 from open_webui.models.access_grants import AccessGrant, AccessGrants
 from open_webui.models.provider_connections import (
@@ -18,12 +18,15 @@ from open_webui.utils.provider_capabilities import ADAPTERS, normalize_model, pr
 from open_webui.utils.providers import (
     PROVIDER_CATALOG,
     can_access_connection,
+    catalog_status,
     discover_connection_models,
     encrypt_credential,
     initialize_model_catalog,
     public_connection,
+    refresh_connection_catalog,
     require_connection_access,
     verify_provider_connection,
+    visible_catalog_statuses,
 )
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -113,10 +116,19 @@ async def list_connections(user=Depends(get_verified_user), db: AsyncSession = D
             select(ProviderConnection).where(ProviderConnection.is_active.is_(True)).order_by(ProviderConnection.name)
         )
     ).all()
+    from open_webui.models.models import Model
+
+    disabled = set(await db.scalars(select(Model.id).where(Model.is_active.is_(False))))
     visible = []
     for connection in connections:
         if await can_access_connection(connection, user, db):
             item = public_connection(connection)
+            aliases = (connection.config or {}).get('_legacy_aliases', {})
+            for model in item['models']:
+                if model['id'] in disabled or any(
+                    alias in disabled and upstream == model['upstream_id'] for alias, upstream in aliases.items()
+                ):
+                    model['enabled'] = False
             if user.role == 'admin' and connection.visibility == 'shared':
                 item['access_control'] = [
                     {
@@ -305,14 +317,8 @@ async def verify_connection(
     connection_id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
     connection = await _connection_with_manage_access(connection_id, user, db)
-    await initialize_model_catalog(connection)
-    verified = await verify_provider_connection(connection, user)
-    models = await discover_connection_models(connection, user)
-    connection.status = 'connected' if verified else 'configured'
-    connection.models = models
-    connection.updated_at = max(int(time.time()), connection.updated_at + 1)
-    await db.commit()
-    return {'ok': verified, 'status': connection.status, 'models': models}
+    models = await refresh_connection_catalog(connection, user, db)
+    return {'ok': True, 'status': connection.status, 'models': models, 'catalog': catalog_status(connection, user.id)}
 
 
 @router.post('/connections/{connection_id}/models/refresh')
@@ -320,18 +326,8 @@ async def refresh_models(
     connection_id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
     connection = await _connection_with_manage_access(connection_id, user, db)
-    await initialize_model_catalog(connection)
-    verified = await verify_provider_connection(connection, user)
-    await initialize_model_catalog(connection)
-    models = await discover_connection_models(connection, user)
-    cache = dict((connection.config or {}).get('_models_by_user') or {})
-    cache[user.id] = models
-    connection.config = {**(connection.config or {}), '_models_by_user': cache}
-    connection.models = models
-    connection.status = 'connected' if verified else 'configured'
-    connection.updated_at = max(int(time.time()), connection.updated_at + 1)
-    await db.commit()
-    return {'models': models, 'status': connection.status}
+    models = await refresh_connection_catalog(connection, user, db)
+    return {'models': models, 'status': connection.status, 'catalog': catalog_status(connection, user.id)}
 
 
 @router.get('/models')
@@ -369,13 +365,50 @@ async def get_visible_models(
                 models.extend(
                     {**m, 'connection_name': connection.name}
                     for m in connection_models
-                    if purpose == 'all' or purpose in m.get('uses', {})
+                    if purpose == 'all' or (m.get('enabled', True) and purpose in m.get('uses', {}))
                 )
     return {
         'object': 'list',
         'data': models,
         'errors': errors,
+        'catalogs': await visible_catalog_statuses(user, db),
     }
+
+
+class ModelEnabled(BaseModel):
+    upstream_id: str = Field(min_length=1, max_length=256)
+    enabled: bool
+
+
+@router.put('/connections/{connection_id}/model-enabled')
+async def set_model_enabled(
+    connection_id: str,
+    form: ModelEnabled,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    connection = await _connection_with_manage_access(connection_id, user, db)
+    if not any(m.get('upstream_id') == form.upstream_id for m in connection.models or []):
+        raise HTTPException(404, 'Discover or add the model first')
+    connection.config = {
+        **(connection.config or {}),
+        '_model_enabled': {**(connection.config or {}).get('_model_enabled', {}), form.upstream_id: form.enabled},
+    }
+    from open_webui.models.models import Model
+    from open_webui.utils.providers import stable_model_id
+    from sqlalchemy import update
+
+    ids = [
+        stable_model_id(connection.id, form.upstream_id),
+        *[
+            alias
+            for alias, upstream in (connection.config or {}).get('_legacy_aliases', {}).items()
+            if upstream == form.upstream_id
+        ],
+    ]
+    await db.execute(update(Model).where(Model.id.in_(ids)).values(is_active=form.enabled))
+    await db.commit()
+    return public_connection(connection)
 
 
 class ModelUses(BaseModel):
@@ -396,7 +429,6 @@ async def set_model_uses(
         raise HTTPException(400, 'SiliconFlow image adapter requires a SiliconFlow connection')
     config = dict(connection.config or {})
     config['_model_overrides'] = {**config.get('_model_overrides', {}), form.upstream_id: form.uses}
-    config.pop('_models_by_user', None)
     if not any(m['upstream_id'] == form.upstream_id for m in connection.models or []):
         from open_webui.utils.providers import stable_model_id
 
@@ -427,6 +459,7 @@ async def test_model(
     connection_id: str, form: ModelTest, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
     import base64
+    import time
 
     import aiohttp
     from open_webui.utils.provider_capabilities import fingerprint
@@ -442,15 +475,34 @@ async def test_model(
     )
 
     connection = await _connection_with_manage_access(connection_id, user, db)
-    if connection.auth_type != 'api_key':
-        raise HTTPException(400, 'Use an ordinary chat to test account models')
+    if connection.auth_type != 'api_key' and form.purpose != 'chat':
+        raise HTTPException(400, 'Account connections support chat testing only')
     model_id = stable_model_id(connection_id, form.upstream_id)
     resolved = (
-        await resolve_model(model_id, user, db)
+        await resolve_model(model_id, user, db, allow_disabled=True)
         if form.purpose == 'chat'
-        else await resolve_media_model(model_id, user, form.purpose, db)
+        else await resolve_media_model(model_id, user, form.purpose, db, allow_disabled=True)
     )
     before = fingerprint(connection, resolved.model_metadata)
+    started = time.monotonic()
+    if connection.auth_type != 'api_key':
+        from open_webui.utils.providers import catalog_error, provider_chat_completion
+
+        outcome, error, usage = 'passed', None, None
+        try:
+            result = await provider_chat_completion(
+                model_id,
+                {'messages': [{'role': 'user', 'content': 'Reply OK.'}], 'stream': False},
+                user,
+                db,
+                allow_disabled=True,
+            )
+            usage = result.get('usage') if isinstance(result, dict) else None
+        except Exception as exc:
+            outcome, error = 'failed', catalog_error(exc)
+        return await _save_model_test(
+            connection, resolved.model_metadata, before, form.purpose, outcome, error, started, user, db, usage
+        )
     connection, key = await get_media_api_connection(connection_id, user, db)
     base = provider_base_url(connection)
     payload = None
@@ -498,7 +550,7 @@ async def test_model(
         )
     else:
         raise HTTPException(400, 'Unsupported test purpose')
-    outcome = 'passed'
+    outcome, error, usage = 'passed', None, None
     try:
         # Explicit test only: exactly one upstream inference, never retry uncertain calls.
         async with media_http_session(connection) as session:
@@ -520,29 +572,63 @@ async def test_model(
                     import json
 
                     result = json.loads(raw)
+                    usage = result.get('usage')
                     if form.purpose == 'transcription' and not isinstance(result.get('text'), str):
                         raise HTTPException(502, 'Provider did not return transcription text')
                     if form.purpose == 'image' and not (result.get('images') or result.get('data')):
                         raise HTTPException(502, 'Provider did not return images')
                     if form.purpose == 'chat' and not (result.get('choices') or result.get('output')):
                         raise HTTPException(502, 'Provider did not return a chat response')
-    except Exception:
-        # Never persist or expose upstream error bodies which may contain credentials.
-        outcome = 'failed'
+    except Exception as exc:
+        from open_webui.utils.providers import catalog_error
+
+        outcome, error = 'failed', catalog_error(exc)
+    return await _save_model_test(
+        connection, resolved.model_metadata, before, form.purpose, outcome, error, started, user, db, usage
+    )
+
+
+async def _save_model_test(connection, metadata, before, purpose, outcome, error, started, user, db, usage):
+    import time
+
+    from open_webui.models.provider_calls import reported_usage, save_call
+    from open_webui.utils.provider_capabilities import fingerprint
+
+    elapsed = int((time.monotonic() - started) * 1000)
     await db.refresh(connection)
-    current = normalize_model(connection, resolved.model_metadata)
+    current = normalize_model(connection, metadata)
     if fingerprint(connection, current) != before:
         raise HTTPException(409, 'Configuration changed during the test; result was not saved')
     config = dict(connection.config or {})
     tests = dict(config.get('_model_tests', {}))
-    tests[form.upstream_id] = {
-        **tests.get(form.upstream_id, {}),
-        form.purpose: {'status': outcome, 'tested_at': int(time.time()), 'fingerprint': before},
+    tests[metadata['upstream_id']] = {
+        **tests.get(metadata['upstream_id'], {}),
+        purpose: {
+            'status': outcome,
+            'tested_at': int(time.time()),
+            'fingerprint': before,
+            'elapsed_ms': elapsed,
+            'error': error,
+        },
     }
     connection.config = {**config, '_model_tests': tests}
     await db.commit()
+    await save_call(
+        user_id=user.id,
+        connection_id=connection.id,
+        model_id=metadata['id'],
+        chat_id=None,
+        message_id=None,
+        purpose='test:' + purpose,
+        status=outcome,
+        created_at=int(time.time()),
+        elapsed_ms=elapsed,
+        usage=reported_usage(usage),
+    )
     return {
         'status': outcome,
+        'elapsed_ms': elapsed,
+        'error': error,
         'message': 'No automatic retry. A failed or timed-out request may already have been charged.',
     }
 
@@ -700,3 +786,109 @@ async def migrate_media(
     )
     await db.commit()
     return public_connection(connection)
+
+
+@router.get('/calls/history')
+async def get_call_history(
+    connection_id: str | None = None,
+    chat_id: str | None = None,
+    message_id: str | None = None,
+    admin_summary: bool = False,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    import time
+
+    from open_webui.models.provider_calls import ProviderCall
+
+    filters = [ProviderCall.created_at >= int(time.time()) - 30 * 86400]
+    if admin_summary:
+        if user.role != 'admin':
+            raise HTTPException(403, 'Administrator access required')
+        # Private connections remain owner-only even to administrators.
+        shared = (
+            await db.scalars(select(ProviderConnection.id).where(ProviderConnection.visibility == 'shared'))
+        ).all()
+        from sqlalchemy import or_
+
+        filters.append(or_(ProviderCall.user_id == user.id, ProviderCall.connection_id.in_(shared)))
+    else:
+        filters.append(ProviderCall.user_id == user.id)
+    if connection_id:
+        await _connection_with_access(connection_id, user, db)
+        filters.append(ProviderCall.connection_id == connection_id)
+    if chat_id:
+        filters.append(ProviderCall.chat_id == chat_id)
+    if message_id:
+        filters.append(ProviderCall.message_id == message_id)
+    rows = (
+        await db.scalars(select(ProviderCall).where(*filters).order_by(ProviderCall.created_at.desc()).limit(500))
+    ).all()
+    from sqlalchemy import func
+
+    summaries = (
+        (
+            await db.execute(
+                select(
+                    ProviderCall.model_id,
+                    ProviderCall.purpose,
+                    func.count(ProviderCall.id).label('count'),
+                    func.count(ProviderCall.usage['input_tokens'].as_integer()).label('input_reported'),
+                    func.count(ProviderCall.usage['output_tokens'].as_integer()).label('output_reported'),
+                    func.sum(ProviderCall.usage['input_tokens'].as_integer()).label('input_tokens'),
+                    func.sum(ProviderCall.usage['output_tokens'].as_integer()).label('output_tokens'),
+                )
+                .where(*filters)
+                .group_by(ProviderCall.model_id, ProviderCall.purpose)
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return {
+        'summary': [dict(row) for row in summaries],
+        'data': [
+            {
+                k: getattr(row, k)
+                for k in (
+                    'id',
+                    'connection_id',
+                    'model_id',
+                    'chat_id',
+                    'message_id',
+                    'purpose',
+                    'status',
+                    'created_at',
+                    'elapsed_ms',
+                    'usage',
+                )
+            }
+            for row in rows
+        ],
+        'retention_days': 30,
+        'limit': 500,
+    }
+
+
+@router.get('/legacy-migration/preview')
+async def get_legacy_migration(
+    request: Request, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
+):
+    from open_webui.utils.provider_migration import preview_migration
+
+    return await preview_migration(request, user, db)
+
+
+class LegacyMigration(BaseModel):
+    index: int = Field(ge=0)
+    fingerprint: str = Field(min_length=64, max_length=64)
+    alias_owners: dict[str, int] = Field(default_factory=dict)
+
+
+@router.post('/legacy-migration/apply')
+async def migrate_legacy(
+    request: Request, form: LegacyMigration, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
+):
+    from open_webui.utils.provider_migration import apply_migration
+
+    return await apply_migration(request, user, db, form.index, form.fingerprint, form.alias_owners)

@@ -259,13 +259,19 @@ async def verify():
                         'auth_type': 'api_key',
                         'visibility': 'private',
                         'api_key': 'synthetic-' + account['id'],
-                        'config': {'base_url': base},
+                        'config': {'base_url': base, 'model_ids': ['same-model']},
                     },
                     account['token'],
                 )
                 ids[account['id']] = stable_model_id(connection['id'], 'same-model')
                 assert 'credential' not in connection and 'api_key' not in connection
                 await call('POST', f'/api/v1/providers/connections/{connection["id"]}/verify', {}, account['token'])
+                await call(
+                    'PUT',
+                    f'/api/v1/providers/connections/{connection["id"]}/model-enabled',
+                    {'upstream_id': 'same-model', 'enabled': True},
+                    account['token'],
+                )
                 # Even administrator privileges must not expose other people's private connections.
                 await call(
                     'GET', f'/api/v1/providers/connections/{connection["id"]}', token=admin['token'], expected=404
@@ -321,7 +327,7 @@ async def verify():
                         'auth_type': 'api_key',
                         'visibility': 'shared',
                         'api_key': 'synthetic-shared',
-                        'config': {'base_url': base},
+                        'config': {'base_url': base, 'model_ids': ['same-model']},
                         'access_control': [
                             {'principal_type': 'user', 'principal_id': alice['id'], 'permission': 'read'}
                         ],
@@ -354,6 +360,18 @@ async def verify():
                 patch.object(registry, 'get_all_base_models', return_value=[]),
                 patch.object(chatgpt_auth, 'OPENAI_API', base),
             ):
+                await call(
+                    'POST',
+                    f'/api/v1/providers/connections/{connected["connection_id"]}/models/refresh',
+                    {},
+                    alice['token'],
+                )
+                await call(
+                    'PUT',
+                    f'/api/v1/providers/connections/{connected["connection_id"]}/model-enabled',
+                    {'upstream_id': 'same-model', 'enabled': True},
+                    alice['token'],
+                )
                 for should_fail in (False, True):
                     chat = await call(
                         'POST',

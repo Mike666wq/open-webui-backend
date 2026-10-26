@@ -1441,6 +1441,9 @@ async def chat_completion_tools_handler(
         models,
     )
 
+    if not task_model_id:
+        raise HTTPException(409, 'Configure a dedicated auxiliary model for tool selection')
+
     skip_files = False
     sources = []
 
@@ -1455,6 +1458,7 @@ async def chat_completion_tools_handler(
 
     tools_function_calling_prompt = tools_function_calling_generation_template(template, tools_specs)
     payload = get_tools_function_calling_payload(body['messages'], task_model_id, tools_function_calling_prompt)
+    payload['metadata'] = {**metadata, 'task': 'tool_selection'}
 
     try:
         response = await generate_chat_completion(request, form_data=payload, user=user)
@@ -3119,7 +3123,7 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                     user,
                     {
                         **extra_params,
-                        '__model__': models[task_model_id],
+                        '__model__': models.get(task_model_id) or models.get(form_data['model']),
                         '__messages__': form_data['messages'],
                         '__files__': metadata.get('files') or [],
                     },

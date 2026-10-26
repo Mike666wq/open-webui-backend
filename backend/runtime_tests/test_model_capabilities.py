@@ -70,6 +70,10 @@ class ModelCapabilitiesTests(unittest.IsolatedAsyncioTestCase):
             200,
         )
         self.assertEqual((await self.client.get('/providers/models?purpose=chat')).json()['data'], [])
+        await self.client.put(
+            f'/providers/connections/{self.connection.id}/model-enabled',
+            json={'upstream_id': 'unknown', 'enabled': True},
+        )
         self.assertEqual(len((await self.client.get('/providers/models?purpose=transcription')).json()['data']), 1)
         denied = await self.client.get('/providers/models?purpose=bad')
         self.assertEqual(denied.status_code, 400)

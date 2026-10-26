@@ -89,15 +89,12 @@ async def get_task_model_generation_config(default_model_id: str, models) -> tup
     if not isinstance(params, dict):
         params = {}
 
-    return (
-        get_task_model_id(
-            default_model_id,
-            config.get('task.model.default'),
-            config.get('task.model.external'),
-            models,
-        ),
-        {key: value for key, value in params.items() if value is not None and value != ''},
+    model_id = get_task_model_id(
+        default_model_id, config.get('task.model.default'), config.get('task.model.external'), models
     )
+    if not model_id:
+        raise HTTPException(409, 'Configure a dedicated auxiliary model; automatic fallback is disabled')
+    return model_id, {key: value for key, value in params.items() if value is not None and value != ''}
 
 
 ##################################
@@ -172,7 +169,12 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
+    try:
+        task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            return None
+        raise
 
     log.debug('generating chat title using model %s for user %s ', task_model_id, user.email)
 
@@ -241,7 +243,12 @@ async def generate_follow_ups(request: Request, form_data: dict, user=Depends(ge
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
+    try:
+        task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            return None
+        raise
 
     log.debug('generating chat title using model %s for user %s ', task_model_id, user.email)
 
@@ -309,7 +316,12 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
+    try:
+        task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            return None
+        raise
 
     log.debug('generating chat tags using model %s for user %s ', task_model_id, user.email)
 
