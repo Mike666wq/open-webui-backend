@@ -2219,6 +2219,17 @@ TASK_MODEL = os.getenv('TASK_MODEL', '')
 
 TASK_MODEL_EXTERNAL = os.getenv('TASK_MODEL_EXTERNAL', '')
 
+# Per-purpose auxiliary models. An empty value means the purpose keeps inheriting
+# TASK_MODEL / TASK_MODEL_EXTERNAL, so upgrading never disables an existing setup.
+TASK_MODEL_TITLE = os.getenv('TASK_MODEL_TITLE', '')
+TASK_MODEL_TITLE_EXTERNAL = os.getenv('TASK_MODEL_TITLE_EXTERNAL', '')
+TASK_MODEL_TAGS = os.getenv('TASK_MODEL_TAGS', '')
+TASK_MODEL_TAGS_EXTERNAL = os.getenv('TASK_MODEL_TAGS_EXTERNAL', '')
+TASK_MODEL_FOLLOWUP = os.getenv('TASK_MODEL_FOLLOWUP', '')
+TASK_MODEL_FOLLOWUP_EXTERNAL = os.getenv('TASK_MODEL_FOLLOWUP_EXTERNAL', '')
+TASK_MODEL_QUERY = os.getenv('TASK_MODEL_QUERY', '')
+TASK_MODEL_QUERY_EXTERNAL = os.getenv('TASK_MODEL_QUERY_EXTERNAL', '')
+
 try:
     task_model_params = JSONCodec.loads(os.getenv('TASK_MODEL_PARAMS', '{}'))
 except Exception as e:
@@ -3219,6 +3230,14 @@ DEFAULT_CONFIG = {
     'task.model.default': TASK_MODEL,
     'task.model.external': TASK_MODEL_EXTERNAL,
     'task.model.params': TASK_MODEL_PARAMS,
+    'task.model.title.default': TASK_MODEL_TITLE,
+    'task.model.title.external': TASK_MODEL_TITLE_EXTERNAL,
+    'task.model.tags.default': TASK_MODEL_TAGS,
+    'task.model.tags.external': TASK_MODEL_TAGS_EXTERNAL,
+    'task.model.followup.default': TASK_MODEL_FOLLOWUP,
+    'task.model.followup.external': TASK_MODEL_FOLLOWUP_EXTERNAL,
+    'task.model.query.default': TASK_MODEL_QUERY,
+    'task.model.query.external': TASK_MODEL_QUERY_EXTERNAL,
     'chat.context_compaction.model': CONTEXT_COMPACTION_MODEL,
     'chat.context_compaction.enable': ENABLE_CONTEXT_COMPACTION,
     'chat.context_compaction.token_threshold': CONTEXT_COMPACTION_TOKEN_THRESHOLD,
