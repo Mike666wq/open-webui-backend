@@ -295,3 +295,24 @@ class ProviderManagementTests(unittest.IsolatedAsyncioTestCase):
                     await apply_migration(request, self.user, db, 0, source['fingerprint'], {})
             await db.rollback()
         self.assertTrue((await Config.get('openai.api_configs'))['0']['enable'])
+
+    async def test_upgrade_preserves_existing_per_user_model_selection(self):
+        import hashlib
+
+        async with get_async_db_context() as db:
+            connection = await db.get(ProviderConnection, self.connection.id)
+            connection.models = []
+            connection.config = {
+                '_catalog_version': 1,
+                '_models_by_user': {
+                    self.user.id: {
+                        'credential_hash': hashlib.sha256(connection.credential.encode()).hexdigest(),
+                        'models': [{'id': self.mid, 'upstream_id': 'old', 'uses': {'chat': 'openai-chat'}}],
+                    }
+                },
+            }
+            await db.commit()
+            models = await providers.visible_connection_models(connection, self.user, db)
+            self.assertTrue(models[0]['enabled'])
+            self.assertEqual(models[0]['id'], self.mid)
+            self.mock.assert_not_awaited()

@@ -664,6 +664,26 @@ async def visible_connection_models(connection: ProviderConnection, user, db: As
     await initialize_model_catalog(connection)
     entry = (connection.config or {}).get('_models_by_user', {}).get(user.id, {})
     stamp = catalog_fingerprint(connection)
+    legacy_hash = hashlib.sha256((connection.credential or '').encode()).hexdigest()
+    if (
+        isinstance(entry, dict)
+        and entry.get('credential_hash') == legacy_hash
+        and isinstance(entry.get('models'), list)
+    ):
+        config = dict(connection.config or {})
+        enabled = dict(config.get('_model_enabled', {}))
+        for model in entry['models']:
+            enabled.setdefault(model['upstream_id'], True)
+        snapshot = {'fingerprint': stamp, 'models': entry['models'], 'updated_at': int(time.time()), 'imported': True}
+        connection.config = {
+            **config,
+            '_model_enabled': enabled,
+            '_models_by_user': {**config.get('_models_by_user', {}), user.id: snapshot},
+        }
+        if connection.owner_id == user.id:
+            connection.models = entry['models']
+        await db.commit()
+        entry = snapshot
     if isinstance(entry, dict) and entry.get('fingerprint') == stamp and isinstance(entry.get('models'), list):
         if time.time() - max(entry.get('updated_at', 0), (entry.get('error') or {}).get('at', 0)) >= CATALOG_TTL:
             key = (connection.id, user.id)

@@ -1,8 +1,10 @@
 """Explicit, transactional migration of compatible administrator OpenAI sources."""
 
+import asyncio
 import hashlib
 import hmac
 import json
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import HTTPException
 from open_webui.env import WEBUI_SECRET_KEY
@@ -13,7 +15,8 @@ from open_webui.utils.providers import encrypt_credential, public_connection, st
 from sqlalchemy import select
 
 _KEYS = ('openai.api_base_urls', 'openai.api_keys', 'openai.api_configs')
-_SUPPORTED = {'enable', 'model_ids', 'prefix_id', 'tags', 'connection_type', 'provider'}
+_migration_lock = asyncio.Lock()
+_SUPPORTED = {'enable', 'model_ids', 'prefix_id', 'tags', 'connection_type', 'provider', 'auth_type', 'api_type'}
 
 
 def signature(value):
@@ -45,6 +48,13 @@ async def preview_migration(request, user, db):
         reason = 'Unsupported request configuration: ' + ', '.join(blocked) if blocked else None
         if not Config.persistent_enabled_for('openai.api_configs'):
             reason = 'Enable persistent configuration before migrating connections'
+        if config.get('auth_type') not in (None, 'bearer') or config.get('api_type') not in (
+            None,
+            '',
+            'chat_completions',
+            'openai',
+        ):
+            reason = 'Only bearer authentication with OpenAI chat completions is supported by this migration'
         if config.get('connection_type', 'external') != 'external':
             reason = 'Only server-side external OpenAI-compatible sources can be migrated'
         models = list(config.get('model_ids') or [])
@@ -61,11 +71,17 @@ async def preview_migration(request, user, db):
         aliases = {f'{prefix}.{mid}' if prefix else mid: mid for mid in models}
         for alias in aliases:
             claims.setdefault(alias, []).append(index)
+        parsed = urlsplit(url)
+        display_url = url
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            reason = 'Remove credentials, query parameters and fragments from the endpoint before migration'
+            display_url = urlunsplit((parsed.scheme, parsed.hostname or '', parsed.path, '', ''))
+        stamp = signature({'source': stamp, 'models': models})
         sources.append(
             {
                 'index': index,
                 'name': config.get('provider') or f'OpenAI-compatible {index + 1}',
-                'base_url': url,
+                'base_url': display_url,
                 'fingerprint': stamp,
                 'models': models,
                 'aliases': aliases,
@@ -79,6 +95,19 @@ async def preview_migration(request, user, db):
 
 
 async def apply_migration(request, user, db, index, fingerprint, alias_owners):
+    from open_webui.utils.providers import catalog_lease
+
+    async with _migration_lock, catalog_lease('legacy-migration', 'global', db) as acquired:
+        if not acquired:
+            raise HTTPException(409, 'Another migration is running; retry shortly')
+        try:
+            return await _apply_migration(request, user, db, index, fingerprint, alias_owners)
+        except BaseException:
+            await db.rollback()
+            raise
+
+
+async def _apply_migration(request, user, db, index, fingerprint, alias_owners):
     # Lock configuration rows and serialize against other migration transactions.
     await db.scalars(select(Config).where(Config.key.in_(_KEYS)).with_for_update())
     # Only a preview of the current configuration may apply.
