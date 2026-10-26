@@ -140,6 +140,27 @@ class AuxiliaryTaskModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.resolve('title', 'chat-remote'), 'title-remote')
         self.assertEqual(await self.resolve('tags', 'chat-local'), 'tags-local')
 
+    async def test_payload_without_purpose_models_keeps_the_stored_selection(self):
+        await Config.upsert({'task.model.title.default': 'title-local'})
+        payload = (await self.client.get('/tasks/config')).json()
+        for field in (
+            'TASK_MODEL_TITLE',
+            'TASK_MODEL_TITLE_EXTERNAL',
+            'TASK_MODEL_TAGS',
+            'TASK_MODEL_TAGS_EXTERNAL',
+            'TASK_MODEL_FOLLOWUP',
+            'TASK_MODEL_FOLLOWUP_EXTERNAL',
+            'TASK_MODEL_QUERY',
+            'TASK_MODEL_QUERY_EXTERNAL',
+        ):
+            payload.pop(field, None)
+
+        # A cached older frontend does not send the purpose fields at all.
+        self.assertEqual((await self.client.post('/tasks/config/update', json=payload)).status_code, 200)
+        stored = (await self.client.get('/tasks/config')).json()
+        self.assertEqual(stored['TASK_MODEL_TITLE'], 'title-local')
+        self.assertEqual(await self.resolve('title', 'chat-local'), 'title-local')
+
 
 if __name__ == '__main__':
     unittest.main()

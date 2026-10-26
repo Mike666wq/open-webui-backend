@@ -87,7 +87,8 @@ AUXILIARY_MODEL_PURPOSES = {
 
 
 def config_updates(data: dict, key_map: dict[str, str]) -> dict:
-    return {key_map[field]: value for field, value in data.items() if field in key_map}
+    # A missing value means "not sent": keep whatever is stored instead of clearing it.
+    return {key_map[field]: value for field, value in data.items() if field in key_map and value is not None}
 
 
 def apply_task_model_params(payload: dict, models: dict, task_model_id: str, params: dict | None = None) -> dict:
@@ -149,14 +150,14 @@ class TaskConfigForm(BaseModel):
     TASK_MODEL: Optional[str]
     TASK_MODEL_EXTERNAL: Optional[str]
     TASK_MODEL_PARAMS: dict | None = None
-    TASK_MODEL_TITLE: Optional[str]
-    TASK_MODEL_TITLE_EXTERNAL: Optional[str]
-    TASK_MODEL_TAGS: Optional[str]
-    TASK_MODEL_TAGS_EXTERNAL: Optional[str]
-    TASK_MODEL_FOLLOWUP: Optional[str]
-    TASK_MODEL_FOLLOWUP_EXTERNAL: Optional[str]
-    TASK_MODEL_QUERY: Optional[str]
-    TASK_MODEL_QUERY_EXTERNAL: Optional[str]
+    TASK_MODEL_TITLE: Optional[str] = None
+    TASK_MODEL_TITLE_EXTERNAL: Optional[str] = None
+    TASK_MODEL_TAGS: Optional[str] = None
+    TASK_MODEL_TAGS_EXTERNAL: Optional[str] = None
+    TASK_MODEL_FOLLOWUP: Optional[str] = None
+    TASK_MODEL_FOLLOWUP_EXTERNAL: Optional[str] = None
+    TASK_MODEL_QUERY: Optional[str] = None
+    TASK_MODEL_QUERY_EXTERNAL: Optional[str] = None
     ENABLE_TITLE_GENERATION: bool
     TITLE_GENERATION_PROMPT_TEMPLATE: str
     IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE: str
