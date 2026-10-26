@@ -400,3 +400,34 @@ class ProviderManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.json()['status'], 'configured')
         self.assertEqual(result.json()['catalog']['error']['status'], 404)
         self.assertEqual(result.json()['models'][0]['upstream_id'], 'manual')
+
+    async def test_shared_connection_refresh_is_serialized_across_users(self):
+        async with get_async_db_context() as db:
+            connection = await db.get(ProviderConnection, self.connection.id)
+            connection.visibility = 'shared'
+            await db.commit()
+        entered, release = asyncio.Event(), asyncio.Event()
+        active, maximum = 0, 0
+
+        async def discover(*args):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            entered.set()
+            await release.wait()
+            active -= 1
+            return {'data': [{'id': 'old'}]}
+
+        self.mock.side_effect = discover
+        first = asyncio.create_task(self.refresh())
+        await entered.wait()
+        self.app.dependency_overrides[get_verified_user] = lambda: self.other
+        second = asyncio.create_task(self.refresh())
+        await asyncio.sleep(0.03)
+        release.set()
+        results = await asyncio.gather(first, second)
+        self.assertTrue(all(r.status_code == 200 for r in results))
+        self.assertEqual(maximum, 1)
+        async with get_async_db_context() as db:
+            connection = await db.get(ProviderConnection, self.connection.id)
+            self.assertEqual(set(connection.config['_models_by_user']), {self.user.id, self.other.id})

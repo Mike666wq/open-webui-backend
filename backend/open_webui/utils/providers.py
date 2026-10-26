@@ -591,8 +591,8 @@ async def catalog_lease(connection_id, user_id, db):
 async def refresh_connection_catalog(connection, user, db):
     generation = (connection.config or {}).get('_models_by_user', {}).get(user.id) or {}
     generation = generation.get('generation') if isinstance(generation, dict) else None
-    lock = _catalog_locks.setdefault((connection.id, user.id), asyncio.Lock())
-    async with lock, catalog_lease(connection.id, user.id, db) as acquired:
+    lock = _catalog_locks.setdefault(connection.id, asyncio.Lock())
+    async with lock, catalog_lease(connection.id, 'catalog', db) as acquired:
         if isinstance(db, AsyncSession):
             await db.refresh(connection)
         entry = (connection.config or {}).get('_models_by_user', {}).get(user.id, {})
@@ -601,7 +601,11 @@ async def refresh_connection_catalog(connection, user, db):
             and entry.get('generation') != generation
             and entry.get('fingerprint') == catalog_fingerprint(connection)
         ):
-            if isinstance(entry, dict) and isinstance(entry.get('models'), list):
+            if (
+                isinstance(entry, dict)
+                and entry.get('fingerprint') == catalog_fingerprint(connection)
+                and isinstance(entry.get('models'), list)
+            ):
                 return [normalize_model(connection, m) for m in entry['models']]
             raise HTTPException(409, 'Catalog refresh already running; retry shortly')
         return await _refresh_connection_catalog(connection, user, db)
