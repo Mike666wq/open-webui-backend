@@ -95,7 +95,8 @@ def record_invocation(function):
                             pending = b''
                         yield chunk
                 except (asyncio.CancelledError, GeneratorExit):
-                    status = 'cancelled'
+                    if status not in ('completed', 'failed'):
+                        status = 'cancelled'
                     raise
                 except Exception:
                     status = 'failed'

@@ -367,3 +367,22 @@ class ProviderManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error['status'], 500)
         self.assertEqual(error['http_status'], 502)
         self.assertEqual(providers.catalog_error(HTTPException(502, 'Could not reach provider'))['category'], 'network')
+
+    async def test_closing_after_done_retains_completed_receipt(self):
+        async def frames():
+            yield b'data: {"choices":[{"delta":{"content":"OK"}}]}' + bytes([10, 10])
+            yield b'data: [DONE]' + bytes([10, 10])
+
+        @record_invocation
+        async def call(request, form_data, user):
+            return StreamingResponse(frames())
+
+        request = SimpleNamespace(
+            state=SimpleNamespace(), app=SimpleNamespace(state=SimpleNamespace(MODELS={'gpt': {'id': 'gpt'}}))
+        )
+        response = await call(request, {'model': 'gpt'}, self.user)
+        await anext(response.body_iterator)
+        await anext(response.body_iterator)
+        await response.body_iterator.aclose()
+        result = await self.client.get('/providers/calls/history')
+        self.assertEqual(result.json()['data'][0]['status'], 'completed')
