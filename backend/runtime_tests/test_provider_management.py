@@ -360,3 +360,10 @@ class ProviderManagementTests(unittest.IsolatedAsyncioTestCase):
             any(c.args[0].get('data', {}).get('action') == 'auxiliary_model_missing' for c in emitter.call_args_list)
         )
         self.assertEqual(search.call_args.args[1].queries, ['synthetic query'])
+
+    async def test_upstream_500_is_distinct_from_local_gateway_502(self):
+        error = providers.catalog_error(providers.provider_http_error(500))
+        self.assertEqual(error['category'], 'upstream')
+        self.assertEqual(error['status'], 500)
+        self.assertEqual(error['http_status'], 502)
+        self.assertEqual(providers.catalog_error(HTTPException(502, 'Could not reach provider'))['category'], 'network')

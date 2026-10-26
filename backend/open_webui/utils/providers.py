@@ -302,7 +302,9 @@ def provider_http_error(status: int) -> HTTPException:
         return HTTPException(429, 'Provider usage limit reached; wait or check your plan quota')
     if status == 402:
         return HTTPException(402, 'Provider quota or balance is insufficient')
-    return HTTPException(502, f'Provider request failed with HTTP {status}')
+    error = HTTPException(502, f'Provider request failed with HTTP {status}')
+    error.provider_status = status
+    return error
 
 
 async def _request_json(connection: ProviderConnection, user, url: str, *, method='GET', body=None, params=None):
@@ -525,18 +527,22 @@ def catalog_status(connection, user_id=None):
 
 
 def catalog_error(exc):
-    status = getattr(exc, 'status_code', 502)
+    http_status = getattr(exc, 'status_code', 502)
+    upstream_status = getattr(exc, 'provider_status', None)
+    status = upstream_status or http_status
     category = (
         'authentication'
         if status in (401, 403)
         else 'rate_limit'
         if status == 429
+        else 'upstream'
+        if upstream_status
         else 'network'
         if status == 502
         else 'upstream'
     )
     # Never persist upstream bodies, URLs with credentials, or exception strings.
-    return {'category': category, 'status': status, 'at': int(time.time())}
+    return {'category': category, 'status': status, 'http_status': http_status, 'at': int(time.time())}
 
 
 @asynccontextmanager
