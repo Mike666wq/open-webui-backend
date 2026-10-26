@@ -44,6 +44,14 @@ TASK_CONFIG_KEYS = {
     'TASK_MODEL': 'task.model.default',
     'TASK_MODEL_EXTERNAL': 'task.model.external',
     'TASK_MODEL_PARAMS': 'task.model.params',
+    'TASK_MODEL_TITLE': 'task.model.title.default',
+    'TASK_MODEL_TITLE_EXTERNAL': 'task.model.title.external',
+    'TASK_MODEL_TAGS': 'task.model.tags.default',
+    'TASK_MODEL_TAGS_EXTERNAL': 'task.model.tags.external',
+    'TASK_MODEL_FOLLOWUP': 'task.model.followup.default',
+    'TASK_MODEL_FOLLOWUP_EXTERNAL': 'task.model.followup.external',
+    'TASK_MODEL_QUERY': 'task.model.query.default',
+    'TASK_MODEL_QUERY_EXTERNAL': 'task.model.query.external',
     'TITLE_GENERATION_PROMPT_TEMPLATE': 'task.title.prompt_template',
     'IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE': 'task.image.prompt_template',
     'ENABLE_AUTOCOMPLETE_GENERATION': 'task.autocomplete.enable',
@@ -68,6 +76,16 @@ async def get_config_values(key_map: dict[str, str]) -> dict:
     return {field: values[storage_key] for field, storage_key in key_map.items() if storage_key in values}
 
 
+# Auxiliary purposes that can carry their own model instead of sharing one default.
+# Each entry maps the purpose to its (local model key, external model key, human label).
+AUXILIARY_MODEL_PURPOSES = {
+    'title': ('task.model.title.default', 'task.model.title.external', 'title'),
+    'tags': ('task.model.tags.default', 'task.model.tags.external', 'tag'),
+    'followup': ('task.model.followup.default', 'task.model.followup.external', 'follow-up'),
+    'query': ('task.model.query.default', 'task.model.query.external', 'search query'),
+}
+
+
 def config_updates(data: dict, key_map: dict[str, str]) -> dict:
     return {key_map[field]: value for field, value in data.items() if field in key_map}
 
@@ -79,21 +97,39 @@ def apply_task_model_params(payload: dict, models: dict, task_model_id: str, par
     return apply_params_to_form_data(payload, model, params or None)
 
 
-async def get_task_model_generation_config(default_model_id: str, models) -> tuple[str, dict]:
-    config = await Config.get_many(
+async def get_task_model_generation_config(
+    default_model_id: str, models, purpose: str | None = None
+) -> tuple[str, dict]:
+    keys = [
         'task.model.default',
         'task.model.external',
         'task.model.params',
-    )
+    ]
+    purpose_keys = AUXILIARY_MODEL_PURPOSES.get(purpose) if purpose else None
+    if purpose_keys:
+        keys.extend(purpose_keys[:2])
+
+    config = await Config.get_many(*keys)
     params = config.get('task.model.params') or {}
     if not isinstance(params, dict):
         params = {}
 
-    model_id = get_task_model_id(
-        default_model_id, config.get('task.model.default'), config.get('task.model.external'), models
-    )
+    task_model = config.get('task.model.default')
+    task_model_external = config.get('task.model.external')
+    if purpose_keys:
+        # A purpose-specific model overrides the shared default; an empty value keeps
+        # inheriting it so upgrading an existing installation never disables a task.
+        purpose_model = config.get(purpose_keys[0])
+        purpose_external = config.get(purpose_keys[1])
+        if purpose_model:
+            task_model = purpose_model
+        if purpose_external:
+            task_model_external = purpose_external
+
+    model_id = get_task_model_id(default_model_id, task_model, task_model_external, models)
     if not model_id:
-        raise HTTPException(409, 'Configure a dedicated auxiliary model; automatic fallback is disabled')
+        label = purpose_keys[2] if purpose_keys else 'auxiliary'
+        raise HTTPException(409, f'Configure a dedicated {label} model; automatic fallback is disabled')
     return model_id, {key: value for key, value in params.items() if value is not None and value != ''}
 
 
@@ -113,6 +149,14 @@ class TaskConfigForm(BaseModel):
     TASK_MODEL: Optional[str]
     TASK_MODEL_EXTERNAL: Optional[str]
     TASK_MODEL_PARAMS: dict | None = None
+    TASK_MODEL_TITLE: Optional[str]
+    TASK_MODEL_TITLE_EXTERNAL: Optional[str]
+    TASK_MODEL_TAGS: Optional[str]
+    TASK_MODEL_TAGS_EXTERNAL: Optional[str]
+    TASK_MODEL_FOLLOWUP: Optional[str]
+    TASK_MODEL_FOLLOWUP_EXTERNAL: Optional[str]
+    TASK_MODEL_QUERY: Optional[str]
+    TASK_MODEL_QUERY_EXTERNAL: Optional[str]
     ENABLE_TITLE_GENERATION: bool
     TITLE_GENERATION_PROMPT_TEMPLATE: str
     IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE: str
@@ -170,7 +214,7 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
         )
 
     try:
-        task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
+        task_model_id, task_model_params = await get_task_model_generation_config(model_id, models, 'title')
     except HTTPException as exc:
         if exc.status_code == 409:
             return None
@@ -244,7 +288,7 @@ async def generate_follow_ups(request: Request, form_data: dict, user=Depends(ge
         )
 
     try:
-        task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
+        task_model_id, task_model_params = await get_task_model_generation_config(model_id, models, 'followup')
     except HTTPException as exc:
         if exc.status_code == 409:
             return None
@@ -317,7 +361,7 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
         )
 
     try:
-        task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
+        task_model_id, task_model_params = await get_task_model_generation_config(model_id, models, 'tags')
     except HTTPException as exc:
         if exc.status_code == 409:
             return None
@@ -459,7 +503,7 @@ async def generate_queries(request: Request, form_data: dict, user=Depends(get_v
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
+    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models, 'query')
 
     log.debug('generating %s queries using model %s for user %s', type, task_model_id, user.email)
 
