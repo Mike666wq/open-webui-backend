@@ -44,7 +44,7 @@ async def cached_legacy_catalog(request, url, key, user, config, fetch):
                 if status in (401, 403)
                 else 'rate_limit'
                 if status == 429
-                else 'network'
+                else 'connection'
                 if status == 502
                 else 'upstream'
             )

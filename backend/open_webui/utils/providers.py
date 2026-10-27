@@ -25,8 +25,22 @@ from open_webui.internal.db import get_async_db_context
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.models import Model
 from open_webui.models.provider_connections import ProviderConnection, new_provider_connection
-from open_webui.utils.apps import AppTCPConnector, validate_app_url
+from open_webui.utils.apps import validate_app_url
 from open_webui.utils.provider_capabilities import normalize_model, provider_family
+from open_webui.utils.provider_errors import (
+    AUTHENTICATION,
+    PROVIDER_NETWORK,
+    RATE_LIMIT,
+    UPSTREAM,
+    ProviderRequestError,
+    error_from_exception,
+)
+from open_webui.utils.provider_http import (
+    ProviderAddressBlocked,
+    ProviderTCPConnector,
+    allowed_ip_networks,
+    provider_request_json,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -296,45 +310,46 @@ async def read_bounded_response(response, limit: int = 2_000_000) -> bytes:
 
 
 def provider_http_error(status: int) -> HTTPException:
+    """Build an HTTP error that keeps the upstream status and its category.
+
+    The category is attached so that `catalog_error` can tell a genuine
+    upstream fault apart from a local gateway failure. Without it every
+    upstream status collapsed into a generic "network" error.
+    """
     if status in (401, 403):
-        return HTTPException(status, 'Provider rejected the configured credentials or permissions')
-    if status == 429:
-        return HTTPException(429, 'Provider usage limit reached; wait or check your plan quota')
-    if status == 402:
-        return HTTPException(402, 'Provider quota or balance is insufficient')
-    error = HTTPException(502, f'Provider request failed with HTTP {status}')
+        error = HTTPException(status, 'Provider rejected the configured credentials or permissions')
+        category = AUTHENTICATION
+    elif status == 429:
+        error = HTTPException(429, 'Provider usage limit reached; wait or check your plan quota')
+        category = RATE_LIMIT
+    elif status == 402:
+        error = HTTPException(402, 'Provider quota or balance is insufficient')
+        category = RATE_LIMIT
+    else:
+        error = HTTPException(502, f'Provider request failed with HTTP {status}')
+        category = UPSTREAM
     error.provider_status = status
+    error.provider_category = category
+    return error
+
+
+def _provider_http_error(exc) -> HTTPException:
+    """Translate a transport failure into an HTTP error with its category."""
+    status = exc.status if exc.status in (401, 403, 402, 429) else 502
+    error = HTTPException(status, exc.detail)
+    error.provider_status = exc.upstream_status
+    error.provider_category = exc.category
+    error.provider_hint = exc.hint
     return error
 
 
 async def _request_json(connection: ProviderConnection, user, url: str, *, method='GET', body=None, params=None):
     token = await _authorization(connection, user)
     headers = provider_request_headers(connection, token)
-    if body is not None:
-        headers['Content-Type'] = 'application/json'
     try:
-        allow_private = validate_app_url(url.split('?', 1)[0])
-        async with aiohttp.ClientSession(
-            connector=AppTCPConnector(allow_private=allow_private),
-            timeout=aiohttp.ClientTimeout(total=20),
-            trust_env=False,
-        ) as session:
-            async with session.request(
-                method, url, json=body, params=params, headers=headers, allow_redirects=False
-            ) as response:
-                raw = await read_bounded_response(response)
-                if len(raw) > 2_000_000:
-                    raise HTTPException(502, 'Provider response is too large')
-                if response.status < 200 or response.status >= 300:
-                    raise provider_http_error(response.status)
-                try:
-                    return json.loads(raw) if raw else {}
-                except (ValueError, UnicodeDecodeError):
-                    raise HTTPException(502, 'Provider returned an invalid response') from None
-    except HTTPException:
-        raise
-    except (aiohttp.ClientError, TimeoutError):
-        raise HTTPException(502, 'Could not reach the provider') from None
+        return await provider_request_json(url, headers=headers, method=method, body=body, params=params)
+    except ProviderRequestError as exc:
+        raise _provider_http_error(exc) from None
 
 
 async def discover_connection_models(connection: ProviderConnection, user) -> list[dict]:
@@ -530,22 +545,12 @@ def catalog_status(connection, user_id=None):
 
 
 def catalog_error(exc):
-    http_status = getattr(exc, 'status_code', 502)
-    upstream_status = getattr(exc, 'provider_status', None)
-    status = upstream_status or http_status
-    category = (
-        'authentication'
-        if status in (401, 403)
-        else 'rate_limit'
-        if status == 429
-        else 'upstream'
-        if upstream_status
-        else 'network'
-        if status == 502
-        else 'upstream'
-    )
-    # Never persist upstream bodies, URLs with credentials, or exception strings.
-    return {'category': category, 'status': status, 'http_status': http_status, 'at': int(time.time())}
+    """Classify a provider failure into the five documented categories.
+
+    Never persists upstream bodies, URLs with credentials, or exception
+    strings; only the category, the statuses and a display-ready hint.
+    """
+    return error_from_exception(exc)
 
 
 @asynccontextmanager
@@ -914,6 +919,35 @@ def _openai_payload(payload: dict, upstream_model_id: str) -> dict:
     return {key: value for key, value in payload.items() if key in allowed} | {'model': upstream_model_id}
 
 
+def _blocked_address_error(exc: ProviderAddressBlocked) -> HTTPException:
+    error = HTTPException(502, 'Provider endpoint resolves to a prohibited address')
+    error.provider_category = PROVIDER_NETWORK
+    error.provider_hint = (
+        f'地址 {exc.host} 解析到 {"、".join(exc.addresses[:4])}，落在保留网段（代理 fake-ip 常用该段），'
+        '已被服务器安全策略拦截。'
+    )
+    return error
+
+
+async def _post_provider_request(connection, target_url: str, body, headers) -> tuple:
+    """Open a provider session and post the request, mapping transport failures."""
+    allow_private = validate_app_url(target_url)
+    session = aiohttp.ClientSession(
+        connector=ProviderTCPConnector(allow_private=allow_private, allowed_networks=allowed_ip_networks()),
+        timeout=aiohttp.ClientTimeout(total=None, connect=20, sock_read=300),
+        trust_env=False,
+    )
+    try:
+        response = await session.post(target_url, json=body, headers=headers, allow_redirects=False)
+    except ProviderAddressBlocked as exc:
+        await session.close()
+        raise _blocked_address_error(exc) from None
+    except (aiohttp.ClientError, TimeoutError):
+        await session.close()
+        raise HTTPException(502, 'Could not reach the provider') from None
+    return response, session
+
+
 async def provider_chat_completion(
     model_id: str, payload: dict, user, db: AsyncSession | None = None, *, allow_disabled=False
 ):
@@ -951,17 +985,7 @@ async def provider_chat_completion(
             target_path = '/chat/completions'
             headers = {**provider_request_headers(connection, token), 'Content-Type': 'application/json'}
         target_url = f'{provider_base_url(connection)}{target_path}'
-        allow_private = validate_app_url(target_url)
-        session = aiohttp.ClientSession(
-            connector=AppTCPConnector(allow_private=allow_private),
-            timeout=aiohttp.ClientTimeout(total=None, connect=20, sock_read=300),
-            trust_env=False,
-        )
-        try:
-            response = await session.post(target_url, json=body, headers=headers, allow_redirects=False)
-        except (aiohttp.ClientError, TimeoutError):
-            await session.close()
-            raise HTTPException(502, 'Could not reach the provider') from None
+        response, session = await _post_provider_request(connection, target_url, body, headers)
     if response.status < 200 or response.status >= 300:
         response.release()
         await session.close()
@@ -1209,7 +1233,9 @@ async def media_http_session(connection: ProviderConnection | None = None):
         return
     allow_private = validate_app_url(provider_base_url(connection))
     async with aiohttp.ClientSession(
-        connector=AppTCPConnector(allow_private=allow_private),
+        connector=ProviderTCPConnector(
+            allow_private=allow_private, allowed_networks=allowed_ip_networks()
+        ),
         timeout=aiohttp.ClientTimeout(total=300, connect=20),
         trust_env=False,
     ) as session:

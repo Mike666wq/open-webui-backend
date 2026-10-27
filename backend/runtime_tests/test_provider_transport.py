@@ -35,7 +35,7 @@ class ProviderTransportTests(unittest.IsolatedAsyncioTestCase):
             patch.object(providers, 'provider_base_url', return_value='https://example.invalid/v1'),
             patch.object(providers, 'provider_request_headers', return_value={}),
             patch.object(providers, 'validate_app_url', return_value=False),
-            patch.object(providers, 'AppTCPConnector'),
+            patch.object(providers, 'ProviderTCPConnector'),
             patch.object(providers.aiohttp, 'ClientSession', return_value=session),
         ):
             try:

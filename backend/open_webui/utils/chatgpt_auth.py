@@ -20,6 +20,12 @@ import jwt
 from fastapi import HTTPException
 from open_webui.internal.db import get_async_db_context
 from open_webui.models.provider_connections import ProviderConnection
+from open_webui.utils.provider_errors import (
+    AUTHENTICATION,
+    CONNECTION,
+    RATE_LIMIT,
+    UPSTREAM,
+)
 from open_webui.utils.providers import (
     get_oauth_credentials,
     replace_oauth_credentials,
@@ -339,18 +345,44 @@ async def _api_json(url: str, token: str, *, method='GET', payload=None):
                 if len(raw) > 2_000_000:
                     raise HTTPException(502, 'ChatGPT response is too large')
                 if response.status in (401, 403):
-                    raise HTTPException(401, 'ChatGPT rejected the connected account')
+                    raise _chatgpt_error(401, response.status, 'ChatGPT rejected the connected account', AUTHENTICATION)
                 if response.status == 402:
-                    raise HTTPException(402, 'ChatGPT plan usage is unavailable. Review your plan and usage.')
+                    raise _chatgpt_error(
+                        402,
+                        response.status,
+                        'ChatGPT plan usage is unavailable. Review your plan and usage.',
+                        RATE_LIMIT,
+                    )
                 if response.status == 429:
-                    raise HTTPException(429, 'ChatGPT usage limit reached. Review your plan usage and retry later.')
+                    raise _chatgpt_error(
+                        429,
+                        response.status,
+                        'ChatGPT usage limit reached. Review your plan usage and retry later.',
+                        RATE_LIMIT,
+                    )
                 if response.status < 200 or response.status >= 300:
-                    raise HTTPException(502, f'ChatGPT request failed with HTTP {response.status}')
+                    raise _chatgpt_error(
+                        502, response.status, f'ChatGPT request failed with HTTP {response.status}', UPSTREAM
+                    )
                 return json.loads(raw) if raw else {}
     except HTTPException:
         raise
     except (aiohttp.ClientError, TimeoutError, ValueError):
-        raise HTTPException(502, 'Could not reach ChatGPT') from None
+        error = HTTPException(502, 'Could not reach ChatGPT')
+        error.provider_category = CONNECTION
+        raise error from None
+
+
+def _chatgpt_error(status: int, upstream_status: int, detail: str, category: str) -> HTTPException:
+    """Build a ChatGPT error that keeps the upstream status and its category.
+
+    Without the upstream status every ChatGPT failure collapsed into a generic
+    "network / HTTP 502" in the interface.
+    """
+    error = HTTPException(status, detail)
+    error.provider_status = upstream_status
+    error.provider_category = category
+    return error
 
 
 async def discover_chatgpt_models(connection: ProviderConnection, user) -> list[dict[str, str]]:
