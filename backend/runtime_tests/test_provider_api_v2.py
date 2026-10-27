@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from open_webui.internal.db import get_async_db_context
 from open_webui.models.provider_connections import (
     ProviderConnection,
@@ -163,6 +163,101 @@ class ProviderApiV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.json()['is_enabled'])
         listed = (await self.client.get('/providers/models')).json()['data']
         self.assertEqual([model['upstream_id'] for model in listed], ['deepseek-chat'])
+
+    async def test_a_cached_catalog_authentication_error_does_not_take_the_models_offline(self):
+        """A3: the catalog and the inference path fail for different reasons."""
+        await self.client.post(
+            f'/providers/connections/{self.connection.id}/models',
+            json={'upstream_ids': ['deepseek-chat']},
+        )
+        async with get_async_db_context() as db:
+            stored = await db.get(ProviderConnection, self.connection.id)
+            await providers.write_snapshot(
+                stored,
+                self.user.id,
+                {
+                    'fingerprint': providers.catalog_fingerprint(stored),
+                    'models': [],
+                    'error': {
+                        'category': 'authentication',
+                        'status': 401,
+                        'http_status': 401,
+                        'upstream_status': 401,
+                        'retryable': False,
+                        'at': 0,
+                        'hint': '厂商拒绝了当前凭据',
+                        'reason': 'invalid_credentials',
+                        'suggested_action': 'replace_key',
+                    },
+                    'updated_at': 0,
+                    'generation': 'stale-generation',
+                },
+                db,
+            )
+            await db.commit()
+
+        listed = (await self.client.get('/providers/models')).json()['data']
+        self.assertEqual([model['upstream_id'] for model in listed], ['deepseek-chat'])
+
+    async def test_the_real_request_still_authenticates_after_a_catalog_error(self):
+        """A3: the cached error must not switch the authentication check off."""
+        await self.client.post(
+            f'/providers/connections/{self.connection.id}/models',
+            json={'upstream_ids': ['deepseek-chat']},
+        )
+        model_id = providers.stable_model_id(self.connection.id, 'deepseek-chat')
+        upstream = SimpleNamespace(status=401, release=lambda: None)
+        session = SimpleNamespace(close=AsyncMock())
+        with patch.object(
+            providers, '_post_provider_request', new=AsyncMock(return_value=(upstream, session))
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await providers.provider_chat_completion(
+                    model_id, {'messages': [{'role': 'user', 'content': 'hi'}]}, self.user
+                )
+        self.assertEqual(ctx.exception.status_code, 401)
+        self.assertEqual(ctx.exception.provider_category, 'authentication')
+        self.assertEqual(ctx.exception.provider_suggested_action, 'replace_key')
+
+    async def test_a_disabled_model_stays_rejected_after_a_catalog_error(self):
+        """A3: disabling a model still wins over a stale catalog error."""
+        await self.client.post(
+            f'/providers/connections/{self.connection.id}/models',
+            json={'upstream_ids': ['deepseek-chat']},
+        )
+        await self.client.put(
+            f'/providers/connections/{self.connection.id}/models/deepseek-chat',
+            json={'enabled': False},
+        )
+        listed = (await self.client.get('/providers/models')).json()['data']
+        self.assertEqual(listed, [])
+
+    async def test_a_failed_fetch_keeps_the_curated_whitelist_untouched(self):
+        """A4: a catalog failure must not rename, re-purpose or disable a model."""
+        await self.client.post(
+            f'/providers/connections/{self.connection.id}/models',
+            json={'upstream_ids': ['deepseek-chat']},
+        )
+        await self.client.put(
+            f'/providers/connections/{self.connection.id}/models/deepseek-chat',
+            json={'display_name': 'DeepSeek Chat', 'uses': {'chat': 'openai-chat'}, 'enabled': False},
+        )
+        before = (await self.client.get(f'/providers/connections/{self.connection.id}/models')).json()['data']
+
+        self.mock.side_effect = RuntimeError('upstream is unreachable')
+        response = await self.client.post(f'/providers/connections/{self.connection.id}/models/fetch')
+        # The failure is reported in the payload; the endpoint itself still answers.
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(response.json()['error'])
+        self.assertEqual(response.json()['candidates'], [])
+        self.mock.side_effect = None
+
+        after = (await self.client.get(f'/providers/connections/{self.connection.id}/models')).json()['data']
+        self.assertEqual(after, before)
+        self.assertEqual(after[0]['id'], f'provider:{self.connection.id}:deepseek-chat')
+        self.assertEqual(after[0]['name'], 'DeepSeek Chat')
+        self.assertEqual(after[0]['uses'], {'chat': 'openai-chat'})
+        self.assertFalse(after[0]['enabled'])
 
     async def test_editing_the_credential_keeps_the_models_of_an_unmigrated_connection(self):
         """A legacy connection must still be able to move its models into the whitelist."""
