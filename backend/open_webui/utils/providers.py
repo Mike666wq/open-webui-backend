@@ -24,9 +24,18 @@ from open_webui.env import VERSION, WEBUI_SECRET_KEY
 from open_webui.internal.db import get_async_db_context
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.models import Model
-from open_webui.models.provider_connections import ProviderConnection, new_provider_connection
+from open_webui.models.provider_connections import (
+    ProviderCatalogSnapshot,
+    ProviderConnection,
+    ProviderModel,
+    new_provider_connection,
+)
 from open_webui.utils.apps import validate_app_url
-from open_webui.utils.provider_capabilities import normalize_model, provider_family
+from open_webui.utils.provider_capabilities import (
+    normalize_model,
+    normalize_whitelist_model,
+    provider_family,
+)
 from open_webui.utils.provider_errors import (
     AUTHENTICATION,
     PROVIDER_NETWORK,
@@ -127,22 +136,281 @@ def decrypt_credential(value: str | None) -> str | None:
         raise HTTPException(500, 'Provider credential could not be read') from None
 
 
-def public_connection(connection: ProviderConnection) -> dict:
+REGISTRY_VERSION = 2
+
+
+def registry_migrated(connection: ProviderConnection) -> bool:
+    """Whether a connection already moved onto the curated whitelist tables."""
+    return (connection.config or {}).get('_registry_version') == REGISTRY_VERSION
+
+
+def legacy_snapshot(connection: ProviderConnection, user_id: str | None = None) -> dict:
+    """Read the per-user catalog snapshot from the legacy config payload."""
+    entry = (connection.config or {}).get('_models_by_user', {}).get(user_id or connection.owner_id, {})
+    return entry if isinstance(entry, dict) else {}
+
+
+async def read_snapshot(connection: ProviderConnection, user_id: str, db: AsyncSession | None) -> dict:
+    """Read the candidate pool for a user from whichever store is in use."""
+    if registry_migrated(connection):
+        return await catalog_snapshot(connection, user_id, db)
+    return legacy_snapshot(connection, user_id)
+
+
+async def write_snapshot(
+    connection: ProviderConnection, user_id: str, entry: dict, db: AsyncSession | None
+) -> None:
+    """Persist the candidate pool for a user in whichever store is in use."""
+    if registry_migrated(connection):
+        await store_catalog_snapshot(connection, user_id, entry, db)
+        return
+    config = dict(connection.config or {})
+    cache = dict(config.get('_models_by_user') or {})
+    cache[user_id] = entry
+    connection.config = {**config, '_models_by_user': cache}
+
+
+async def catalog_snapshot(connection: ProviderConnection, user_id: str | None, db: AsyncSession | None) -> dict:
+    """Read the candidate pool for a user, preferring the new snapshot table."""
+    if db is not None:
+        row = (
+            await db.scalars(
+                select(ProviderCatalogSnapshot).where(
+                    ProviderCatalogSnapshot.connection_id == connection.id,
+                    ProviderCatalogSnapshot.user_id == (user_id or connection.owner_id),
+                )
+            )
+        ).first()
+        if row is not None:
+            return {
+                'fingerprint': row.fingerprint or '',
+                'models': row.models if isinstance(row.models, list) else [],
+                'error': row.error,
+                'generation': row.generation or '',
+                'updated_at': row.updated_at or 0,
+            }
+    return legacy_snapshot(connection, user_id)
+
+
+async def store_catalog_snapshot(
+    connection: ProviderConnection, user_id: str, entry: dict, db: AsyncSession | None
+) -> None:
+    """Persist the candidate pool for a user."""
+    if db is None:
+        return
+    if not registry_migrated(connection):
+        return
+    existing = (
+        await db.scalars(
+            select(ProviderCatalogSnapshot).where(
+                ProviderCatalogSnapshot.connection_id == connection.id,
+                ProviderCatalogSnapshot.user_id == user_id,
+            )
+        )
+    ).first()
+    payload = {
+        'fingerprint': entry.get('fingerprint') or '',
+        'models': entry.get('models') if isinstance(entry.get('models'), list) else [],
+        'error': entry.get('error'),
+        'generation': entry.get('generation') or '',
+        'updated_at': entry.get('updated_at') or 0,
+    }
+    if existing is None:
+        db.add(
+            ProviderCatalogSnapshot(
+                id=str(uuid.uuid4()),
+                connection_id=connection.id,
+                user_id=user_id,
+                fingerprint=payload['fingerprint'],
+                models=payload['models'],
+                error=payload['error'],
+                generation=payload['generation'],
+                updated_at=payload['updated_at'],
+            )
+        )
+        return
+    existing.fingerprint = payload['fingerprint']
+    existing.models = payload['models']
+    existing.error = payload['error']
+    existing.generation = payload['generation']
+    existing.updated_at = payload['updated_at']
+
+
+async def connection_models(connection: ProviderConnection, db: AsyncSession | None = None) -> list[dict]:
+    """Return the curated whitelist of a connection.
+
+    A migrated connection is authoritative in `provider_model`: the catalog
+    refresh never adds rows on its own. A connection that has not been moved
+    yet keeps using the legacy payload, so a failed migration never hides
+    models from the user.
+    """
+    if db is not None and registry_migrated(connection):
+        rows = (
+            await db.scalars(
+                select(ProviderModel)
+                .where(ProviderModel.connection_id == connection.id)
+                .order_by(ProviderModel.sort_order, ProviderModel.created_at)
+            )
+        ).all()
+        return [normalize_whitelist_model(connection, _whitelist_row(row)) for row in rows]
+    return [normalize_model(connection, model) for model in connection.models or []]
+
+
+def _whitelist_row(row: ProviderModel) -> dict:
+    return {
+        # The stable id is what the chat selector and the saved switch use.
+        'id': stable_model_id(row.connection_id, row.upstream_id),
+        'upstream_id': row.upstream_id,
+        'display_name': row.display_name,
+        'uses': row.uses if isinstance(row.uses, dict) else {},
+        'enabled': bool(row.enabled),
+        'source': row.source,
+        'verification': row.verification if isinstance(row.verification, dict) else {},
+        'sort_order': row.sort_order,
+        'capabilities': row.capabilities if isinstance(row.capabilities, list) else [],
+        'features': row.features if isinstance(row.features, list) else [],
+        'model_info': row.model_info if isinstance(row.model_info, dict) else {},
+    }
+
+
+async def seed_connection_models(
+    connection: ProviderConnection,
+    upstream_ids: list,
+    db: AsyncSession,
+    *,
+    display_names: dict | None = None,
+    uses: dict | None = None,
+    source: str = 'provider',
+) -> list[str]:
+    """Create whitelist rows for the given upstream model ids.
+
+    Only the models the user picked end up in the whitelist; a catalog refresh
+    never calls this on its own.
+    """
+    now = int(time.time())
+    added = []
+    existing = {
+        row.upstream_id: row
+        for row in (
+            await db.scalars(select(ProviderModel).where(ProviderModel.connection_id == connection.id))
+        ).all()
+    }
+    order = len(existing)
+    for upstream_id in upstream_ids:
+        if not isinstance(upstream_id, str) or not upstream_id:
+            continue
+        row = existing.get(upstream_id)
+        if row is not None:
+            added.append(upstream_id)
+            continue
+        db.add(
+            ProviderModel(
+                id=str(uuid.uuid4()),
+                connection_id=connection.id,
+                upstream_id=upstream_id,
+                display_name=(display_names or {}).get(upstream_id) or upstream_id,
+                uses=dict(uses or {}),
+                capabilities=[],
+                features=[],
+                model_info={},
+                enabled=True,
+                source=source,
+                verification={},
+                sort_order=order,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        order += 1
+        added.append(upstream_id)
+    return added
+
+
+async def set_connection_model_enabled(
+    connection: ProviderConnection, upstream_id: str, enabled: bool, db: AsyncSession
+) -> bool:
+    """Toggle one curated model. Returns True when the whitelist table was used."""
+    if not registry_migrated(connection):
+        return False
+    row = (
+        await db.scalars(
+            select(ProviderModel).where(
+                ProviderModel.connection_id == connection.id,
+                ProviderModel.upstream_id == upstream_id,
+            )
+        )
+    ).first()
+    if row is None:
+        return False
+    row.enabled = bool(enabled)
+    row.updated_at = int(time.time())
+    return True
+
+
+async def set_connection_model_verification(
+    connection: ProviderConnection, upstream_id: str, purpose: str, result: dict, db: AsyncSession
+) -> bool:
+    """Store the outcome of one model test on the whitelist row."""
+    if not registry_migrated(connection):
+        return False
+    row = (
+        await db.scalars(
+            select(ProviderModel).where(
+                ProviderModel.connection_id == connection.id,
+                ProviderModel.upstream_id == upstream_id,
+            )
+        )
+    ).first()
+    if row is None:
+        return False
+    verification = dict(row.verification) if isinstance(row.verification, dict) else {}
+    verification[purpose] = result
+    row.verification = verification
+    row.updated_at = int(time.time())
+    return True
+
+
+async def set_connection_model_uses(
+    connection: ProviderConnection, upstream_id: str, uses: dict, db: AsyncSession
+) -> bool:
+    """Replace the purposes of one curated model."""
+    if not registry_migrated(connection):
+        return False
+    row = (
+        await db.scalars(
+            select(ProviderModel).where(
+                ProviderModel.connection_id == connection.id,
+                ProviderModel.upstream_id == upstream_id,
+            )
+        )
+    ).first()
+    if row is None:
+        return False
+    row.uses = dict(uses)
+    row.updated_at = int(time.time())
+    return True
+
+
+async def public_connection(connection: ProviderConnection, db: AsyncSession | None = None) -> dict:
     config = dict(connection.config or {})
     config = {key: value for key, value in config.items() if not key.startswith('_')}
     for key in ('host_id', 'client_id', 'subject', 'device_id'):
         config.pop(key, None)
+    snapshot = await catalog_snapshot(connection, connection.owner_id, db)
     return {
         'id': connection.id,
         'provider_id': connection.provider_id,
+        'provider_template': connection.provider_template or connection.provider_id,
+        'protocol': connection.protocol or 'openai-compatible',
+        'is_enabled': connection.is_enabled is not False,
         'name': connection.name,
         'auth_type': connection.auth_type,
         'visibility': connection.visibility,
         'owner_id': connection.owner_id,
         'config': config,
         'status': connection.status,
-        'models': [normalize_model(connection, model) for model in connection.models or []],
-        'catalog': catalog_status(connection),
+        'models': await connection_models(connection, db),
+        'catalog': catalog_status(connection, snapshot=snapshot),
         'configured': bool(connection.credential)
         or (connection.auth_type == 'oauth' and connection.status != 'disconnected'),
         'created_at': connection.created_at,
@@ -488,6 +756,8 @@ async def verify_provider_connection(connection: ProviderConnection, user) -> bo
 
 
 async def initialize_model_catalog(connection):
+    if registry_migrated(connection):
+        return
     if (connection.config or {}).get('_catalog_version'):
         return
     from open_webui.models.config import Config
@@ -530,9 +800,8 @@ def catalog_fingerprint(connection):
     ).hexdigest()
 
 
-def catalog_status(connection, user_id=None):
-    config = connection.config or {}
-    entry = config.get('_models_by_user', {}).get(user_id or connection.owner_id, {})
+def catalog_status(connection, user_id=None, snapshot=None):
+    entry = snapshot if isinstance(snapshot, dict) else legacy_snapshot(connection, user_id)
     if not isinstance(entry, dict):
         entry = {}
     valid = entry.get('fingerprint') == catalog_fingerprint(connection)
@@ -594,13 +863,13 @@ async def catalog_lease(connection_id, user_id, db):
 
 
 async def refresh_connection_catalog(connection, user, db):
-    generation = (connection.config or {}).get('_models_by_user', {}).get(user.id) or {}
-    generation = generation.get('generation') if isinstance(generation, dict) else None
+    entry = await read_snapshot(connection, user.id, db)
+    generation = entry.get('generation') if isinstance(entry, dict) else None
     lock = _catalog_locks.setdefault(connection.id, asyncio.Lock())
     async with lock, catalog_lease(connection.id, 'catalog', db) as acquired:
         if isinstance(db, AsyncSession):
             await db.refresh(connection)
-        entry = (connection.config or {}).get('_models_by_user', {}).get(user.id, {})
+        entry = await read_snapshot(connection, user.id, db)
         if not acquired or (
             isinstance(entry, dict)
             and entry.get('generation') != generation
@@ -619,8 +888,7 @@ async def refresh_connection_catalog(connection, user, db):
 async def _refresh_connection_catalog(connection, user, db):
     await initialize_model_catalog(connection)
     stamp = catalog_fingerprint(connection)
-    cache = dict((connection.config or {}).get('_models_by_user') or {})
-    previous = cache.get(user.id, {})
+    previous = await read_snapshot(connection, user.id, db)
     previous = previous if isinstance(previous, dict) and previous.get('fingerprint') == stamp else {}
     try:
         models = await discover_connection_models(connection, user)
@@ -629,9 +897,7 @@ async def _refresh_connection_catalog(connection, user, db):
             await db.refresh(connection)
             if catalog_fingerprint(connection) != stamp:
                 raise HTTPException(409, 'Connection changed during refresh') from None
-            cache = dict((connection.config or {}).get('_models_by_user') or {})
-        cache[user.id] = {**previous, 'fingerprint': stamp, 'error': catalog_error(exc)}
-        connection.config = {**(connection.config or {}), '_models_by_user': cache}
+        await write_snapshot(connection, user.id, {**previous, 'fingerprint': stamp, 'error': catalog_error(exc)}, db)
         await db.commit()
         raise
     if isinstance(db, AsyncSession):
@@ -642,13 +908,30 @@ async def _refresh_connection_catalog(connection, user, db):
             or not await can_access_connection(connection, user, db)
         ):
             raise HTTPException(409, 'Connection changed during refresh; fetch the catalog again')
-        cache = dict((connection.config or {}).get('_models_by_user') or {})
     discovery_error = next((m.get('catalog_error') for m in models if m.get('catalog_error')), None)
     if discovery_error and previous.get('models'):
-        cache[user.id] = {**previous, 'error': discovery_error}
-        connection.config = {**(connection.config or {}), '_models_by_user': cache}
+        await write_snapshot(connection, user.id, {**previous, 'error': discovery_error}, db)
         await db.commit()
         return [normalize_model(connection, m) for m in previous['models']]
+    if registry_migrated(connection):
+        # The catalog is a candidate pool only. The curated whitelist is never
+        # changed by a refresh, so newly published models stay out until the
+        # user picks them.
+        await write_snapshot(
+            connection,
+            user.id,
+            {
+                'fingerprint': stamp,
+                'models': models,
+                'updated_at': 0 if discovery_error else int(time.time()),
+                'generation': str(uuid.uuid4()),
+                'error': discovery_error,
+            },
+            db,
+        )
+        connection.status = 'configured' if discovery_error else 'connected'
+        await db.commit()
+        return models
     config = dict(connection.config or {})
     enabled = dict(config.get('_model_enabled', {}))
     old_ids = {m['upstream_id'] for m in connection.models or []}
@@ -663,14 +946,19 @@ async def _refresh_connection_catalog(connection, user, db):
         for m in connection.models or []
         if m['upstream_id'] not in found and m['upstream_id'] in config.get('_model_overrides', {})
     )
-    cache[user.id] = {
-        'fingerprint': stamp,
-        'models': models,
-        'updated_at': 0 if discovery_error else int(time.time()),
-        'generation': str(uuid.uuid4()),
-        'error': discovery_error,
-    }
-    connection.config = {**config, '_model_enabled': enabled, '_models_by_user': cache}
+    await write_snapshot(
+        connection,
+        user.id,
+        {
+            'fingerprint': stamp,
+            'models': models,
+            'updated_at': 0 if discovery_error else int(time.time()),
+            'generation': str(uuid.uuid4()),
+            'error': discovery_error,
+        },
+        db,
+    )
+    connection.config = {**config, '_model_enabled': enabled}
     connection.models = models
     connection.status = 'configured' if discovery_error else 'connected'
     await db.commit()
@@ -692,10 +980,33 @@ async def _refresh_catalog_background(connection_id, user, expected):
         log.info('Provider catalog background refresh failed for %s', connection_id)
 
 
+def _schedule_catalog_refresh(connection: ProviderConnection, user, stamp: str) -> None:
+    """Refresh the candidate pool in the background, coalesced per connection."""
+    key = (connection.id, user.id)
+    if key not in _catalog_refresh_tasks or _catalog_refresh_tasks[key].done():
+        task = asyncio.create_task(_refresh_catalog_background(connection.id, user, stamp))
+        _catalog_refresh_tasks[key] = task
+        task.add_done_callback(
+            lambda done: (
+                _catalog_refresh_tasks.pop(key, None) if _catalog_refresh_tasks.get(key) is done else None
+            )
+        )
+
+
 async def visible_connection_models(connection: ProviderConnection, user, db: AsyncSession) -> list[dict]:
     if connection.status == 'disconnected' or not connection.credential:
         return []
     await initialize_model_catalog(connection)
+    if registry_migrated(connection):
+        # The curated whitelist decides what is offered. The catalog is only a
+        # candidate pool and is refreshed in the background.
+        entry = await read_snapshot(connection, user.id, db)
+        stamp = catalog_fingerprint(connection)
+        fresh = isinstance(entry, dict) and entry.get('fingerprint') == stamp and isinstance(entry.get('models'), list)
+        age = time.time() - max(entry.get('updated_at', 0), (entry.get('error') or {}).get('at', 0))
+        if not fresh or age >= CATALOG_TTL:
+            _schedule_catalog_refresh(connection, user, stamp)
+        return await connection_models(connection, db)
     entry = (connection.config or {}).get('_models_by_user', {}).get(user.id, {})
     stamp = catalog_fingerprint(connection)
     legacy_hash = hashlib.sha256((connection.credential or '').encode()).hexdigest()
@@ -720,15 +1031,7 @@ async def visible_connection_models(connection: ProviderConnection, user, db: As
         entry = snapshot
     if isinstance(entry, dict) and entry.get('fingerprint') == stamp and isinstance(entry.get('models'), list):
         if time.time() - max(entry.get('updated_at', 0), (entry.get('error') or {}).get('at', 0)) >= CATALOG_TTL:
-            key = (connection.id, user.id)
-            if key not in _catalog_refresh_tasks or _catalog_refresh_tasks[key].done():
-                task = asyncio.create_task(_refresh_catalog_background(connection.id, user, stamp))
-                _catalog_refresh_tasks[key] = task
-                task.add_done_callback(
-                    lambda done: (
-                        _catalog_refresh_tasks.pop(key, None) if _catalog_refresh_tasks.get(key) is done else None
-                    )
-                )
+            _schedule_catalog_refresh(connection, user, stamp)
         return [normalize_model(connection, model) for model in entry['models']]
     # Upgrade existing owner catalogs without a network dependency. Other users
     # never inherit an owner's per-user discovery snapshot.
@@ -755,8 +1058,11 @@ async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
     disabled_ids = await disabled_provider_model_ids(db)
     result = []
     for connection in connections:
+        if connection.is_enabled is False:
+            continue
         if await can_access_connection(connection, user, db):
             try:
+                snapshot = await catalog_snapshot(connection, user.id, db)
                 result.extend(
                     {
                         **model,
@@ -766,7 +1072,7 @@ async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
                         'connection_type': 'external',
                         'provider_visibility': connection.visibility,
                         'connection_name': connection.name,
-                        'catalog': catalog_status(connection, user.id),
+                        'catalog': catalog_status(connection, user.id, snapshot),
                         'info': {
                             'meta': {
                                 'capabilities': {
@@ -840,9 +1146,13 @@ async def _resolve_model(model_id: str, user, db: AsyncSession, allow_disabled=F
     connection_id, upstream_id = parse_model_id(model_id)
     connection = await db.get(ProviderConnection, connection_id)
     await require_connection_access(connection, user, db)
-    if not connection.is_active or (not allow_disabled and model_id in await disabled_provider_model_ids(db)):
+    if (
+        not connection.is_active
+        or connection.is_enabled is False
+        or (not allow_disabled and model_id in await disabled_provider_model_ids(db))
+    ):
         raise HTTPException(404, 'Provider model not found')
-    error = catalog_status(connection, user.id).get('error')
+    error = catalog_status(connection, user.id, await catalog_snapshot(connection, user.id, db)).get('error')
     if error and error['category'] == 'authentication':
         raise HTTPException(401, 'Provider authentication failed; refresh after correcting credentials')
     available = await visible_connection_models(connection, user, db)
@@ -1248,7 +1558,11 @@ async def resolve_media_model(model_id, user, purpose, db=None, *, allow_disable
         connection_id, upstream_id = parse_model_id(model_id)
         connection = await session.get(ProviderConnection, connection_id)
         await require_connection_access(connection, user, session)
-        if not connection.is_active or (not allow_disabled and model_id in await disabled_provider_model_ids(session)):
+        if (
+            not connection.is_active
+            or connection.is_enabled is False
+            or (not allow_disabled and model_id in await disabled_provider_model_ids(session))
+        ):
             raise HTTPException(404, 'Provider model not found')
         if connection.auth_type != 'api_key':
             raise HTTPException(400, 'This connection does not support media API calls')
@@ -1282,11 +1596,12 @@ async def visible_catalog_statuses(user, db=None):
             await session.scalars(select(ProviderConnection).where(ProviderConnection.is_active.is_(True)))
         ).all():
             if await can_access_connection(connection, user, session):
+                snapshot = await catalog_snapshot(connection, user.id, session)
                 result.append(
                     {
                         'connection_id': connection.id,
                         'connection_name': connection.name,
-                        **catalog_status(connection, user.id),
+                        **catalog_status(connection, user.id, snapshot),
                     }
                 )
         return result

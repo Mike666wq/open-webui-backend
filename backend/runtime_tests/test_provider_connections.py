@@ -243,7 +243,7 @@ class ProviderConnectionTests(unittest.IsolatedAsyncioTestCase):
         db.commit.assert_awaited_once()
 
     async def test_credential_ciphertext_is_never_in_public_connection_shape(self):
-        safe = providers.public_connection(self.connection)
+        safe = await providers.public_connection(self.connection)
         self.assertNotIn('credential', safe)
         self.assertNotIn('secret-value', repr(safe))
         self.assertNotEqual(self.connection.credential, 'secret-value')
