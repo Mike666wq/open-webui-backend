@@ -77,3 +77,20 @@
 契约见 [接口契约](PROVIDER_CONTRACT.md)，恢复步骤见 [恢复手册](PROVIDER_RECOVERY.md)。
 
 自动化覆盖错误分类与阶段、目录鉴权错误下白名单模型仍可用、真实请求仍鉴权、禁用模型仍被拒、拉取失败后白名单数据不变、重新登录更新原连接。CI 使用合成凭据与模拟厂商，**不访问**真实厂商。生产网络命名空间里的 DNS / 代理取证、放行网段后的真实连通、真实 ChatGPT 授权与真实推理**尚未验证**，需要部署责任人执行。
+
+### 本轮发布记录（2026-10-27）
+
+| 产物 | 标识 | 校验 |
+|---|---|---|
+| 后端合并 | PR #19 squash 合并 | commit `f321ad5ae276b8d2f55bda9584d861a5cedf8013` |
+| 前端锁提交 | `chore: consume verified frontend ba1105d168cb` | commit `6d74e75` |
+| 前端发布 | `frontend-ba1105d168cb` | `sourceCommit=ba1105d168cbe87b58fb9149c45f84d5d1c97fde` |
+| `open-webui-frontend.zip` | 103,071,206 B | SHA256 `6116d8a6e49b270e99a21c14cd262c709bd5c0de56c694d23d8224ab23fa0cc6` |
+| `frontend-manifest.json` | 1,140,050 B | SHA256 `e56096b710db5e163f50912444c03a33628cdc980ed5434947622fa814573bb0` |
+| 后端镜像 | `ghcr.io/mike666wq/open-webui-backend@sha256:d99cc7279f4ffe1b44291ef2823551e166a941cc530f6d77a4d33cdd6b977590` | 源码 `6d74e75`，内嵌前端 `ba1105d168cb`，平台 `linux/amd64` + `linux/arm64`；`:latest` 指向同一 digest |
+
+来源 run：[`40539159787`](https://github.com/Mike666wq/open-webui-backend/actions/runs/40539159787)（`checks` ✓ 含 `sync_frontend.py --check` 锁新鲜度校验 / `resource lifecycle tests` ✓ / `build, smoke and publish image` ✓）。`frontend.lock.json` 在 `6d74e75` 上锁定的 `sourceCommit` 与两个 SHA-256 与前端发布产物逐字一致。
+
+上游基线未变：Open WebUI `0.12.2` @ `6a18585ff4c2e5f6805f682222cfbc46dc669ef8`。
+
+线上 CI 证明的是自动化检查通过，**不等于**生产已部署，也不等于真实厂商凭据下的推理已验证。
