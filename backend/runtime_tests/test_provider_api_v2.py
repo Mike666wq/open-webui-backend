@@ -104,6 +104,47 @@ class ProviderApiV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload['error']['category'], 'authentication')
         self.assertEqual(payload['error']['status'], 401)
 
+    async def test_a_failed_verification_keeps_the_taxonomy_in_the_response(self):
+        """A2: the browser needs the stage, the reason and the action."""
+        self.mock.side_effect = providers.provider_http_error(403, stage='catalog')
+        response = await self.client.post(
+            f'/providers/connections/{self.connection.id}/verify',
+        )
+        payload = response.json()
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(payload['error']['category'], 'authentication')
+        self.assertEqual(payload['error']['reason'], 'insufficient_permissions')
+        self.assertEqual(payload['error']['suggested_action'], 'check_permissions')
+        self.assertEqual(payload['error']['stage'], 'catalog')
+        self.assertTrue(payload['detail'])
+
+    async def test_the_wizard_verification_keeps_the_taxonomy_in_the_response(self):
+        """The add-provider wizard needs the same fields as the saved connection."""
+        self.mock.side_effect = providers.provider_http_error(403, stage='catalog')
+        response = await self.client.post(
+            '/providers/connections/verify',
+            json={
+                'provider_template': 'deepseek',
+                'name': 'Synthetic',
+                'auth_type': 'api_key',
+                'api_key': 'synthetic-key',
+                'config': {'base_url': 'https://api.deepseek.com/v1'},
+            },
+        )
+        payload = response.json()
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(payload['error']['category'], 'authentication')
+        self.assertEqual(payload['error']['reason'], 'insufficient_permissions')
+        self.assertEqual(payload['error']['suggested_action'], 'check_permissions')
+
+    async def test_a_validation_failure_is_not_dressed_up_as_a_provider_error(self):
+        response = await self.client.post(
+            '/providers/connections/verify',
+            json={'provider_template': 'deepseek', 'name': 'Synthetic'},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertNotIn('error', response.json())
+
     async def test_added_models_become_the_whitelist(self):
         await self.client.post(f'/providers/connections/{self.connection.id}/models/fetch')
         response = await self.client.post(

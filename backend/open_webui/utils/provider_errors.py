@@ -222,6 +222,38 @@ def build_error(
     }
 
 
+def is_provider_error(exc) -> bool:
+    """True when the exception carries the provider taxonomy.
+
+    A plain `HTTPException` from the request validation or the access checks
+    does not: it must keep its own shape and must not be dressed up as a
+    provider failure.
+    """
+    if getattr(exc, 'provider_category', None) is not None:
+        return True
+    return getattr(exc, 'category', None) in CATEGORIES
+
+
+def provider_error_response(exc, *, status_code: int | None = None):
+    """Render a provider failure so the client keeps the taxonomy.
+
+    FastAPI's default handler answers `{"detail": ...}` and nothing else, so
+    the stage, the reason and the suggested action never reach the browser.
+    The client needs them to offer a recovery entry instead of a bare
+    message, so the payload travels next to the detail.
+    """
+    from fastapi.responses import JSONResponse
+
+    error = error_from_exception(exc)
+    detail = getattr(exc, 'detail', None)
+    if not isinstance(detail, str) or not detail.strip():
+        detail = error['hint']
+    return JSONResponse(
+        status_code=status_code if status_code is not None else error['http_status'],
+        content={'detail': detail, 'error': error},
+    )
+
+
 def error_from_exception(exc) -> dict:
     """Translate any provider failure into the five-category payload.
 
