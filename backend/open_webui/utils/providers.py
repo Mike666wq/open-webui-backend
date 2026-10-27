@@ -50,41 +50,14 @@ from open_webui.utils.provider_http import (
     allowed_ip_networks,
     provider_request_json,
 )
+from open_webui.utils.provider_registry import default_base_urls, public_templates
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
 
-PROVIDER_CATALOG = [
-    {
-        'id': 'siliconflow',
-        'name': 'SiliconFlow',
-        'auth_types': ['api_key'],
-        'default_base_url': 'https://api.siliconflow.cn/v1',
-    },
-    {'id': 'openai', 'name': 'OpenAI', 'auth_types': ['api_key'], 'default_base_url': 'https://api.openai.com/v1'},
-    {
-        'id': 'deepseek',
-        'name': 'DeepSeek',
-        'auth_types': ['api_key'],
-        'default_base_url': 'https://api.deepseek.com/v1',
-    },
-    {
-        'id': 'bailian',
-        'name': 'Bailian',
-        'auth_types': ['api_key'],
-        'default_base_url': 'https://dashscope.aliyuncs.com/compatible-mode/v1',
-    },
-    {'id': 'custom', 'name': 'New API / OpenAI-compatible', 'auth_types': ['api_key'], 'default_base_url': ''},
-    {'id': 'chatgpt', 'name': 'ChatGPT', 'auth_types': ['oauth'], 'default_base_url': ''},
-    {
-        'id': 'kimi',
-        'name': 'Kimi Code',
-        'auth_types': ['oauth'],
-        'default_base_url': 'https://api.kimi.com/coding/v1',
-    },
-]
-_DEFAULTS = {entry['id']: entry['default_base_url'] for entry in PROVIDER_CATALOG}
+PROVIDER_CATALOG = public_templates()
+_DEFAULTS = default_base_urls()
 _BAILIAN_REGIONS = {
     'cn-beijing': 'dashscope.aliyuncs.com',
     'ap-southeast-1': 'dashscope-intl.aliyuncs.com',
@@ -172,7 +145,7 @@ async def write_snapshot(
 
 async def catalog_snapshot(connection: ProviderConnection, user_id: str | None, db: AsyncSession | None) -> dict:
     """Read the candidate pool for a user, preferring the new snapshot table."""
-    if db is not None:
+    if isinstance(db, AsyncSession):
         row = (
             await db.scalars(
                 select(ProviderCatalogSnapshot).where(
@@ -196,7 +169,7 @@ async def store_catalog_snapshot(
     connection: ProviderConnection, user_id: str, entry: dict, db: AsyncSession | None
 ) -> None:
     """Persist the candidate pool for a user."""
-    if db is None:
+    if not isinstance(db, AsyncSession):
         return
     if not registry_migrated(connection):
         return
@@ -244,7 +217,7 @@ async def connection_models(connection: ProviderConnection, db: AsyncSession | N
     yet keeps using the legacy payload, so a failed migration never hides
     models from the user.
     """
-    if db is not None and registry_migrated(connection):
+    if isinstance(db, AsyncSession) and registry_migrated(connection):
         rows = (
             await db.scalars(
                 select(ProviderModel)
@@ -281,13 +254,20 @@ async def seed_connection_models(
     display_names: dict | None = None,
     uses: dict | None = None,
     source: str = 'provider',
+    user_id: str | None = None,
 ) -> list[str]:
     """Create whitelist rows for the given upstream model ids.
 
     Only the models the user picked end up in the whitelist; a catalog refresh
-    never calls this on its own.
+    never calls this on its own. The purposes are taken from the candidate
+    pool unless the caller states them.
     """
     now = int(time.time())
+    candidates = {}
+    snapshot = await read_snapshot(connection, user_id or connection.owner_id, db)
+    for candidate in snapshot.get('models') or []:
+        if isinstance(candidate, dict) and candidate.get('upstream_id'):
+            candidates[candidate['upstream_id']] = candidate
     added = []
     existing = {
         row.upstream_id: row
@@ -303,13 +283,19 @@ async def seed_connection_models(
         if row is not None:
             added.append(upstream_id)
             continue
+        candidate = candidates.get(upstream_id) or {}
+        resolved_uses = uses if uses is not None else (candidate.get('uses') or {})
+        if not resolved_uses:
+            resolved_uses = {'chat': 'openai-chat'}
         db.add(
             ProviderModel(
                 id=str(uuid.uuid4()),
                 connection_id=connection.id,
                 upstream_id=upstream_id,
-                display_name=(display_names or {}).get(upstream_id) or upstream_id,
-                uses=dict(uses or {}),
+                display_name=(display_names or {}).get(upstream_id)
+                or candidate.get('name')
+                or upstream_id,
+                uses=dict(resolved_uses),
                 capabilities=[],
                 features=[],
                 model_info={},
@@ -330,7 +316,7 @@ async def set_connection_model_enabled(
     connection: ProviderConnection, upstream_id: str, enabled: bool, db: AsyncSession
 ) -> bool:
     """Toggle one curated model. Returns True when the whitelist table was used."""
-    if not registry_migrated(connection):
+    if not registry_migrated(connection) or not isinstance(db, AsyncSession):
         return False
     row = (
         await db.scalars(
@@ -351,7 +337,7 @@ async def set_connection_model_verification(
     connection: ProviderConnection, upstream_id: str, purpose: str, result: dict, db: AsyncSession
 ) -> bool:
     """Store the outcome of one model test on the whitelist row."""
-    if not registry_migrated(connection):
+    if not registry_migrated(connection) or not isinstance(db, AsyncSession):
         return False
     row = (
         await db.scalars(
@@ -374,7 +360,7 @@ async def set_connection_model_uses(
     connection: ProviderConnection, upstream_id: str, uses: dict, db: AsyncSession
 ) -> bool:
     """Replace the purposes of one curated model."""
-    if not registry_migrated(connection):
+    if not registry_migrated(connection) or not isinstance(db, AsyncSession):
         return False
     row = (
         await db.scalars(
@@ -958,7 +944,8 @@ async def _refresh_connection_catalog(connection, user, db):
         },
         db,
     )
-    connection.config = {**config, '_model_enabled': enabled}
+    # Keep the snapshot that was just written; only the enabled map changes.
+    connection.config = {**(connection.config or {}), '_model_enabled': enabled}
     connection.models = models
     connection.status = 'configured' if discovery_error else 'connected'
     await db.commit()

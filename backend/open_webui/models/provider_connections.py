@@ -37,7 +37,11 @@ class ProviderConnection(Base):
 
 
 class ProviderConnectionCreate(BaseModel):
-    provider_id: Literal['openai', 'deepseek', 'bailian', 'custom', 'chatgpt', 'kimi', 'siliconflow']
+    # The provider template id. `provider_template` is the preferred field name;
+    # `provider_id` stays accepted for older clients.
+    provider_id: str = Field(default='custom', min_length=1, max_length=64)
+    provider_template: str | None = Field(default=None, min_length=1, max_length=64)
+    protocol: str | None = Field(default=None, min_length=1, max_length=64)
     name: str = Field(min_length=1, max_length=100)
     auth_type: Literal['api_key', 'oauth'] = 'api_key'
     visibility: Literal['private', 'shared'] = 'private'

@@ -20,6 +20,7 @@ from open_webui.models.provider_connections import (
 from open_webui.routers import providers as api
 from open_webui.utils import providers
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.provider_capabilities import fingerprint
 from sqlalchemy import delete, select
 
 
@@ -156,8 +157,14 @@ class ProviderRegistryV2Tests(unittest.IsolatedAsyncioTestCase):
         await self.seed('picked-model')
         async with get_async_db_context() as db:
             await providers.set_connection_model_uses(self.connection, 'picked-model', {'image': 'openai-image'}, db)
+            connection = await db.get(ProviderConnection, self.connection.id)
+            expected = fingerprint(connection, {'upstream_id': 'picked-model', 'uses': {'image': 'openai-image'}})
             await providers.set_connection_model_verification(
-                self.connection, 'picked-model', 'image', {'status': 'passed', 'tested_at': 1}, db
+                self.connection,
+                'picked-model',
+                'image',
+                {'status': 'passed', 'tested_at': 1, 'fingerprint': expected},
+                db,
             )
             await db.commit()
         models = await self.whitelist()
