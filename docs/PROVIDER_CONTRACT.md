@@ -68,13 +68,48 @@
 	"upstream_status": null,
 	"retryable": true,
 	"at": 1793081473,
-	"hint": "DNS 把 api.openai.com 解析到 198.18.0.27（保留网段，可能是代理 fake-ip），已被安全策略拦截。"
+	"hint": "连接被服务器的安全策略拦截，请检查地址解析结果与代理配置。",
+	"stage": "catalog",
+	"reason": "address_blocked",
+	"suggested_action": "check_server_network"
 }
 ```
 
 - `hint` 是**可直接展示的中文短句**，由后端产出；前端只渲染，不自行拼装。
 - `status` = `upstream_status or http_status`。
 - `upstream_status` 只有在上游真的返回了非 2xx 时才有值；本地网关错误（502）**不算**上游错误。
+
+### 4.1 阶段、原因与建议动作
+
+三个**新增可选字段**，与既有字段并存。旧客户端只读 `category/status/hint`，行为不变。
+
+| 字段               | 取值                                                                                                                                                                                                       | 含义             |
+| ------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------- |
+| `stage`            | `catalog` / `oauth_refresh` / `inference`                                                                                                                                                                  | 失败发生在哪一步 |
+| `reason`           | `invalid_credentials` / `token_expired` / `insufficient_permissions` / `rate_limited` / `quota_exhausted` / `address_blocked` / `dns_failure` / `tls_failure` / `timeout` / `upstream_failure` / `unknown` | 为什么失败       |
+| `suggested_action` | `reconnect` / `replace_key` / `check_permissions` / `check_server_network` / `retry_later` / `inspect_connection`                                                                                          | 运维下一步做什么 |
+
+硬性约束：
+
+- **阶段语义**：目录调用内部发生的 OAuth 刷新失败标 `oauth_refresh`，不标 `catalog`；推理失败标 `inference`。
+- **未知不得伪装**：证据不足时 `reason` 用 `unknown`；**不得**把所有 403 说成凭据失效（403 = `insufficient_permissions`，动作 `check_permissions`）。
+- **本地拦截**的 `upstream_status` 必须是 `null`。
+- **动作必须匹配认证方式**：OAuth 连接给 `reconnect`，API Key 连接给 `replace_key`；403 一律 `check_permissions`。
+- 旧错误对象（只有 `category`）前端**必须**能显示：按 category 回退出 reason / action / 摘要。
+
+### 4.2 HTTP 错误响应
+
+FastAPI 的默认处理器只回 `{"detail": ...}`，会把三个新字段丢掉。厂商类错误的 HTTP 响应统一为：
+
+```json
+{
+	"detail": "Provider rejected the configured credentials or permissions",
+	"error": { "category": "authentication", "reason": "insufficient_permissions", "...": "..." }
+}
+```
+
+- 只有**真正的厂商错误**才带 `error`；参数校验、权限校验、找不到连接等仍然只回 `detail`，**不得**被包装成厂商错误。
+- `GET /api/models` 的 `catalogs[]` 里每个连接的 `error` 同结构。
 
 ---
 
@@ -84,7 +119,9 @@
 - **不得**修改上游文件 `open_webui/utils/apps.py`。
 - 默认严格拒绝私网 / 回环 / 链路本地 / 组播 / 保留段（含 RFC 2544 `198.18.0.0/15`）。
 - 需要放行代理 fake-ip 段时，部署方显式设置 `PROVIDER_ALLOWED_IP_RANGES=198.18.0.0/15`（逗号分隔 CIDR，默认空 = 不放行）。
-- 被拦截时**必须**归类为 `provider_network`，并在 `hint` 中写明解析到的地址与放行方式，**不得**折叠成 `network`。
+- 被拦截时**必须**归类为 `provider_network`，`reason=address_blocked`，动作 `check_server_network`，`upstream_status` 为 `null`，**不得**折叠成 `network`。
+- 恢复步骤（两条路线、前提、验证与回滚）见 `docs/PROVIDER_RECOVERY.md`。放行网段**只**解除本地拦截，**不**保证代理接管、登录成功或模型调用成功。
+- `trust_env=False`：只设置宿主机 `HTTP_PROXY` / `HTTPS_PROXY` **不**构成可用代理。需要显式代理契约时按升级件处理，**不得**静默开启全局环境代理。
 
 ---
 
@@ -189,7 +226,7 @@ GET /connections/{id}/models
     "data": [
       {
         "upstream_id": "gpt-4o",
-        "name": "GPT-4o",
+        "display_name": "GPT-4o",
         "uses": { "chat": "openai-chat" },
         "enabled": true,
         "source": "provider",
@@ -261,7 +298,23 @@ provider_model 中该连接的记录非空 → 用新表
 
 ---
 
-## 9. 前端术语对照（强制）
+## 9. 恢复入口（前端强制）
+
+失败必须**按连接**呈现，并且给出可执行的入口。
+
+| 位置               | 必须有                                  | 禁止                                 |
+| ------------------ | --------------------------------------- | ------------------------------------ |
+| 模型选择器         | 按连接的短摘要 + 可达的「查看连接」操作 | 把长错误整段堆在模型列表上方         |
+| 连接详情           | 短摘要 + 建议动作按钮 + 可展开的长说明  | 只有一句笼统的失败提示               |
+| 连接详情（管理员） | 部署说明：DNS / 代理核查与两条恢复路线  | 把环境变量与配置文件路径写给普通用户 |
+| 普通用户           | 权限适当的提示 + 自己能执行的恢复       | 泄露部署细节或他人连接               |
+
+- 短摘要由 `stage` + `reason` 组成（例如「获取模型列表时地址被本地安全策略拦截」），长说明取 `hint`。
+- 「查看连接」必须跳到该连接并选中它，不能只打开一个泛化页面。
+- 模型选择器里的告警**不得**挤掉搜索框与模型操作；多连接失败时每个连接各自可点。
+- 重新登录**沿用原连接**（`connection_id`），不得新建第二个连接；换 Key 不得清空白名单、改名、用途、启停与稳定 ID。
+
+## 10. 前端术语对照（强制）
 
 | 禁止出现                                  | 必须使用                                 |
 | ----------------------------------------- | ---------------------------------------- |
