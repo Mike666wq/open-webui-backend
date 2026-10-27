@@ -159,7 +159,7 @@ POST /connections
 }
 ```
 
-`provider_template` 必须存在于模板目录且 `supported=true`，否则 400。
+`provider_template` 必须存在于模板目录且 `supported=true`，否则 400。旧客户端仍可传 `provider_id`，其值按模板 id 解析。
 
 ```
 PUT /connections/{id}/enabled
@@ -181,7 +181,7 @@ POST /connections/{id}/models/fetch
   }
 ```
 
-**纯读取**：不落库、不改变白名单、不改变任何模型状态。失败时 `candidates` 为空数组，`error` 为五类错误对象。
+只写入**候选池快照**（`provider_catalog_snapshot`），**不改变白名单、不改变任何模型状态**。失败时 `candidates` 为空数组，`error` 为五类错误对象。
 
 ```
 GET /connections/{id}/models
@@ -189,7 +189,7 @@ GET /connections/{id}/models
     "data": [
       {
         "upstream_id": "gpt-4o",
-        "display_name": "GPT-4o",
+        "name": "GPT-4o",
         "uses": { "chat": "openai-chat" },
         "enabled": true,
         "source": "provider",

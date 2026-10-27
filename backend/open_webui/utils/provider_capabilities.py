@@ -42,6 +42,58 @@ def fingerprint(connection, model):
     ).hexdigest()
 
 
+def public_verification(connection, model, uses, stored):
+    """Expose verification results without the credential-derived fingerprint.
+
+    A stored result is only trusted while its fingerprint still matches the
+    current endpoint, credential and purposes.
+    """
+    stored = stored if isinstance(stored, dict) else {}
+    result = {}
+    for use in uses:
+        entry = stored.get(use)
+        if not isinstance(entry, dict):
+            result[use] = {'status': 'untested'}
+            continue
+        if entry.get('fingerprint') != fingerprint(connection, model):
+            result[use] = {'status': 'untested'}
+            continue
+        result[use] = {key: value for key, value in entry.items() if key != 'fingerprint'}
+    return result
+
+
+def normalize_whitelist_model(connection, row):
+    """Build the public shape of a curated whitelist entry."""
+    upstream = row['upstream_id']
+    uses = dict(row.get('uses') or {})
+    if connection.auth_type == 'oauth':
+        uses = {'chat': uses.get('chat', 'openai-chat')}
+    source = row.get('source') or 'provider'
+    model = {
+        'id': row.get('id') or f'provider:{connection.id}:{upstream}',
+        'name': row.get('display_name') or upstream,
+        'upstream_id': upstream,
+        'provider_id': connection.provider_id,
+        'connection_id': connection.id,
+        'capabilities': row.get('capabilities') or [],
+        'uses': uses,
+        'features': row.get('features') or [],
+        'model_info': row.get('model_info') or {},
+    }
+    result = {
+        **model,
+        'capability_source': 'unknown' if not uses else ('manual' if source == 'manual' else 'provider'),
+        'enabled': bool(row.get('enabled', True)),
+        'source': source,
+    }
+    if provider_family(connection) == 'siliconflow' and 'speech' in uses:
+        result['voice_options'] = [
+            {'id': f'{upstream}:{voice}', 'name': voice} for voice in SILICONFLOW_PRESET_VOICES
+        ]
+    result['verification'] = public_verification(connection, model, uses, row.get('verification') or {})
+    return result
+
+
 def normalize_model(connection, model):
     config = connection.config or {}
     upstream = model['upstream_id']
@@ -89,12 +141,5 @@ def normalize_model(connection, model):
             {'id': f'{upstream}:{voice}', 'name': voice} for voice in SILICONFLOW_PRESET_VOICES
         ]
     test = config.get('_model_tests', {}).get(upstream, {})
-    result['verification'] = {
-        use: (
-            {k: v for k, v in test.get(use, {}).items() if k != 'fingerprint'}
-            if test.get(use, {}).get('fingerprint') == fingerprint(connection, result)
-            else {'status': 'untested'}
-        )
-        for use in uses
-    }
+    result['verification'] = public_verification(connection, result, uses, test)
     return result

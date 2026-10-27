@@ -2,6 +2,7 @@
 
 import re
 import time
+import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from open_webui.internal.db import get_async_session
@@ -14,20 +15,29 @@ from open_webui.models.provider_connections import (
 )
 from open_webui.utils.apps import validate_app_url
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.provider_capabilities import ADAPTERS, normalize_model, provider_family
+from open_webui.utils.provider_capabilities import ADAPTERS, provider_family
+from open_webui.utils.provider_errors import ProviderRequestError
+from open_webui.utils.provider_registry import GROUPS, require_supported_template
 from open_webui.utils.providers import (
     PROVIDER_CATALOG,
     can_access_connection,
+    catalog_error,
+    catalog_fingerprint,
+    catalog_snapshot,
     catalog_status,
+    connection_models,
     discover_connection_models,
     encrypt_credential,
     initialize_model_catalog,
     legacy_model_access,
     public_connection,
     refresh_connection_catalog,
+    registry_migrated,
     require_connection_access,
+    seed_connection_models,
     verify_provider_connection,
     visible_catalog_statuses,
+    write_snapshot,
 )
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -39,11 +49,28 @@ _BAILIAN_WORKSPACE_LABEL = re.compile(r'^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z
 router = APIRouter()
 
 
+def _template_for(form: ProviderConnectionCreate) -> dict:
+    """Resolve the provider template of a create request.
+
+    A template this release cannot talk to is refused outright; the platform
+    never falls back to the OpenAI protocol for it.
+    """
+    template_id = form.provider_template or form.provider_id
+    try:
+        template = require_supported_template(template_id)
+    except ProviderRequestError as exc:
+        raise HTTPException(400, exc.detail) from None
+    if form.protocol and form.protocol != template['protocol']:
+        raise HTTPException(400, f'{template["name"]} uses the {template["protocol"]} protocol')
+    return template
+
+
 def _validate_form(form: ProviderConnectionCreate, user):
+    template = _template_for(form)
     if form.visibility == 'shared' and user.role != 'admin':
         raise HTTPException(403, 'Only administrators can create shared provider connections')
-    if form.provider_id in ('chatgpt', 'kimi'):
-        raise HTTPException(400, f'Connect {form.provider_id} through its OAuth sign-in flow')
+    if template['id'] in ('chatgpt', 'kimi'):
+        raise HTTPException(400, f'Connect {template["id"]} through its OAuth sign-in flow')
     elif form.auth_type != 'api_key':
         raise HTTPException(400, 'This provider requires an API key')
     elif not form.api_key:
@@ -55,7 +82,7 @@ def _validate_form(form: ProviderConnectionCreate, user):
     for key in ('region', 'workspace_id', 'api_type'):
         if key in config and (not isinstance(config[key], str) or len(config[key]) > 128):
             raise HTTPException(400, f'{key} must be a string no longer than 128 characters')
-    if form.provider_id == 'custom' and config.get('api_type', 'openai') not in ('openai', 'responses'):
+    if template['id'] == 'custom' and config.get('api_type', 'openai') not in ('openai', 'responses'):
         raise HTTPException(400, 'Custom API type must be openai or responses')
     if config.get('base_url'):
         try:
@@ -69,9 +96,9 @@ def _validate_form(form: ProviderConnectionCreate, user):
         or any(not isinstance(x, str) or not x or len(x) > 256 for x in model_ids)
     ):
         raise HTTPException(400, 'model_ids must be a list of at most 500 non-empty strings')
-    if form.provider_id == 'custom' and not config.get('base_url'):
+    if template['id'] == 'custom' and not config.get('base_url'):
         raise HTTPException(400, 'A base URL is required for custom providers')
-    _validate_bailian_config(form.provider_id, config)
+    _validate_bailian_config(template['id'], config)
     return config
 
 
@@ -86,6 +113,17 @@ def _validate_bailian_config(provider_id, config):
         raise HTTPException(400, 'Invalid Bailian workspace ID')
     if region in {'eu-central-1', 'us-east-1', 'ap-northeast-1'} and not workspace and not config.get('base_url'):
         raise HTTPException(400, 'Bailian requires a workspace ID for this region')
+
+
+def _drop_redundant_legacy_models(connection):
+    """Clear the legacy model column only when the curated whitelist is authoritative.
+
+    A connection that has not been migrated yet keeps its legacy models: the
+    migration still has to move them into the curated whitelist, so clearing
+    them here would lose the user's model selection.
+    """
+    if registry_migrated(connection):
+        connection.models = []
 
 
 async def _connection_with_access(connection_id: str, user, db):
@@ -107,7 +145,8 @@ async def _connection_with_manage_access(connection_id: str, user, db):
 
 @router.get('')
 async def get_provider_catalog(user=Depends(get_verified_user)):
-    return PROVIDER_CATALOG
+    """The provider templates, grouped by the protocol that decides a call."""
+    return {'object': 'list', 'data': PROVIDER_CATALOG, 'groups': GROUPS}
 
 
 @router.get('/connections')
@@ -123,7 +162,7 @@ async def list_connections(user=Depends(get_verified_user), db: AsyncSession = D
     visible = []
     for connection in connections:
         if await can_access_connection(connection, user, db):
-            item = public_connection(connection)
+            item = await public_connection(connection, db)
             if user.role != 'admin' and connection.owner_id != user.id:
                 item['models'] = [
                     m for m in item['models'] if await legacy_model_access(connection, m['upstream_id'], user, db)
@@ -163,7 +202,7 @@ async def verify_ephemeral_connection(form: ProviderConnectionCreate, user=Depen
         auth_type=form.auth_type,
         visibility=form.visibility,
         owner_id=user.id,
-        config={**config, '_catalog_version': 1},
+        config={**config, '_registry_version': 2},
         credential=encrypt_credential(form.api_key.get_secret_value() if form.api_key else None),
         status='configured',
         models=[],
@@ -180,23 +219,30 @@ async def create_connection(
     form: ProviderConnectionCreate, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
     config = _validate_form(form, user)
+    template = _template_for(form)
     connection = new_provider_connection(
-        provider_id=form.provider_id,
+        provider_id=template['id'],
         name=form.name,
         auth_type=form.auth_type,
         visibility=form.visibility,
         owner_id=user.id,
-        config={**config, '_catalog_version': 1},
+        config={**config, '_registry_version': 2},
         credential=encrypt_credential(form.api_key.get_secret_value() if form.api_key else None),
         status='configured',
         models=[],
         is_active=True,
+        protocol=template['protocol'],
+        provider_template=template['id'],
     )
     db.add(connection)
     if form.visibility == 'shared':
         await AccessGrants.replace_access_grants(db, 'provider_connection', connection.id, form.access_control)
+    # The models the user picked in the wizard become the curated whitelist.
+    await seed_connection_models(
+        connection, [item for item in (config.get('model_ids') or []) if isinstance(item, str)], db
+    )
     await db.commit()
-    return public_connection(connection)
+    return await public_connection(connection, db)
 
 
 @router.get('/connections/{connection_id}')
@@ -204,7 +250,7 @@ async def get_connection(
     connection_id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
     connection = await _connection_with_access(connection_id, user, db)
-    result = public_connection(connection)
+    result = await public_connection(connection, db)
     if user.role == 'admin' and connection.visibility == 'shared':
         result['access_control'] = [
             {'principal_type': grant.principal_type, 'principal_id': grant.principal_id, 'permission': grant.permission}
@@ -291,10 +337,10 @@ async def update_connection(
     connection.updated_at = max(int(time.time()), connection.updated_at + 1)
     if api_key or 'config' in values:
         connection.config = {key: value for key, value in (connection.config or {}).items() if key != '_models_by_user'}
-        connection.models = []
+        _drop_redundant_legacy_models(connection)
         connection.status = 'configured'
     await db.commit()
-    return public_connection(connection)
+    return await public_connection(connection, db)
 
 
 @router.delete('/connections/{connection_id}')
@@ -327,7 +373,7 @@ async def verify_connection(
         'ok': connection.status == 'connected',
         'status': connection.status,
         'models': models,
-        'catalog': catalog_status(connection, user.id),
+        'catalog': catalog_status(connection, user.id, await catalog_snapshot(connection, user.id, db)),
     }
 
 
@@ -337,7 +383,11 @@ async def refresh_models(
 ):
     connection = await _connection_with_manage_access(connection_id, user, db)
     models = await refresh_connection_catalog(connection, user, db)
-    return {'models': models, 'status': connection.status, 'catalog': catalog_status(connection, user.id)}
+    return {
+        'models': models,
+        'status': connection.status,
+        'catalog': catalog_status(connection, user.id, await catalog_snapshot(connection, user.id, db)),
+    }
 
 
 @router.get('/models')
@@ -398,12 +448,18 @@ async def set_model_enabled(
     db: AsyncSession = Depends(get_async_session),
 ):
     connection = await _connection_with_manage_access(connection_id, user, db)
-    if not any(m.get('upstream_id') == form.upstream_id for m in connection.models or []):
-        raise HTTPException(404, 'Discover or add the model first')
-    connection.config = {
-        **(connection.config or {}),
-        '_model_enabled': {**(connection.config or {}).get('_model_enabled', {}), form.upstream_id: form.enabled},
-    }
+    from open_webui.utils.providers import set_connection_model_enabled
+
+    if not await set_connection_model_enabled(connection, form.upstream_id, form.enabled, db):
+        if not any(m.get('upstream_id') == form.upstream_id for m in connection.models or []):
+            raise HTTPException(404, 'Discover or add the model first')
+        connection.config = {
+            **(connection.config or {}),
+            '_model_enabled': {
+                **(connection.config or {}).get('_model_enabled', {}),
+                form.upstream_id: form.enabled,
+            },
+        }
     from open_webui.models.models import Model
     from open_webui.utils.providers import stable_model_id
     from sqlalchemy import update
@@ -418,7 +474,7 @@ async def set_model_enabled(
     ]
     await db.execute(update(Model).where(Model.id.in_(ids)).values(is_active=form.enabled))
     await db.commit()
-    return public_connection(connection)
+    return await public_connection(connection, db)
 
 
 class ModelUses(BaseModel):
@@ -437,23 +493,207 @@ async def set_model_uses(
         raise HTTPException(400, 'Unsupported purpose or adapter')
     if form.uses.get('image') == 'siliconflow-image' and provider_family(connection) != 'siliconflow':
         raise HTTPException(400, 'SiliconFlow image adapter requires a SiliconFlow connection')
-    config = dict(connection.config or {})
-    config['_model_overrides'] = {**config.get('_model_overrides', {}), form.upstream_id: form.uses}
-    if not any(m['upstream_id'] == form.upstream_id for m in connection.models or []):
-        from open_webui.utils.providers import stable_model_id
+    from open_webui.utils.providers import set_connection_model_uses
 
-        config['model_ids'] = list(dict.fromkeys([*config.get('model_ids', []), form.upstream_id]))
-        connection.models = [
-            *(connection.models or []),
-            {
-                'id': stable_model_id(connection.id, form.upstream_id),
-                'upstream_id': form.upstream_id,
-                'name': form.upstream_id,
-            },
-        ]
-    connection.config = config
+    if not await set_connection_model_uses(connection, form.upstream_id, form.uses, db):
+        config = dict(connection.config or {})
+        config['_model_overrides'] = {**config.get('_model_overrides', {}), form.upstream_id: form.uses}
+        if not any(m['upstream_id'] == form.upstream_id for m in connection.models or []):
+            from open_webui.utils.providers import stable_model_id
+
+            config['model_ids'] = list(dict.fromkeys([*config.get('model_ids', []), form.upstream_id]))
+            connection.models = [
+                *(connection.models or []),
+                {
+                    'id': stable_model_id(connection.id, form.upstream_id),
+                    'upstream_id': form.upstream_id,
+                    'name': form.upstream_id,
+                },
+            ]
+        connection.config = config
     await db.commit()
-    return public_connection(connection)
+    return await public_connection(connection, db)
+
+
+class ConnectionEnabled(BaseModel):
+    enabled: bool
+
+
+@router.put('/connections/{connection_id}/enabled')
+async def set_connection_enabled(
+    connection_id: str,
+    form: ConnectionEnabled,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """The provider level switch: when off, none of its models are offered."""
+    connection = await _connection_with_manage_access(connection_id, user, db)
+    connection.is_enabled = bool(form.enabled)
+    connection.updated_at = int(time.time())
+    await db.commit()
+    return await public_connection(connection, db)
+
+
+@router.get('/connections/{connection_id}/models')
+async def list_connection_models(
+    connection_id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """The curated whitelist of one provider."""
+    connection = await _connection_with_access(connection_id, user, db)
+    return {'object': 'list', 'data': await connection_models(connection, db)}
+
+
+@router.post('/connections/{connection_id}/models/fetch')
+async def fetch_connection_models(
+    connection_id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Fetch the candidate pool from the provider.
+
+    The result never changes the whitelist: the user picks what to keep.
+    """
+    connection = await _connection_with_manage_access(connection_id, user, db)
+    stamp = catalog_fingerprint(connection)
+    try:
+        candidates = await discover_connection_models(connection, user)
+    except Exception as exc:
+        error = catalog_error(exc)
+        await write_snapshot(
+            connection,
+            user.id,
+            {'fingerprint': stamp, 'models': [], 'error': error, 'generation': '', 'updated_at': int(time.time())},
+            db,
+        )
+        await db.commit()
+        return {'candidates': [], 'error': error, 'fetched_at': int(time.time())}
+    await write_snapshot(
+        connection,
+        user.id,
+        {
+            'fingerprint': stamp,
+            'models': candidates,
+            'error': None,
+            'generation': str(uuid.uuid4()),
+            'updated_at': int(time.time()),
+        },
+        db,
+    )
+    connection.status = 'connected'
+    await db.commit()
+    return {
+        'candidates': [
+            {
+                'upstream_id': candidate['upstream_id'],
+                'display_name': candidate.get('name') or candidate['upstream_id'],
+                'capabilities': candidate.get('capabilities') or [],
+                'uses': candidate.get('uses') or {},
+            }
+            for candidate in candidates
+        ],
+        'error': None,
+        'fetched_at': int(time.time()),
+    }
+
+
+class ModelAdd(BaseModel):
+    upstream_ids: list[str] = Field(min_length=1, max_length=500)
+    display_names: dict[str, str] = Field(default_factory=dict)
+    uses: dict[str, str] | None = None
+
+
+@router.post('/connections/{connection_id}/models')
+async def add_connection_models(
+    connection_id: str,
+    form: ModelAdd,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Add the models the user picked to the curated whitelist."""
+    connection = await _connection_with_manage_access(connection_id, user, db)
+    added = await seed_connection_models(
+        connection,
+        form.upstream_ids,
+        db,
+        display_names=form.display_names,
+        uses=form.uses,
+        source='provider',
+        user_id=user.id,
+    )
+    await db.commit()
+    return {'object': 'list', 'added': added, 'data': await connection_models(connection, db)}
+
+
+class ModelUpdate(BaseModel):
+    display_name: str | None = Field(default=None, max_length=256)
+    uses: dict[str, str] | None = None
+    enabled: bool | None = None
+
+
+@router.put('/connections/{connection_id}/models/{upstream_id}')
+async def update_connection_model(
+    connection_id: str,
+    upstream_id: str,
+    form: ModelUpdate,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Rename a curated model, change its purposes or switch it off."""
+    connection = await _connection_with_manage_access(connection_id, user, db)
+    if form.uses is not None:
+        if any(use not in ADAPTERS or adapter not in ADAPTERS[use] for use, adapter in form.uses.items()):
+            raise HTTPException(400, 'Unsupported purpose or adapter')
+        if form.uses.get('image') == 'siliconflow-image' and provider_family(connection) != 'siliconflow':
+            raise HTTPException(400, 'SiliconFlow image adapter requires a SiliconFlow connection')
+    from open_webui.models.provider_connections import ProviderModel
+
+    row = (
+        await db.scalars(
+            select(ProviderModel).where(
+                ProviderModel.connection_id == connection.id,
+                ProviderModel.upstream_id == upstream_id,
+            )
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(404, 'Model not found')
+    if form.display_name is not None:
+        row.display_name = form.display_name
+    if form.uses is not None:
+        row.uses = dict(form.uses)
+    if form.enabled is not None:
+        row.enabled = bool(form.enabled)
+    row.updated_at = int(time.time())
+    await db.commit()
+    return {'object': 'list', 'data': await connection_models(connection, db)}
+
+
+@router.delete('/connections/{connection_id}/models/{upstream_id}')
+async def remove_connection_model(
+    connection_id: str,
+    upstream_id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Remove a model from the curated whitelist. The provider keeps it."""
+    connection = await _connection_with_manage_access(connection_id, user, db)
+    from open_webui.models.provider_connections import ProviderModel
+
+    row = (
+        await db.scalars(
+            select(ProviderModel).where(
+                ProviderModel.connection_id == connection.id,
+                ProviderModel.upstream_id == upstream_id,
+            )
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(404, 'Model not found')
+    await db.delete(row)
+    await db.commit()
+    return {'object': 'list', 'data': await connection_models(connection, db)}
 
 
 class ModelTest(BaseModel):
@@ -606,22 +846,25 @@ async def _save_model_test(connection, metadata, before, purpose, outcome, error
 
     elapsed = int((time.monotonic() - started) * 1000)
     await db.refresh(connection)
-    current = normalize_model(connection, metadata)
+    # The metadata already carries the curated purposes; re-deriving them would
+    # change the fingerprint and invalidate the result we are about to store.
+    current = metadata
     if fingerprint(connection, current) != before:
         raise HTTPException(409, 'Configuration changed during the test; result was not saved')
-    config = dict(connection.config or {})
-    tests = dict(config.get('_model_tests', {}))
-    tests[metadata['upstream_id']] = {
-        **tests.get(metadata['upstream_id'], {}),
-        purpose: {
-            'status': outcome,
-            'tested_at': int(time.time()),
-            'fingerprint': before,
-            'elapsed_ms': elapsed,
-            'error': error,
-        },
+    result = {
+        'status': outcome,
+        'tested_at': int(time.time()),
+        'fingerprint': before,
+        'elapsed_ms': elapsed,
+        'error': error,
     }
-    connection.config = {**config, '_model_tests': tests}
+    from open_webui.utils.providers import set_connection_model_verification
+
+    if not await set_connection_model_verification(connection, metadata['upstream_id'], purpose, result, db):
+        config = dict(connection.config or {})
+        tests = dict(config.get('_model_tests', {}))
+        tests[metadata['upstream_id']] = {**tests.get(metadata['upstream_id'], {}), purpose: result}
+        connection.config = {**config, '_model_tests': tests}
     await db.commit()
     await save_call(
         user_id=user.id,
@@ -754,7 +997,7 @@ async def migrate_media(
     rows = (await db.scalars(select(ProviderConnection).where(ProviderConnection.owner_id == user.id))).all()
     existing = next((c for c in rows if (c.config or {}).get('_migration') == form.fingerprint and c.is_active), None)
     if values['engine'] == 'provider' and existing:
-        return public_connection(existing)
+        return await public_connection(existing, db)
     if values['engine'] != 'openai' or digest != form.fingerprint:
         raise HTTPException(409, 'Legacy settings changed; refresh migration preview')
     if not all(values.get(key) for key in ('url', 'key', 'model')):
@@ -778,13 +1021,20 @@ async def migrate_media(
         config={
             'base_url': values['url'],
             'model_ids': [values['model']],
-            '_catalog_version': 1,
+            '_registry_version': 2,
             '_migration': form.fingerprint,
-            '_model_overrides': {values['model']: {purpose: adapter}},
         },
     )
     connection.id = str(uuid.uuid5(uuid.NAMESPACE_URL, f'media-migration:{user.id}:{form.fingerprint}'))
     db.add(connection)
+    await seed_connection_models(
+        connection,
+        [values['model']],
+        db,
+        display_names={values['model']: values['model']},
+        uses={purpose: adapter},
+        source='manual',
+    )
     prefix, engine, _, _, _, model, reference = _MEDIA_SETTINGS[purpose]
     await Config.upsert(
         {
@@ -795,7 +1045,7 @@ async def migrate_media(
         db=db,
     )
     await db.commit()
-    return public_connection(connection)
+    return await public_connection(connection, db)
 
 
 @router.get('/calls/history')

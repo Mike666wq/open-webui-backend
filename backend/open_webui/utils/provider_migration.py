@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import hmac
 import json
+import time
+import uuid
 from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import HTTPException
@@ -114,7 +116,7 @@ async def _apply_migration(request, user, db, index, fingerprint, alias_owners):
     existing = (await db.scalars(select(ProviderConnection))).all()
     done = next((c for c in existing if (c.config or {}).get('_legacy_source') == fingerprint), None)
     if done:
-        return public_connection(done)
+        return await public_connection(done, db)
     preview = await preview_migration(request, user, db)
     source = next((s for s in preview['sources'] if s['index'] == index), None)
     if not source or source['fingerprint'] != fingerprint:
@@ -147,14 +149,13 @@ async def _apply_migration(request, user, db, index, fingerprint, alias_owners):
         config={
             'base_url': source['base_url'],
             'model_ids': source['models'],
-            '_catalog_version': 1,
+            '_registry_version': 2,
             '_legacy_source': fingerprint,
             '_legacy_index': index,
             '_legacy_aliases': aliases,
             '_legacy_access_ids': source['aliases'],
             '_legacy_chat_ids': source['models'],
             '_legacy_names': {mid: alias for alias, mid in aliases.items()},
-            '_model_enabled': {m: True for m in source['models']},
         },
     )
     connection.models = [
@@ -167,6 +168,29 @@ async def _apply_migration(request, user, db, index, fingerprint, alias_owners):
         for alias, mid in source['aliases'].items()
     ]
     db.add(connection)
+    # The migrated models form the curated whitelist of the new connection.
+    from open_webui.models.provider_connections import ProviderModel
+
+    now = int(time.time())
+    for order, (alias, mid) in enumerate(source['aliases'].items()):
+        db.add(
+            ProviderModel(
+                id=str(uuid.uuid4()),
+                connection_id=connection.id,
+                upstream_id=mid,
+                display_name=alias,
+                uses={'chat': 'openai-chat'},
+                capabilities=[],
+                features=[],
+                model_info={},
+                enabled=True,
+                source='manual',
+                verification={},
+                sort_order=order,
+                created_at=now,
+                updated_at=now,
+            )
+        )
     await AccessGrants.replace_access_grants(
         db,
         'provider_connection',
@@ -181,4 +205,4 @@ async def _apply_migration(request, user, db, index, fingerprint, alias_owners):
 
     await get_all_models.cache.clear()
     request.app.state.BASE_MODELS = []
-    return public_connection(connection)
+    return await public_connection(connection, db)
