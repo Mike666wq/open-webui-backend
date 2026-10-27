@@ -88,7 +88,7 @@ class ProviderManagementTests(unittest.IsolatedAsyncioTestCase):
         result = await self.client.get('/providers/models')
         self.assertEqual([m['upstream_id'] for m in result.json()['data']], ['old'])
         self.assertNotIn('secret upstream body', result.text)
-        self.assertEqual(result.json()['catalogs'][0]['error']['category'], 'network')
+        self.assertEqual(result.json()['catalogs'][0]['error']['category'], 'connection')
 
     async def test_stale_catalog_returns_without_waiting_and_coalesces_background(self):
         await self.refresh()
@@ -366,7 +366,9 @@ class ProviderManagementTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(error['category'], 'upstream')
         self.assertEqual(error['status'], 500)
         self.assertEqual(error['http_status'], 502)
-        self.assertEqual(providers.catalog_error(HTTPException(502, 'Could not reach provider'))['category'], 'network')
+        self.assertEqual(
+            providers.catalog_error(HTTPException(502, 'Could not reach provider'))['category'], 'connection'
+        )
 
     async def test_closing_after_done_retains_completed_receipt(self):
         async def frames():
