@@ -8,6 +8,7 @@ replaced it.
 
 import ipaddress
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import aiohttp
@@ -70,6 +71,13 @@ class FakeSession:
         return False
 
     def request(self, *args, **kwargs):
+        return FakeRequestContext(self.response, self.error)
+
+
+class FakeTokenSession(FakeSession):
+    """A session for the OAuth token endpoint, which is posted to."""
+
+    def post(self, *args, **kwargs):
         return FakeRequestContext(self.response, self.error)
 
 
@@ -236,3 +244,150 @@ class ProviderHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('secret', str(error))
         self.assertIn('hint', error)
         self.assertIn('retryable', error)
+
+    # --- reason, stage and suggested action ------------------------------
+
+    def test_the_five_categories_still_carry_a_reason_and_an_action(self):
+        cases = [
+            (401, provider_errors.REASON_INVALID_CREDENTIALS, provider_errors.ACTION_REPLACE_KEY),
+            (403, provider_errors.REASON_INSUFFICIENT_PERMISSIONS, provider_errors.ACTION_CHECK_PERMISSIONS),
+            (402, provider_errors.REASON_QUOTA_EXHAUSTED, provider_errors.ACTION_RETRY_LATER),
+            (429, provider_errors.REASON_RATE_LIMITED, provider_errors.ACTION_RETRY_LATER),
+            (500, provider_errors.REASON_UPSTREAM_FAILURE, provider_errors.ACTION_RETRY_LATER),
+        ]
+        for status, reason, action in cases:
+            error = providers.catalog_error(providers.provider_http_error(status))
+            self.assertEqual(error['reason'], reason, status)
+            self.assertEqual(error['suggested_action'], action, status)
+
+    def test_a_forbidden_catalog_does_not_ask_for_a_new_key(self):
+        """403 means the account lacks a permission, not that the key is wrong."""
+        error = providers.catalog_error(providers.provider_http_error(403))
+        self.assertEqual(error['category'], provider_errors.AUTHENTICATION)
+        self.assertEqual(error['reason'], provider_errors.REASON_INSUFFICIENT_PERMISSIONS)
+        self.assertEqual(error['suggested_action'], provider_errors.ACTION_CHECK_PERMISSIONS)
+        self.assertNotEqual(error['suggested_action'], provider_errors.ACTION_REPLACE_KEY)
+
+    def test_the_fake_ip_address_is_reported_as_a_local_block(self):
+        """A6: 198.18.0.28 is a local policy decision, not an upstream status."""
+        error = providers.catalog_error(
+            provider_http.ProviderRequestError(
+                provider_errors.PROVIDER_NETWORK,
+                502,
+                reason=provider_errors.REASON_ADDRESS_BLOCKED,
+                suggested_action=provider_errors.ACTION_CHECK_SERVER_NETWORK,
+            )
+        )
+        self.assertEqual(error['category'], provider_errors.PROVIDER_NETWORK)
+        self.assertEqual(error['reason'], provider_errors.REASON_ADDRESS_BLOCKED)
+        self.assertEqual(error['suggested_action'], provider_errors.ACTION_CHECK_SERVER_NETWORK)
+        self.assertIsNone(error['upstream_status'])
+
+    async def test_a_blocked_address_carries_the_network_reason(self):
+        session = FakeSession(
+            error=provider_http.ProviderAddressBlocked('api.siliconflow.cn', ['198.18.0.28'])
+        )
+        with patch.object(provider_http.aiohttp, 'ClientSession', return_value=session):
+            with self.assertRaises(provider_errors.ProviderRequestError) as ctx:
+                await provider_http.provider_request_json(
+                    'https://api.siliconflow.cn/v1/models', headers={}
+                )
+        self.assertEqual(ctx.exception.category, provider_errors.PROVIDER_NETWORK)
+        self.assertEqual(ctx.exception.reason, provider_errors.REASON_ADDRESS_BLOCKED)
+        self.assertEqual(
+            ctx.exception.suggested_action, provider_errors.ACTION_CHECK_SERVER_NETWORK
+        )
+        self.assertIsNone(ctx.exception.upstream_status)
+
+    async def test_dns_tls_and_timeout_carry_their_own_reason(self):
+        cases = [
+            (
+                aiohttp.ClientConnectorDNSError(connection_key(), OSError('no such host')),
+                provider_errors.REASON_DNS_FAILURE,
+            ),
+            (
+                aiohttp.ClientSSLError(connection_key(), OSError('bad handshake')),
+                provider_errors.REASON_TLS_FAILURE,
+            ),
+            (TimeoutError(), provider_errors.REASON_TIMEOUT),
+        ]
+        for error, reason in cases:
+            session = FakeSession(error=error)
+            with patch.object(provider_http.aiohttp, 'ClientSession', return_value=session):
+                with self.assertRaises(provider_errors.ProviderRequestError) as ctx:
+                    await provider_http.provider_request_json(
+                        'https://api.example.com/v1/models', headers={}
+                    )
+            self.assertEqual(ctx.exception.category, provider_errors.CONNECTION)
+            self.assertEqual(ctx.exception.reason, reason)
+            self.assertEqual(
+                ctx.exception.suggested_action, provider_errors.ACTION_CHECK_SERVER_NETWORK
+            )
+
+    # --- OAuth failures are not all authentication failures ---------------
+
+    async def test_an_invalid_grant_asks_for_a_new_sign_in(self):
+        body = b'{"error": "invalid_grant", "error_description": "refresh token revoked"}'
+        with patch.object(
+            chatgpt_auth.aiohttp, 'ClientSession', return_value=FakeTokenSession(FakeResponse(400, body))
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await chatgpt_auth.oauth_form({'grant_type': 'refresh_token'})
+        error = ctx.exception
+        self.assertEqual(error.provider_category, provider_errors.AUTHENTICATION)
+        self.assertEqual(error.provider_reason, provider_errors.REASON_TOKEN_EXPIRED)
+        self.assertEqual(error.provider_suggested_action, provider_errors.ACTION_RECONNECT)
+        self.assertEqual(error.provider_stage, provider_errors.STAGE_OAUTH_REFRESH)
+
+    async def test_a_throttled_token_endpoint_is_not_an_authentication_failure(self):
+        with patch.object(
+            chatgpt_auth.aiohttp,
+            'ClientSession',
+            return_value=FakeTokenSession(FakeResponse(429, b'{"error": "slow_down"}')),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await chatgpt_auth.oauth_form({'grant_type': 'refresh_token'})
+        error = ctx.exception
+        self.assertEqual(error.provider_category, provider_errors.RATE_LIMIT)
+        self.assertEqual(error.provider_reason, provider_errors.REASON_RATE_LIMITED)
+        self.assertEqual(error.provider_suggested_action, provider_errors.ACTION_RETRY_LATER)
+
+    async def test_a_broken_token_service_is_an_upstream_failure(self):
+        with patch.object(
+            chatgpt_auth.aiohttp,
+            'ClientSession',
+            return_value=FakeTokenSession(FakeResponse(503, b'{"error": "unavailable"}')),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await chatgpt_auth.oauth_form({'grant_type': 'refresh_token'})
+        error = ctx.exception
+        self.assertEqual(error.provider_category, provider_errors.UPSTREAM)
+        self.assertEqual(error.provider_reason, provider_errors.REASON_UPSTREAM_FAILURE)
+        self.assertEqual(error.provider_suggested_action, provider_errors.ACTION_RETRY_LATER)
+
+    async def test_an_unreachable_token_endpoint_stays_a_connection_failure(self):
+        with patch.object(
+            chatgpt_auth.aiohttp, 'ClientSession', return_value=FakeTokenSession(error=TimeoutError())
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await chatgpt_auth.oauth_form({'grant_type': 'refresh_token'})
+        error = ctx.exception
+        self.assertEqual(error.provider_category, provider_errors.CONNECTION)
+        self.assertEqual(error.provider_stage, provider_errors.STAGE_OAUTH_REFRESH)
+
+    def test_an_oauth_connection_asks_for_a_sign_in_not_a_new_key(self):
+        """The suggested action has to match how the connection authenticates."""
+        connection = SimpleNamespace(auth_type='oauth')
+        error = providers.provider_http_error(401)
+        providers._recovery_action(connection, error)
+        self.assertEqual(error.provider_suggested_action, provider_errors.ACTION_RECONNECT)
+
+        key_connection = SimpleNamespace(auth_type='api_key')
+        key_error = providers.provider_http_error(401)
+        providers._recovery_action(key_connection, key_error)
+        self.assertEqual(key_error.provider_suggested_action, provider_errors.ACTION_REPLACE_KEY)
+
+    def test_an_unknown_error_stays_unknown(self):
+        error = providers.catalog_error(HTTPException(502, 'Could not reach provider'))
+        self.assertEqual(error['reason'], provider_errors.REASON_UNKNOWN)
+        self.assertIsNone(error['stage'])

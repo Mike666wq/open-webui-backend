@@ -20,8 +20,18 @@ from typing import Any
 import aiohttp
 from open_webui.utils.apps import validate_app_url
 from open_webui.utils.provider_errors import (
+    ACTION_CHECK_SERVER_NETWORK,
+    ACTION_REPLACE_KEY,
+    ACTION_RETRY_LATER,
     CONNECTION,
     PROVIDER_NETWORK,
+    REASON_ADDRESS_BLOCKED,
+    REASON_DNS_FAILURE,
+    REASON_INVALID_CREDENTIALS,
+    REASON_TIMEOUT,
+    REASON_TLS_FAILURE,
+    REASON_UNKNOWN,
+    REASON_UPSTREAM_FAILURE,
     ProviderRequestError,
     category_for_status,
 )
@@ -176,6 +186,8 @@ async def provider_request_json(
                         upstream_status=response.status,
                         detail=_status_detail(response.status),
                         retryable=response.status >= 500,
+                        reason=_reason_for_status(response.status),
+                        suggested_action=_action_for_status(response.status),
                     )
                 try:
                     return json.loads(raw) if raw else {}
@@ -186,6 +198,8 @@ async def provider_request_json(
                         detail='Provider returned an invalid response',
                         hint='厂商返回的内容不是合法 JSON，请确认 API 地址指向正确的接口根路径。',
                         retryable=False,
+                        reason=REASON_UNKNOWN,
+                        suggested_action=ACTION_CHECK_SERVER_NETWORK,
                     ) from None
     except ProviderRequestError:
         raise
@@ -195,6 +209,8 @@ async def provider_request_json(
             502,
             detail='Provider endpoint resolves to a prohibited address',
             hint=_blocked_hint(exc.host, exc.addresses),
+            reason=REASON_ADDRESS_BLOCKED,
+            suggested_action=ACTION_CHECK_SERVER_NETWORK,
         ) from None
     except aiohttp.ClientSSLError:
         raise ProviderRequestError(
@@ -202,6 +218,8 @@ async def provider_request_json(
             502,
             detail='Provider TLS verification failed',
             hint='与厂商的 TLS 握手失败，请检查证书链、服务器时间或中间代理。',
+            reason=REASON_TLS_FAILURE,
+            suggested_action=ACTION_CHECK_SERVER_NETWORK,
         ) from None
     except aiohttp.ClientConnectorDNSError:
         raise ProviderRequestError(
@@ -209,14 +227,49 @@ async def provider_request_json(
             502,
             detail='Provider hostname could not be resolved',
             hint='服务器无法解析厂商域名，请检查 DNS 与 hosts 配置。',
+            reason=REASON_DNS_FAILURE,
+            suggested_action=ACTION_CHECK_SERVER_NETWORK,
         ) from None
-    except (aiohttp.ClientError, TimeoutError):
+    except TimeoutError:
         raise ProviderRequestError(
             CONNECTION,
             502,
             detail='Could not reach the provider',
             hint='连接厂商超时或被拒绝，请检查服务器出网网络与代理设置。',
+            reason=REASON_TIMEOUT,
+            suggested_action=ACTION_CHECK_SERVER_NETWORK,
         ) from None
+    except aiohttp.ClientError:
+        raise ProviderRequestError(
+            CONNECTION,
+            502,
+            detail='Could not reach the provider',
+            hint='连接厂商超时或被拒绝，请检查服务器出网网络与代理设置。',
+            reason=REASON_UNKNOWN,
+            suggested_action=ACTION_CHECK_SERVER_NETWORK,
+        ) from None
+
+
+def _reason_for_status(status: int) -> str:
+    if status == 401:
+        return REASON_INVALID_CREDENTIALS
+    if status == 403:
+        return 'insufficient_permissions'
+    if status == 402:
+        return 'quota_exhausted'
+    if status == 429:
+        return 'rate_limited'
+    return REASON_UPSTREAM_FAILURE
+
+
+def _action_for_status(status: int) -> str:
+    if status == 401:
+        return ACTION_REPLACE_KEY
+    if status == 403:
+        return 'check_permissions'
+    if status in (402, 429):
+        return ACTION_RETRY_LATER
+    return ACTION_RETRY_LATER
 
 
 def _status_detail(status: int) -> str:

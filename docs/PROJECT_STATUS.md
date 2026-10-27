@@ -61,3 +61,19 @@
 合并顺序：前端 PR #30 先合，后端 PR #18 再合（`GET /providers` 返回结构由裸数组变为 `{object,data,groups}`，前端已兼容两种形状）。
 
 自动化覆盖模板目录、白名单增删改查、厂商级开关、迁移幂等与双读兜底、五类错误分类，以及旧连接搬迁。CI 使用合成凭据与模拟厂商，不访问真实付费模型。浏览器端真实交互（添加供应商 → 拉取模型 → 勾选 → 保存 → 聊天选择器出现）与真实厂商凭据下的连通性检查**尚未人工验收**；迁移到生产环境后的真实数据搬迁**尚未验收**。
+
+## 服务商接入故障恢复（P-001 r2，2026-10-27）
+
+错误对象新增三个可选字段：`stage`（`catalog` / `oauth_refresh` / `inference`）、`reason`（含 `token_expired`、`insufficient_permissions`、`address_blocked`、`dns_failure`、`tls_failure`、`timeout` 等）、`suggested_action`（`reconnect` / `replace_key` / `check_permissions` / `check_server_network` / `retry_later` / `inspect_connection`）。厂商类错误的 HTTP 响应统一带 `error` 对象，参数校验与权限校验仍只回 `detail`。
+
+行为变化：
+
+- **目录失败不再是推理总闸门**。原先目录快照里的鉴权错误会把整条连接的模型全部下线；厂商可以拒绝模型列表却仍能正常推理。真实请求仍按凭据鉴权，连接启停、模型启停、用途、分享范围与访问检查都不受影响。
+- 传输失败各带自己的原因：被拦截 `address_blocked`、解析失败 `dns_failure`、握手失败 `tls_failure`、超时 `timeout`；本地拦截的 `upstream_status` 为空。
+- OAuth 令牌接口不再把所有非 2xx 压成 401：`invalid_grant` 记为 `token_expired` 并建议重新登录，429 记为限流，5xx 记为上游故障，网络不可达记为连接失败。
+- 建议动作与认证方式匹配：OAuth 连接给 `reconnect`，API Key 连接给 `replace_key`，403 一律 `check_permissions`（不再提示「更换 API Key」）。
+- 重新登录沿用原连接：成功清除旧目录错误；取消、失败、超时与迟到响应都不清空原凭据，也不新建重复连接。
+
+契约见 [接口契约](PROVIDER_CONTRACT.md)，恢复步骤见 [恢复手册](PROVIDER_RECOVERY.md)。
+
+自动化覆盖错误分类与阶段、目录鉴权错误下白名单模型仍可用、真实请求仍鉴权、禁用模型仍被拒、拉取失败后白名单数据不变、重新登录更新原连接。CI 使用合成凭据与模拟厂商，**不访问**真实厂商。生产网络命名空间里的 DNS / 代理取证、放行网段后的真实连通、真实 ChatGPT 授权与真实推理**尚未验证**，需要部署责任人执行。

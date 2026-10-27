@@ -272,8 +272,8 @@ class ChatGPTBrowserTests(unittest.IsolatedAsyncioTestCase):
             return await complete_browser_auth(attempt['attempt_id'], BrowserCallbackForm(callback_url=value), owner or self.owner, db)
 
     async def test_browser_callback_is_owner_bound_encrypted_and_one_time(self):
-        from open_webui.routers import provider_auth
         from open_webui.models.users import Users
+        from open_webui.routers import provider_auth
         from open_webui.utils.providers import decrypt_credential
         attempt, query, encrypted = await self.start()
         verifier = decrypt_credential(encrypted)
@@ -396,6 +396,196 @@ class ChatGPTBrowserTests(unittest.IsolatedAsyncioTestCase):
             row = await db.get(ChatGPTAuthAttempt, attempt['attempt_id'])
             self.assertNotEqual(row.status, 'complete')
             self.assertIsNone(row.connection_id)
+
+    # --- reauthorizing an existing connection ----------------------------
+
+    async def existing_connection(self, host_id='synthetic-host'):
+        """A ChatGPT OAuth connection whose credential is no longer usable."""
+        from open_webui.models.provider_connections import new_provider_connection
+
+        credentials = {
+            'access_token': 'old-access',
+            'refresh_token': 'old-refresh',
+            'id_token': 'old-id',
+            'expires_at': int(time.time()) - 10,
+            'scopes': ['openid', 'offline_access', 'resource.invoke', 'chatgpt.tokens.use.direct'],
+            'subject': 'browser-subject',
+            'client_id': 'oaiapp_browser',
+        }
+        connection = new_provider_connection(
+            provider_id='chatgpt',
+            name='ChatGPT',
+            auth_type='oauth',
+            owner_id=self.owner.id,
+            visibility='private',
+            config={
+                'host_id': host_id,
+                'client_id': 'oaiapp_browser',
+                'subject': 'browser-subject',
+                'model_ids': [],
+                '_registry_version': 2,
+            },
+            credential=encrypt_credential(json.dumps(credentials)),
+            status='connected',
+            models=[],
+            is_active=True,
+            protocol='openai-responses',
+            provider_template='chatgpt',
+        )
+        async with AsyncSessionLocal() as db:
+            db.add(connection)
+            await db.commit()
+        return connection
+
+    async def start_for(self, connection):
+        from open_webui.routers.provider_auth import StartAuthForm, start_chatgpt_auth
+
+        async with AsyncSessionLocal() as db:
+            attempt = await start_chatgpt_auth(
+                None, StartAuthForm(mode='browser', connection_id=connection.id), self.owner, db
+            )
+            return attempt, parse_qs(urlsplit(attempt['authorization_url']).query)
+
+    async def test_reauthorizing_updates_the_original_connection(self):
+        """A5: a new sign-in repairs the connection instead of adding a second one."""
+        from open_webui.models.users import Users
+        from open_webui.routers import provider_auth
+        from open_webui.utils.providers import decrypt_credential
+
+        connection = await self.existing_connection('host-reauthorizing')
+        attempt, query = await self.start_for(connection)
+        token = {
+            'access_token': 'fresh-access',
+            'refresh_token': 'fresh-refresh',
+            'id_token': 'fresh-id',
+            'expires_in': 3600,
+            'scope': 'openid offline_access resource.invoke chatgpt.tokens.use.direct',
+        }
+        claims = {'iss': 'https://auth.openai.com', 'sub': 'browser-subject'}
+        with (
+            patch.object(provider_auth, 'exchange_authorization_code', new=AsyncMock(return_value=token)),
+            patch.object(provider_auth, 'validate_id_token', new=AsyncMock(return_value=claims)),
+            patch.object(Users, 'get_user_by_id', new=AsyncMock(return_value=self.owner)),
+        ):
+            result = await self.complete(attempt, self.callback(query))
+        self.assertEqual(result['status'], 'complete')
+        self.assertEqual(result['connection_id'], connection.id)
+        async with AsyncSessionLocal() as db:
+            rows = (
+                await db.scalars(
+                    select(ProviderConnection).where(
+                        ProviderConnection.owner_id == self.owner.id,
+                        ProviderConnection.provider_id == 'chatgpt',
+                    )
+                )
+            ).all()
+            # The sign-in must not add a second connection for the same account.
+            synthetic = [row for row in rows if (row.config or {}).get('host_id') == 'host-reauthorizing']
+            self.assertEqual([row.id for row in synthetic], [connection.id])
+            stored = await db.get(ProviderConnection, connection.id)
+            credentials = json.loads(decrypt_credential(stored.credential))
+            self.assertEqual(credentials['access_token'], 'fresh-access')
+            self.assertEqual(stored.status, 'connected')
+
+    async def test_reauthorizing_clears_the_stale_catalog_error(self):
+        """A5: the old authentication error must not survive the new credential."""
+        from open_webui.models.users import Users
+        from open_webui.routers import provider_auth
+        from open_webui.utils import providers
+
+        connection = await self.existing_connection('host-stale-error')
+        async with AsyncSessionLocal() as db:
+            stored = await db.get(ProviderConnection, connection.id)
+            await providers.write_snapshot(
+                stored,
+                self.owner.id,
+                {
+                    'fingerprint': providers.catalog_fingerprint(stored),
+                    'models': [],
+                    'error': {
+                        'category': 'authentication',
+                        'status': 401,
+                        'http_status': 401,
+                        'upstream_status': 401,
+                        'retryable': False,
+                        'at': int(time.time()),
+                        'hint': '厂商拒绝了当前凭据',
+                    },
+                    'updated_at': int(time.time()),
+                    'generation': 'stale-generation',
+                },
+                db,
+            )
+            await db.commit()
+        async with AsyncSessionLocal() as db:
+            stored = await db.get(ProviderConnection, connection.id)
+            snapshot = await providers.catalog_snapshot(stored, self.owner.id, db)
+            status = providers.catalog_status(stored, self.owner.id, snapshot=snapshot)
+        self.assertEqual(status['error']['category'], 'authentication')
+
+        attempt, query = await self.start_for(connection)
+        token = {
+            'access_token': 'fresh-access',
+            'refresh_token': 'fresh-refresh',
+            'id_token': 'fresh-id',
+            'expires_in': 3600,
+            'scope': 'openid offline_access resource.invoke chatgpt.tokens.use.direct',
+        }
+        claims = {'iss': 'https://auth.openai.com', 'sub': 'browser-subject'}
+        with (
+            patch.object(provider_auth, 'exchange_authorization_code', new=AsyncMock(return_value=token)),
+            patch.object(provider_auth, 'validate_id_token', new=AsyncMock(return_value=claims)),
+            patch.object(Users, 'get_user_by_id', new=AsyncMock(return_value=self.owner)),
+        ):
+            await self.complete(attempt, self.callback(query))
+        async with AsyncSessionLocal() as db:
+            stored = await db.get(ProviderConnection, connection.id)
+            snapshot = await providers.catalog_snapshot(stored, self.owner.id, db)
+            status = providers.catalog_status(stored, self.owner.id, snapshot=snapshot)
+        self.assertIsNone(status['error'])
+
+    async def test_cancelling_a_sign_in_keeps_the_original_credential(self):
+        """A5: a cancelled sign-in must not empty the stored session."""
+        from open_webui.routers import provider_auth
+        from open_webui.utils.providers import decrypt_credential
+
+        connection = await self.existing_connection('host-cancelled')
+        attempt, _ = await self.start_for(connection)
+        async with AsyncSessionLocal() as db:
+            await provider_auth.cancel_chatgpt_auth(attempt['attempt_id'], self.owner, db)
+        async with AsyncSessionLocal() as db:
+            stored = await db.get(ProviderConnection, connection.id)
+            credentials = json.loads(decrypt_credential(stored.credential))
+        self.assertEqual(credentials['access_token'], 'old-access')
+        self.assertEqual(credentials['refresh_token'], 'old-refresh')
+        self.assertEqual(stored.status, 'connected')
+
+    async def test_a_failed_sign_in_keeps_the_original_credential(self):
+        """A5: a failed exchange must not empty the stored session."""
+        from open_webui.routers import provider_auth
+        from open_webui.utils.providers import decrypt_credential
+
+        connection = await self.existing_connection('host-failed')
+        attempt, query = await self.start_for(connection)
+        with (
+            patch.object(
+                provider_auth,
+                'exchange_authorization_code',
+                new=AsyncMock(side_effect=HTTPException(502, 'OpenAI returned an invalid token response')),
+            ),
+            patch.object(
+                provider_auth,
+                'validate_id_token',
+                new=AsyncMock(return_value={'iss': 'https://auth.openai.com', 'sub': 'browser-subject'}),
+            ),
+        ):
+            with self.assertRaises(HTTPException):
+                await self.complete(attempt, self.callback(query))
+        async with AsyncSessionLocal() as db:
+            stored = await db.get(ProviderConnection, connection.id)
+            credentials = json.loads(decrypt_credential(stored.credential))
+        self.assertEqual(credentials['access_token'], 'old-access')
+        self.assertEqual(stored.status, 'connected')
 
 
 class ChatGPTIDTokenTests(unittest.IsolatedAsyncioTestCase):

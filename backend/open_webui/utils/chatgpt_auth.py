@@ -21,9 +21,21 @@ from fastapi import HTTPException
 from open_webui.internal.db import get_async_db_context
 from open_webui.models.provider_connections import ProviderConnection
 from open_webui.utils.provider_errors import (
+    ACTION_RECONNECT,
+    ACTION_RETRY_LATER,
     AUTHENTICATION,
     CONNECTION,
     RATE_LIMIT,
+    REASON_INVALID_CREDENTIALS,
+    REASON_QUOTA_EXHAUSTED,
+    REASON_RATE_LIMITED,
+    REASON_TIMEOUT,
+    REASON_TOKEN_EXPIRED,
+    REASON_UNKNOWN,
+    REASON_UPSTREAM_FAILURE,
+    STAGE_CATALOG,
+    STAGE_INFERENCE,
+    STAGE_OAUTH_REFRESH,
     UPSTREAM,
 )
 from open_webui.utils.providers import (
@@ -93,7 +105,7 @@ async def oauth_form(values: dict[str, str]) -> dict[str, Any]:
                     raise HTTPException(502, 'OpenAI token response is too large')
                 if response.status < 200 or response.status >= 300:
                     log.info('ChatGPT OAuth token endpoint returned HTTP %s', response.status)
-                    raise HTTPException(401, 'ChatGPT authorization could not be completed')
+                    raise _oauth_token_error(response.status, raw)
                 try:
                     data = json.loads(raw)
                 except (ValueError, UnicodeDecodeError):
@@ -104,7 +116,104 @@ async def oauth_form(values: dict[str, str]) -> dict[str, Any]:
     except HTTPException:
         raise
     except (aiohttp.ClientError, TimeoutError):
-        raise HTTPException(502, 'Could not reach OpenAI authentication') from None
+        raise _oauth_network_error() from None
+
+
+# OAuth error codes the token endpoint documents. `invalid_grant` is the one
+# that means "this session cannot be refreshed"; anything else must not be
+# reported as a broken credential.
+_OAUTH_INVALID_GRANT = 'invalid_grant'
+
+
+def _oauth_error_code(raw: bytes) -> str:
+    """Read the OAuth error code from a token endpoint response body."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return ''
+    if not isinstance(payload, dict):
+        return ''
+    code = payload.get('error')
+    return code if isinstance(code, str) else ''
+
+
+def _oauth_token_error(status: int, raw: bytes) -> HTTPException:
+    """Classify a token endpoint failure without collapsing it into a 401."""
+    code = _oauth_error_code(raw)
+    if status == 429:
+        return _oauth_http_error(
+            429,
+            status,
+            'ChatGPT usage limit reached; retry the sign-in later',
+            RATE_LIMIT,
+            REASON_RATE_LIMITED,
+            ACTION_RETRY_LATER,
+        )
+    if status >= 500:
+        return _oauth_http_error(
+            502,
+            status,
+            'ChatGPT authentication service is unavailable',
+            UPSTREAM,
+            REASON_UPSTREAM_FAILURE,
+            ACTION_RETRY_LATER,
+        )
+    if code == _OAUTH_INVALID_GRANT:
+        # The refresh token or authorization code is no longer usable.
+        return _oauth_http_error(
+            401,
+            status,
+            'ChatGPT authorization can no longer be completed; sign in again',
+            AUTHENTICATION,
+            REASON_TOKEN_EXPIRED,
+            ACTION_RECONNECT,
+        )
+    if status in (400, 401, 403):
+        return _oauth_http_error(
+            401,
+            status,
+            'ChatGPT authorization could not be completed; sign in again',
+            AUTHENTICATION,
+            REASON_INVALID_CREDENTIALS,
+            ACTION_RECONNECT,
+        )
+    return _oauth_http_error(
+        502,
+        status,
+        f'ChatGPT authorization failed with HTTP {status}',
+        UPSTREAM,
+        REASON_UNKNOWN,
+        ACTION_RETRY_LATER,
+    )
+
+
+def _oauth_network_error() -> HTTPException:
+    return _oauth_http_error(
+        502,
+        None,
+        'Could not reach OpenAI authentication',
+        CONNECTION,
+        REASON_TIMEOUT,
+        ACTION_RETRY_LATER,
+    )
+
+
+def _oauth_http_error(
+    status: int,
+    upstream_status: int | None,
+    detail: str,
+    category: str,
+    reason: str,
+    suggested_action: str,
+) -> HTTPException:
+    """Build an OAuth error that keeps its stage, reason and recovery action."""
+    error = HTTPException(status, detail)
+    error.provider_category = category
+    error.provider_status = upstream_status
+    error.provider_reason = reason
+    error.provider_suggested_action = suggested_action
+    error.provider_stage = STAGE_OAUTH_REFRESH
+    return error
 
 
 async def exchange_authorization_code(*, code: str, client_id: str, verifier: str, redirect_uri: str) -> dict[str, Any]:
@@ -253,7 +362,14 @@ def _refresh_lock(connection_id: str) -> asyncio.Lock:
 async def _refresh_credentials(connection: ProviderConnection, user, db) -> dict[str, Any]:
     credentials = await get_oauth_credentials(connection, user, db=db)
     if not credentials or not credentials.get('refresh_token'):
-        raise HTTPException(401, 'Reconnect this ChatGPT account')
+        raise _oauth_http_error(
+            401,
+            None,
+            'Reconnect this ChatGPT account',
+            AUTHENTICATION,
+            REASON_TOKEN_EXPIRED,
+            ACTION_RECONNECT,
+        )
     token = await oauth_form(
         {
             'grant_type': 'refresh_token',
@@ -267,7 +383,14 @@ async def _refresh_credentials(connection: ProviderConnection, user, db) -> dict
     if isinstance(expires_in, bool) or not isinstance(expires_in, (int, float)) or expires_in <= 0:
         raise HTTPException(502, 'OpenAI returned an invalid token lifetime')
     if not isinstance(token.get('access_token'), str) or not token['access_token']:
-        raise HTTPException(401, 'ChatGPT session must be reauthorized')
+        raise _oauth_http_error(
+            401,
+            None,
+            'ChatGPT session must be reauthorized',
+            AUTHENTICATION,
+            REASON_INVALID_CREDENTIALS,
+            ACTION_RECONNECT,
+        )
     if token.get('refresh_token') is not None and (
         not isinstance(token['refresh_token'], str) or not token['refresh_token']
     ):
@@ -278,7 +401,14 @@ async def _refresh_credentials(connection: ProviderConnection, user, db) -> dict
     if token.get('id_token'):
         refreshed_claims = await validate_id_token(token['id_token'], client_id=credentials['client_id'])
         if refreshed_claims.get('sub') != credentials.get('subject'):
-            raise HTTPException(401, 'ChatGPT account identity changed; reconnect this provider')
+            raise _oauth_http_error(
+                401,
+                None,
+                'ChatGPT account identity changed; reconnect this provider',
+                AUTHENTICATION,
+                REASON_INVALID_CREDENTIALS,
+                ACTION_RECONNECT,
+            )
     # Refresh responses may omit identity tokens. Preserve the already validated
     # identity and nonce is not applicable to a refresh grant.
     new_creds = dict(credentials)
@@ -297,7 +427,14 @@ async def _refresh_credentials(connection: ProviderConnection, user, db) -> dict
         }
     )
     if not new_creds['access_token'] or not REQUIRED_SCOPES.issubset(set(new_creds['scopes'])):
-        raise HTTPException(401, 'ChatGPT session must be reauthorized')
+        raise _oauth_http_error(
+            401,
+            None,
+            'ChatGPT session must be reauthorized',
+            AUTHENTICATION,
+            REASON_INVALID_CREDENTIALS,
+            ACTION_RECONNECT,
+        )
     await replace_oauth_credentials(connection, user, new_creds, db=db)
     return new_creds
 
@@ -306,7 +443,14 @@ async def get_provider_access_token(connection: ProviderConnection, user) -> str
     """Return a live OAuth token, serializing rotating refreshes by connection."""
     initial = await get_oauth_credentials(connection, user)
     if not initial or not initial.get('access_token'):
-        raise HTTPException(401, 'Reconnect this ChatGPT account')
+        raise _oauth_http_error(
+            401,
+            None,
+            'Reconnect this ChatGPT account',
+            AUTHENTICATION,
+            REASON_TOKEN_EXPIRED,
+            ACTION_RECONNECT,
+        )
     if int(initial.get('expires_at', 0)) > int(time.time()) + 90:
         return initial['access_token']
     lock = _refresh_lock(connection.id)
@@ -327,14 +471,21 @@ async def get_provider_access_token(connection: ProviderConnection, user) -> str
                 raise HTTPException(404, 'Provider connection not found')
             credentials = await get_oauth_credentials(row, user, db=db)
             if not credentials or not credentials.get('access_token'):
-                raise HTTPException(401, 'Reconnect this ChatGPT account')
+                raise _oauth_http_error(
+                    401,
+                    None,
+                    'Reconnect this ChatGPT account',
+                    AUTHENTICATION,
+                    REASON_TOKEN_EXPIRED,
+                    ACTION_RECONNECT,
+                )
             if int(credentials.get('expires_at', 0)) <= int(time.time()) + 90:
                 credentials = await _refresh_credentials(row, user, db)
             await db.commit()
             return credentials['access_token']
 
 
-async def _api_json(url: str, token: str, *, method='GET', payload=None):
+async def _api_json(url: str, token: str, *, method='GET', payload=None, stage=STAGE_CATALOG):
     headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
     if payload is not None:
         headers['Content-Type'] = 'application/json'
@@ -345,13 +496,24 @@ async def _api_json(url: str, token: str, *, method='GET', payload=None):
                 if len(raw) > 2_000_000:
                     raise HTTPException(502, 'ChatGPT response is too large')
                 if response.status in (401, 403):
-                    raise _chatgpt_error(401, response.status, 'ChatGPT rejected the connected account', AUTHENTICATION)
+                    raise _chatgpt_error(
+                        401,
+                        response.status,
+                        'ChatGPT rejected the connected account',
+                        AUTHENTICATION,
+                        reason=REASON_INVALID_CREDENTIALS,
+                        suggested_action=ACTION_RECONNECT,
+                        stage=stage,
+                    )
                 if response.status == 402:
                     raise _chatgpt_error(
                         402,
                         response.status,
                         'ChatGPT plan usage is unavailable. Review your plan and usage.',
                         RATE_LIMIT,
+                        reason=REASON_QUOTA_EXHAUSTED,
+                        suggested_action=ACTION_RETRY_LATER,
+                        stage=stage,
                     )
                 if response.status == 429:
                     raise _chatgpt_error(
@@ -359,10 +521,19 @@ async def _api_json(url: str, token: str, *, method='GET', payload=None):
                         response.status,
                         'ChatGPT usage limit reached. Review your plan usage and retry later.',
                         RATE_LIMIT,
+                        reason=REASON_RATE_LIMITED,
+                        suggested_action=ACTION_RETRY_LATER,
+                        stage=stage,
                     )
                 if response.status < 200 or response.status >= 300:
                     raise _chatgpt_error(
-                        502, response.status, f'ChatGPT request failed with HTTP {response.status}', UPSTREAM
+                        502,
+                        response.status,
+                        f'ChatGPT request failed with HTTP {response.status}',
+                        UPSTREAM,
+                        reason=REASON_UPSTREAM_FAILURE,
+                        suggested_action=ACTION_RETRY_LATER,
+                        stage=stage,
                     )
                 return json.loads(raw) if raw else {}
     except HTTPException:
@@ -370,18 +541,38 @@ async def _api_json(url: str, token: str, *, method='GET', payload=None):
     except (aiohttp.ClientError, TimeoutError, ValueError):
         error = HTTPException(502, 'Could not reach ChatGPT')
         error.provider_category = CONNECTION
+        error.provider_reason = REASON_TIMEOUT
+        error.provider_suggested_action = ACTION_RETRY_LATER
+        error.provider_stage = stage
         raise error from None
 
 
-def _chatgpt_error(status: int, upstream_status: int, detail: str, category: str) -> HTTPException:
+def _chatgpt_error(
+    status: int,
+    upstream_status: int,
+    detail: str,
+    category: str,
+    *,
+    reason: str | None = None,
+    suggested_action: str | None = None,
+    stage: str | None = None,
+) -> HTTPException:
     """Build a ChatGPT error that keeps the upstream status and its category.
 
     Without the upstream status every ChatGPT failure collapsed into a generic
-    "network / HTTP 502" in the interface.
+    "network / HTTP 502" in the interface. The reason and the suggested action
+    keep the failure actionable: a rejected session needs a new sign-in, a rate
+    limit needs patience.
     """
     error = HTTPException(status, detail)
     error.provider_status = upstream_status
     error.provider_category = category
+    if reason is not None:
+        error.provider_reason = reason
+    if suggested_action is not None:
+        error.provider_suggested_action = suggested_action
+    if stage is not None:
+        error.provider_stage = stage
     return error
 
 
@@ -459,16 +650,56 @@ async def chatgpt_chat_completion(connection: ProviderConnection, model_id: str,
         response = await session.post(f'{OPENAI_API}/responses', json=body, headers=headers, allow_redirects=False)
     except (aiohttp.ClientError, TimeoutError):
         await session.close()
-        raise HTTPException(502, 'Could not reach ChatGPT') from None
+        raise _chatgpt_error(
+            502,
+            None,
+            'Could not reach ChatGPT',
+            CONNECTION,
+            reason=REASON_TIMEOUT,
+            suggested_action=ACTION_RETRY_LATER,
+            stage=STAGE_INFERENCE,
+        ) from None
     if response.status < 200 or response.status >= 300:
         status_code = response.status
         response.release()
         await session.close()
         if status_code in (401, 403):
-            raise HTTPException(401, 'ChatGPT rejected the connected account')
+            raise _chatgpt_error(
+                401,
+                status_code,
+                'ChatGPT rejected the connected account',
+                AUTHENTICATION,
+                reason=REASON_INVALID_CREDENTIALS,
+                suggested_action=ACTION_RECONNECT,
+                stage=STAGE_INFERENCE,
+            )
         if status_code == 402:
-            raise HTTPException(402, 'ChatGPT plan usage is unavailable. Review your plan and usage.')
+            raise _chatgpt_error(
+                402,
+                status_code,
+                'ChatGPT plan usage is unavailable. Review your plan and usage.',
+                RATE_LIMIT,
+                reason=REASON_QUOTA_EXHAUSTED,
+                suggested_action=ACTION_RETRY_LATER,
+                stage=STAGE_INFERENCE,
+            )
         if status_code == 429:
-            raise HTTPException(429, 'ChatGPT usage limit reached. Review your plan usage and retry later.')
-        raise HTTPException(502, f'ChatGPT request failed with HTTP {status_code}')
+            raise _chatgpt_error(
+                429,
+                status_code,
+                'ChatGPT usage limit reached. Review your plan usage and retry later.',
+                RATE_LIMIT,
+                reason=REASON_RATE_LIMITED,
+                suggested_action=ACTION_RETRY_LATER,
+                stage=STAGE_INFERENCE,
+            )
+        raise _chatgpt_error(
+            502,
+            status_code,
+            f'ChatGPT request failed with HTTP {status_code}',
+            UPSTREAM,
+            reason=REASON_UPSTREAM_FAILURE,
+            suggested_action=ACTION_RETRY_LATER,
+            stage=STAGE_INFERENCE,
+        )
     return response, session

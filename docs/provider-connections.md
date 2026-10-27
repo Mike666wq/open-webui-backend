@@ -114,6 +114,27 @@ OpenAI/Azure API Key 设置。[ChatGPT OAuth 限制](https://developers.openai.c
 [语音转写](https://docs.siliconflow.cn/docs/api/audio-transcriptions-post) 和
 [图片生成](https://docs.siliconflow.cn/docs/userguide/capabilities/images)。
 
+## 失败时怎么恢复
+
+连接失败会按**真实阶段**与**真实原因**显示，而不是笼统的「失败」：
+
+| 现象                                   | 阶段            | 原因                       | 界面给出的动作 |
+| -------------------------------------- | --------------- | -------------------------- | -------------- |
+| 提示某个域名解析到 `198.18.x.x` 被拦截 | 获取模型列表     | `address_blocked`          | 检查服务器网络 |
+| 登录状态失效                           | 刷新登录状态     | `token_expired`            | 重新登录       |
+| 账号缺少权限                           | 获取模型列表     | `insufficient_permissions` | 检查账号权限   |
+| Key 被拒                               | 获取模型列表     | `invalid_credentials`      | 更换 API Key   |
+| 限流 / 额度不足                        | 调用模型         | `rate_limited` / `quota_exhausted` | 稍后重试 |
+
+要点：
+
+- **目录失败不等于推理不可用**。厂商可以拒绝模型列表却仍能正常推理；真实请求仍按凭据鉴权。
+- **403 不等于 Key 填错**，它表示账号缺权限，换 Key 解决不了。
+- 重新登录**沿用原连接**，不会新建第二个连接；取消或失败不会清空原凭据。
+- 换 Key **不会**清空白名单、改名、用途、启停状态与聊天里的模型引用。
+
+网络侧（fake-ip / 保留网段）的取证步骤、两条恢复路线与回滚方式见 [恢复手册](PROVIDER_RECOVERY.md)。
+
 ## 验证与发布
 
 后端 CI 的基础测试保持轻量；运行时测试使用临时数据库和合成凭据。集成测试通过临时回环服务检查真实 HTTP 转发、流式响应、私有隔离、共享权限撤销和 OAuth 配对重放，不调用收费厂商。

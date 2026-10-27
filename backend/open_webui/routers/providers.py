@@ -16,7 +16,11 @@ from open_webui.models.provider_connections import (
 from open_webui.utils.apps import validate_app_url
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.provider_capabilities import ADAPTERS, provider_family
-from open_webui.utils.provider_errors import ProviderRequestError
+from open_webui.utils.provider_errors import (
+    ProviderRequestError,
+    is_provider_error,
+    provider_error_response,
+)
 from open_webui.utils.provider_registry import GROUPS, require_supported_template
 from open_webui.utils.providers import (
     PROVIDER_CATALOG,
@@ -209,8 +213,15 @@ async def verify_ephemeral_connection(form: ProviderConnectionCreate, user=Depen
         is_active=True,
     )
     await initialize_model_catalog(connection)
-    verified = await verify_provider_connection(connection, user)
-    models = await discover_connection_models(connection, user)
+    try:
+        verified = await verify_provider_connection(connection, user)
+        models = await discover_connection_models(connection, user)
+    except HTTPException as exc:
+        # The taxonomy travels with the response: the wizard needs the stage,
+        # the reason and the suggested action to offer a recovery entry.
+        if not is_provider_error(exc):
+            raise
+        return provider_error_response(exc)
     return {'ok': verified, 'status': 'connected' if verified else 'manual', 'models': models}
 
 
@@ -368,7 +379,12 @@ async def verify_connection(
     connection_id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
     connection = await _connection_with_manage_access(connection_id, user, db)
-    models = await refresh_connection_catalog(connection, user, db)
+    try:
+        models = await refresh_connection_catalog(connection, user, db)
+    except HTTPException as exc:
+        if not is_provider_error(exc):
+            raise
+        return provider_error_response(exc)
     return {
         'ok': connection.status == 'connected',
         'status': connection.status,

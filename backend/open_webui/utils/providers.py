@@ -37,9 +37,24 @@ from open_webui.utils.provider_capabilities import (
     provider_family,
 )
 from open_webui.utils.provider_errors import (
+    ACTION_CHECK_PERMISSIONS,
+    ACTION_CHECK_SERVER_NETWORK,
+    ACTION_RECONNECT,
+    ACTION_REPLACE_KEY,
+    ACTION_RETRY_LATER,
     AUTHENTICATION,
+    CONNECTION,
     PROVIDER_NETWORK,
     RATE_LIMIT,
+    REASON_ADDRESS_BLOCKED,
+    REASON_INSUFFICIENT_PERMISSIONS,
+    REASON_INVALID_CREDENTIALS,
+    REASON_QUOTA_EXHAUSTED,
+    REASON_RATE_LIMITED,
+    REASON_UNKNOWN,
+    REASON_UPSTREAM_FAILURE,
+    STAGE_CATALOG,
+    STAGE_INFERENCE,
     UPSTREAM,
     ProviderRequestError,
     error_from_exception,
@@ -563,38 +578,69 @@ async def read_bounded_response(response, limit: int = 2_000_000) -> bytes:
     return b''.join(chunks)
 
 
-def provider_http_error(status: int) -> HTTPException:
+def provider_http_error(status: int, *, stage: str = STAGE_INFERENCE) -> HTTPException:
     """Build an HTTP error that keeps the upstream status and its category.
 
     The category is attached so that `catalog_error` can tell a genuine
     upstream fault apart from a local gateway failure. Without it every
     upstream status collapsed into a generic "network" error.
+
+    The reason and the suggested action say what the operator can do next.
+    A 403 is not a broken key: it is a permission the account does not have.
     """
     if status in (401, 403):
         error = HTTPException(status, 'Provider rejected the configured credentials or permissions')
         category = AUTHENTICATION
+        reason = REASON_INVALID_CREDENTIALS if status == 401 else REASON_INSUFFICIENT_PERMISSIONS
+        action = ACTION_REPLACE_KEY if status == 401 else ACTION_CHECK_PERMISSIONS
     elif status == 429:
         error = HTTPException(429, 'Provider usage limit reached; wait or check your plan quota')
         category = RATE_LIMIT
+        reason = REASON_RATE_LIMITED
+        action = ACTION_RETRY_LATER
     elif status == 402:
         error = HTTPException(402, 'Provider quota or balance is insufficient')
         category = RATE_LIMIT
+        reason = REASON_QUOTA_EXHAUSTED
+        action = ACTION_RETRY_LATER
     else:
         error = HTTPException(502, f'Provider request failed with HTTP {status}')
         category = UPSTREAM
+        reason = REASON_UPSTREAM_FAILURE
+        action = ACTION_RETRY_LATER
     error.provider_status = status
     error.provider_category = category
+    error.provider_reason = reason
+    error.provider_suggested_action = action
+    error.provider_stage = stage
     return error
 
 
-def _provider_http_error(exc) -> HTTPException:
+def _provider_http_error(exc, *, stage: str | None = None) -> HTTPException:
     """Translate a transport failure into an HTTP error with its category."""
     status = exc.status if exc.status in (401, 403, 402, 429) else 502
     error = HTTPException(status, exc.detail)
     error.provider_status = exc.upstream_status
     error.provider_category = exc.category
     error.provider_hint = exc.hint
+    error.provider_reason = exc.reason
+    error.provider_suggested_action = exc.suggested_action
+    error.provider_stage = stage or exc.stage
     return error
+
+
+def _recovery_action(connection, error: HTTPException) -> None:
+    """Align the suggested action with how this connection authenticates.
+
+    An OAuth session cannot be repaired by pasting a new key: it needs a new
+    sign-in. An API key connection cannot be repaired by signing in again.
+    """
+    if (
+        getattr(error, 'provider_category', None) == AUTHENTICATION
+        and connection is not None
+        and connection.auth_type == 'oauth'
+    ):
+        error.provider_suggested_action = ACTION_RECONNECT
 
 
 async def _request_json(connection: ProviderConnection, user, url: str, *, method='GET', body=None, params=None):
@@ -603,7 +649,9 @@ async def _request_json(connection: ProviderConnection, user, url: str, *, metho
     try:
         return await provider_request_json(url, headers=headers, method=method, body=body, params=params)
     except ProviderRequestError as exc:
-        raise _provider_http_error(exc) from None
+        error = _provider_http_error(exc, stage=STAGE_CATALOG)
+        _recovery_action(connection, error)
+        raise error from None
 
 
 async def discover_connection_models(connection: ProviderConnection, user) -> list[dict]:
@@ -1139,9 +1187,12 @@ async def _resolve_model(model_id: str, user, db: AsyncSession, allow_disabled=F
         or (not allow_disabled and model_id in await disabled_provider_model_ids(db))
     ):
         raise HTTPException(404, 'Provider model not found')
-    error = catalog_status(connection, user.id, await catalog_snapshot(connection, user.id, db)).get('error')
-    if error and error['category'] == 'authentication':
-        raise HTTPException(401, 'Provider authentication failed; refresh after correcting credentials')
+    # A cached catalog error is not an inference gate. The catalog and the
+    # inference path fail for different reasons: a provider can refuse the
+    # model list while still serving completions, and a stale catalog error
+    # must not take every enabled model of the connection offline. The real
+    # request below still authenticates with the configured credential, so
+    # access control, the whitelist and the provider switch all apply.
     available = await visible_connection_models(connection, user, db)
     metadata = next((model for model in available if model['upstream_id'] == upstream_id), None)
     if (
@@ -1216,13 +1267,16 @@ def _openai_payload(payload: dict, upstream_model_id: str) -> dict:
     return {key: value for key, value in payload.items() if key in allowed} | {'model': upstream_model_id}
 
 
-def _blocked_address_error(exc: ProviderAddressBlocked) -> HTTPException:
+def _blocked_address_error(exc: ProviderAddressBlocked, *, stage: str = STAGE_INFERENCE) -> HTTPException:
     error = HTTPException(502, 'Provider endpoint resolves to a prohibited address')
     error.provider_category = PROVIDER_NETWORK
     error.provider_hint = (
         f'地址 {exc.host} 解析到 {"、".join(exc.addresses[:4])}，落在保留网段（代理 fake-ip 常用该段），'
         '已被服务器安全策略拦截。'
     )
+    error.provider_reason = REASON_ADDRESS_BLOCKED
+    error.provider_suggested_action = ACTION_CHECK_SERVER_NETWORK
+    error.provider_stage = stage
     return error
 
 
@@ -1241,7 +1295,12 @@ async def _post_provider_request(connection, target_url: str, body, headers) -> 
         raise _blocked_address_error(exc) from None
     except (aiohttp.ClientError, TimeoutError):
         await session.close()
-        raise HTTPException(502, 'Could not reach the provider') from None
+        error = HTTPException(502, 'Could not reach the provider')
+        error.provider_category = CONNECTION
+        error.provider_reason = REASON_UNKNOWN
+        error.provider_suggested_action = ACTION_CHECK_SERVER_NETWORK
+        error.provider_stage = STAGE_INFERENCE
+        raise error from None
     return response, session
 
 
@@ -1286,7 +1345,9 @@ async def provider_chat_completion(
     if response.status < 200 or response.status >= 300:
         response.release()
         await session.close()
-        raise provider_http_error(response.status)
+        error = provider_http_error(response.status, stage=STAGE_INFERENCE)
+        _recovery_action(resolved.connection, error)
+        raise error
     if payload.get('stream'):
         from open_webui.utils.provider_stream import provider_stream
 

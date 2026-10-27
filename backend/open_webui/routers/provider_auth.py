@@ -16,6 +16,7 @@ from fastapi.responses import FileResponse
 from open_webui.internal.db import Base, get_async_db_context, get_async_session
 from open_webui.models.provider_connections import ProviderConnection
 from open_webui.utils.auth import get_verified_user
+from open_webui.utils.provider_errors import is_provider_error, provider_error_response
 from open_webui.utils.chatgpt_auth import (
     REQUIRED_SCOPES,
     build_authorize_url,
@@ -347,7 +348,12 @@ async def complete_chatgpt_auth(
         await db.rollback()
         raise HTTPException(404, 'Authorization attempt is invalid or expired')
     await db.commit()
-    return await _finish_chatgpt_auth(attempt, form, db)
+    try:
+        return await _finish_chatgpt_auth(attempt, form, db)
+    except HTTPException as exc:
+        if not is_provider_error(exc):
+            raise
+        return provider_error_response(exc)
 
 
 async def _finish_chatgpt_auth(attempt: ChatGPTAuthAttempt, form: CompleteForm, db: AsyncSession):
@@ -492,12 +498,16 @@ async def complete_browser_auth(
             state=callback['state'], client_id=callback['client_id'], token=token,
             granted_scope=callback.get('scope'),
         ), db)
-    except Exception:
+    except Exception as exc:
         await db.rollback()
         await db.execute(update(ChatGPTAuthAttempt).where(
             ChatGPTAuthAttempt.id == attempt_id, ChatGPTAuthAttempt.status == 'processing',
         ).values(status='failed', pkce_verifier=None))
         await db.commit()
+        # A rejected or expired token keeps the taxonomy: the browser needs to
+        # tell "sign in again" apart from "the provider is unreachable".
+        if isinstance(exc, HTTPException) and is_provider_error(exc):
+            return provider_error_response(exc)
         raise
 
 
