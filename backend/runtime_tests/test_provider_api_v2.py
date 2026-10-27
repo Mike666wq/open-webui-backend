@@ -163,3 +163,46 @@ class ProviderApiV2Tests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.json()['is_enabled'])
         listed = (await self.client.get('/providers/models')).json()['data']
         self.assertEqual([model['upstream_id'] for model in listed], ['deepseek-chat'])
+
+    async def test_editing_the_credential_keeps_the_models_of_an_unmigrated_connection(self):
+        """A legacy connection must still be able to move its models into the whitelist."""
+        legacy = new_provider_connection(
+            provider_id='deepseek',
+            name='Legacy',
+            auth_type='api_key',
+            owner_id=self.user.id,
+            visibility='private',
+            config={},
+            credential=providers.encrypt_credential('synthetic'),
+            status='configured',
+            models=[{'id': 'legacy-model', 'upstream_id': 'legacy-model', 'name': 'Legacy model'}],
+            is_active=True,
+            protocol='openai-compatible',
+            provider_template='deepseek',
+        )
+        async with get_async_db_context() as db:
+            db.add(legacy)
+            await db.commit()
+        response = await self.client.patch(
+            f'/providers/connections/{legacy.id}',
+            json={'api_key': 'rotated'},
+        )
+        self.assertEqual(response.status_code, 200)
+        async with get_async_db_context() as db:
+            stored = await db.get(ProviderConnection, legacy.id)
+            self.assertEqual([model['upstream_id'] for model in stored.models], ['legacy-model'])
+        listed = (await self.client.get(f'/providers/connections/{legacy.id}/models')).json()
+        self.assertEqual([model['upstream_id'] for model in listed['data']], ['legacy-model'])
+
+    async def test_editing_the_credential_keeps_the_curated_whitelist(self):
+        await self.client.post(
+            f'/providers/connections/{self.connection.id}/models',
+            json={'upstream_ids': ['deepseek-chat']},
+        )
+        response = await self.client.patch(
+            f'/providers/connections/{self.connection.id}',
+            json={'api_key': 'rotated'},
+        )
+        self.assertEqual(response.status_code, 200)
+        listed = (await self.client.get(f'/providers/connections/{self.connection.id}/models')).json()
+        self.assertEqual([model['upstream_id'] for model in listed['data']], ['deepseek-chat'])

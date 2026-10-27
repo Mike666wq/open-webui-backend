@@ -32,6 +32,7 @@ from open_webui.utils.providers import (
     legacy_model_access,
     public_connection,
     refresh_connection_catalog,
+    registry_migrated,
     require_connection_access,
     seed_connection_models,
     verify_provider_connection,
@@ -112,6 +113,17 @@ def _validate_bailian_config(provider_id, config):
         raise HTTPException(400, 'Invalid Bailian workspace ID')
     if region in {'eu-central-1', 'us-east-1', 'ap-northeast-1'} and not workspace and not config.get('base_url'):
         raise HTTPException(400, 'Bailian requires a workspace ID for this region')
+
+
+def _drop_redundant_legacy_models(connection):
+    """Clear the legacy model column only when the curated whitelist is authoritative.
+
+    A connection that has not been migrated yet keeps its legacy models: the
+    migration still has to move them into the curated whitelist, so clearing
+    them here would lose the user's model selection.
+    """
+    if registry_migrated(connection):
+        connection.models = []
 
 
 async def _connection_with_access(connection_id: str, user, db):
@@ -325,7 +337,7 @@ async def update_connection(
     connection.updated_at = max(int(time.time()), connection.updated_at + 1)
     if api_key or 'config' in values:
         connection.config = {key: value for key, value in (connection.config or {}).items() if key != '_models_by_user'}
-        connection.models = []
+        _drop_redundant_legacy_models(connection)
         connection.status = 'configured'
     await db.commit()
     return await public_connection(connection, db)
