@@ -1422,8 +1422,9 @@ def _blocked_address_error(exc: ProviderAddressBlocked, *, stage: str = STAGE_IN
     return error
 
 
-async def _post_provider_request(connection, target_url: str, body, headers) -> tuple:
+async def _post_provider_request(connection, target_url: str, body, headers, *, on_request_started=None) -> tuple:
     """Open a provider session and post the request, mapping transport failures."""
+    import asyncio
     allow_private = validate_app_url(target_url)
     session = aiohttp.ClientSession(
         connector=ProviderTCPConnector(allow_private=allow_private, allowed_networks=allowed_ip_networks()),
@@ -1431,7 +1432,12 @@ async def _post_provider_request(connection, target_url: str, body, headers) -> 
         trust_env=False,
     )
     try:
+        if on_request_started:
+            on_request_started()
         response = await session.post(target_url, json=body, headers=headers, allow_redirects=False)
+    except asyncio.CancelledError:
+        await session.close()
+        raise
     except ProviderAddressBlocked as exc:
         await session.close()
         raise _blocked_address_error(exc) from None
@@ -1447,7 +1453,7 @@ async def _post_provider_request(connection, target_url: str, body, headers) -> 
 
 
 async def provider_chat_completion(
-    model_id: str, payload: dict, user, db: AsyncSession | None = None, *, allow_disabled=False
+    model_id: str, payload: dict, user, db: AsyncSession | None = None, *, allow_disabled=False, on_request_started=None
 ):
     """Authorize and forward a completion, returning JSON or an SSE response."""
     resolved = (
@@ -1483,7 +1489,9 @@ async def provider_chat_completion(
             target_path = '/chat/completions'
             headers = {**provider_request_headers(connection, token), 'Content-Type': 'application/json'}
         target_url = f'{provider_base_url(connection)}{target_path}'
-        response, session = await _post_provider_request(connection, target_url, body, headers)
+        response, session = await _post_provider_request(
+            connection, target_url, body, headers, on_request_started=on_request_started
+        )
     if response.status < 200 or response.status >= 300:
         response.release()
         await session.close()
@@ -1692,7 +1700,7 @@ async def delete_provider_connection(
         if not connection or connection.provider_id != provider_id or connection.owner_id != user.id:
             raise HTTPException(404, 'Provider connection not found')
         connection.credential = None
-        connection.is_active = True
+        connection.is_active = False
         connection.models = []
         connection.config = {key: value for key, value in (connection.config or {}).items() if key != '_models_by_user'}
         connection.status = 'disconnected'

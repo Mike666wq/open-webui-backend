@@ -569,13 +569,14 @@ async def disconnect_chatgpt(
     )
     await db.refresh(connection)
     credentials = await get_oauth_credentials(connection, user, db=db)
-    revocation_confirmed = await revoke_chatgpt_session(credentials)
+    revocation_confirmed = bool(credentials.get('refresh_token') and credentials.get('client_id')) and (
+        await revoke_chatgpt_session(credentials)
+    )
     connection.config = {
         **(connection.config or {}),
         'client_id': credentials.get('client_id') or (connection.config or {}).get('client_id'),
         'subject': credentials.get('subject') or (connection.config or {}).get('subject'),
         'host_id': credentials.get('host_id') or (connection.config or {}).get('host_id'),
     }
-    await db.commit()
     await delete_provider_connection(connection_id, user, db=db)
     return {'status': 'disconnected', 'revocation_confirmed': revocation_confirmed}

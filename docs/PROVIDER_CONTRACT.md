@@ -537,7 +537,7 @@ provider_media.call_media_service(service, *, model, credential, input) -> norma
 ### 14.3 MiniMax 同步 TTS（A8）
 
 - `POST t2a_v2`；携带有效 `model`、`text`、`voice_setting` 与 `audio_setting`，
-  `audio_setting.format=mp3`、`stream=false`、`output_format=hex`。
+  `audio_setting.format=mp3`；`stream=false` 与 `output_format=hex` 位于请求顶层。
 - **非零 `base_resp` 先转错误**；合法 `data.audio` 按 hex 解码并校验实际音频。
 - **不得**把 JSON、错误文字或非法 hex 写成 mp3。
 - 系统音色查询（`POST /v1/get_voice`）与手工 voice ID 可用；
@@ -614,3 +614,30 @@ provider_media.call_media_service(service, *, model, credential, input) -> norma
 - 能获取的时长 / 字符 / 图片数量用**对应单位**存进现有 `usage` JSON；
   **无计量则 `null`**，**不伪造** token 或费用。
 - 记录**不得**包含上传音频、合成文本、图片内容、Key 或原始业务错误体。
+
+---
+
+## 18. 模型测试流与连接移除（P-003）
+
+- 保留 `POST /connections/{id}/model-test` 及原 JSON 语义；新增
+  `POST /connections/{id}/model-test-stream`，使用相同载荷、权限、适配器、
+  配置指纹和测试结果保存规则。浏览器以带认证的 `fetch` POST 消费 SSE。
+- 事件为 `{test_id, seq, phase, elapsed_ms, data}`；phase 为 `accepted`、
+  `request_started`、`response_headers`、`output_delta`、`completed` 或 `failed`。
+  耗时取服务端单调时钟，自该次测试开始；仅实际观测到的阶段才发出。
+  建立流之前拒绝返回 HTTP 错误，建立之后失败以终态事件返回。
+- 终态包含原有 `status`、`elapsed_ms`、`error`，并提供 `timings`：
+  `upstream_headers_ms`、`first_output_ms`、`upstream_total_ms`；无法观测为 null。
+  测试总耗时包括上游请求及响应处理，不包含鉴权与模型解析，浏览器耗时单独标注。
+- 支持流式的聊天模型仅发一次流式推理，以首个非空回答文本增量记录首输出；
+  非流式不测首输出。取消、断流、超时或解析失败不得记成功、自动重试或重新推理；
+  样例输出只临时展示，最多 8 KiB，不能存入调用记录。旧后端不支持流端点时，
+  仅在确认尚未发送推理时回退 JSON 测试，并标注只有总耗时。
+- API Key 连接通过原 DELETE 移除；OAuth 通过对应的断开接口，保留刷新与断开锁。
+  本站删除成功与远端撤销是否确认分开报告；删除完成后的目录刷新失败单独报告。
+  连接、模型和访问权限删除后不可用于新请求，保留历史聊天文本。
+- MiniMax 媒体服务继续使用现有加密连接凭据与独立用途模型；不同 Key 应建立独立
+  连接，不覆盖聊天凭据。转写与合成地址分别为 `/v1/speech_to_text` 和 `/v1/t2a_v2`，
+  Base URL 和完整 URL 均不得重复追加路径；保存配置、列目录和查音色不触发推理。
+- `POST /connections/{id}/models` 可选 `source` 为 `provider`（默认）、`manual` 或 `preset`；
+  `preset` 只接受该用途的官方声明中的模型和适配器，保留来源，不影响旧请求。

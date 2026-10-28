@@ -198,8 +198,10 @@ class MiniMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call['json']['text'], 'hello')
         self.assertEqual(call['json']['voice_setting'], {'voice_id': 'voice-id'})
         self.assertEqual(call['json']['audio_setting']['format'], 'mp3')
-        self.assertEqual(call['json']['audio_setting']['output_format'], 'hex')
-        self.assertFalse(call['json']['audio_setting']['stream'])
+        self.assertEqual(call['json']['output_format'], 'hex')
+        self.assertFalse(call['json']['stream'])
+        self.assertNotIn('output_format', call['json']['audio_setting'])
+        self.assertNotIn('stream', call['json']['audio_setting'])
 
     async def test_speech_refuses_a_business_failure_inside_a_http_200(self):
         body = b'{"base_resp": {"status_code": 1004, "status_msg": "invalid api key"}}'
@@ -359,6 +361,8 @@ class MiniMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     def test_the_speech_body_never_streams(self):
         payload = provider_minimax.speech_payload(model='speech-2.8-hd', text='hi', voice='v')
-        self.assertFalse(payload['audio_setting']['stream'])
-        self.assertEqual(payload['audio_setting']['output_format'], 'hex')
+        self.assertFalse(payload['stream'])
+        self.assertEqual(payload['output_format'], 'hex')
+        self.assertNotIn('stream', payload['audio_setting'])
+        self.assertNotIn('output_format', payload['audio_setting'])
         self.assertEqual(payload['voice_setting'], {'voice_id': 'v'})

@@ -120,10 +120,10 @@ def speech_payload(
     payload = {
         'model': model,
         'text': text,
+        'output_format': 'hex',
+        'stream': False,
         'audio_setting': {
             'format': audio_format,
-            'output_format': 'hex',
-            'stream': False,
         },
     }
     voice_setting = {}

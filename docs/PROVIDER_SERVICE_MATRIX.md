@@ -213,3 +213,9 @@ HTTP 200 的业务失败用 `upstream_http_status=200` + 真实业务码表达�
 - MiniMax 原生图生图或图片编辑。
 - 百炼原生语音 / 图片、Gemini / Anthropic / Bedrock / local 的媒体接入。
 - Bridge 实时语音链路（独立问题，另行规划）。
+
+## P-003：MiniMax 同步 TTS 载荷
+
+同步 `t2a_v2` 使用顶层 `stream: false` 与 `output_format: "hex"`；
+`audio_setting` 保存音频参数（如 `format: "mp3"`）。业务失败先识别，
+成功音频才解码。配置与音色查询不会发起推理。

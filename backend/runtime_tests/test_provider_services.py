@@ -88,6 +88,86 @@ class ProviderServicesTests(unittest.IsolatedAsyncioTestCase):
             'preset',
         )
 
+    async def test_streamed_transcription_shows_ephemeral_text_and_keeps_old_json(self):
+        import base64
+        import json
+
+        created = await self.client.post('/providers/connections', json={
+            'provider_template': 'minimax', 'name': 'ASR', 'api_key': 'synthetic-key',
+            'config': {'services': {'transcription': {'enabled': True, 'adapter': 'minimax-transcription',
+                      'endpoint': {'kind': 'base_url', 'url': 'https://api.minimax.cn/v1'}}}},
+            'model_selections': [{'upstream_id': 'asr-1.0', 'uses': {'transcription': 'minimax-transcription'},
+                                  'source': 'preset'}],
+        })
+        self.assertEqual(created.status_code, 200, created.text)
+        connection_id = created.json()['id']
+        payload = {'upstream_id': 'asr-1.0', 'purpose': 'transcription',
+                   'audio_base64': base64.b64encode(b'audio').decode(), 'filename': 'sample.mp3'}
+        with patch.object(provider_media, 'call_media_service', new=AsyncMock(return_value={'text': 'temporary text'})) as call:
+            old = await self.client.post(f'/providers/connections/{connection_id}/model-test', json=payload)
+            stream = await self.client.post(f'/providers/connections/{connection_id}/model-test-stream', json=payload)
+        self.assertEqual(old.status_code, 200, old.text)
+        self.assertEqual(old.json()['status'], 'passed')
+        self.assertNotIn('sample_text', old.json())
+        events = [json.loads(frame[6:]) for frame in stream.text.strip().split('\n\n')]
+        self.assertEqual(events[-1]['phase'], 'completed')
+        self.assertEqual(events[-1]['data']['sample_text'], 'temporary text')
+        self.assertEqual(call.await_count, 2)  # One explicit inference per endpoint invocation.
+        history = (await self.client.get('/providers/calls/history')).text
+        self.assertNotIn('temporary text', history)
+
+    async def test_added_preset_models_reject_wrong_adapter(self):
+        created = await self.client.post('/providers/connections', json={
+            'provider_template': 'minimax', 'name': 'ASR', 'api_key': 'synthetic-key',
+            'config': {'services': {'transcription': {'enabled': True, 'adapter': 'minimax-transcription',
+                      'endpoint': {'kind': 'base_url', 'url': 'https://api.minimax.cn/v1'}}}},
+        })
+        self.assertEqual(created.status_code, 200, created.text)
+        connection_id = created.json()['id']
+        invalid = await self.client.post(f'/providers/connections/{connection_id}/models', json={
+            'upstream_ids': ['asr-1.0'], 'uses': {'transcription': 'openai-transcription'}
+        })
+        self.assertEqual(invalid.status_code, 400)
+        valid = await self.client.post(f'/providers/connections/{connection_id}/models', json={
+            'upstream_ids': ['asr-1.0'], 'uses': {'transcription': 'minimax-transcription'}, 'source': 'preset'
+        })
+        self.assertEqual(valid.status_code, 200, valid.text)
+        self.assertEqual(valid.json()['data'][0]['uses'], {'transcription': 'minimax-transcription'})
+        self.assertEqual(valid.json()['data'][0]['source'], 'preset')
+        forged = await self.client.post(f'/providers/connections/{connection_id}/models', json={
+            'upstream_ids': ['not-an-official-preset'],
+            'uses': {'transcription': 'minimax-transcription'}, 'source': 'preset'
+        })
+        self.assertEqual(forged.status_code, 400)
+
+    async def test_model_test_does_not_save_result_after_model_purpose_changes(self):
+        import base64
+        import json
+
+        created = await self.client.post('/providers/connections', json={
+            'provider_template': 'minimax', 'name': 'ASR', 'api_key': 'synthetic-key',
+            'config': {'services': {'transcription': {'enabled': True, 'adapter': 'minimax-transcription',
+                      'endpoint': {'kind': 'base_url', 'url': 'https://api.minimax.cn/v1'}}}},
+            'model_selections': [{'upstream_id': 'asr-1.0', 'uses': {'transcription': 'minimax-transcription'},
+                                  'source': 'preset'}],
+        })
+        connection_id = created.json()['id']
+
+        async def change_during_call(*args, **kwargs):
+            response = await self.client.put(f'/providers/connections/{connection_id}/models/asr-1.0',
+                                             json={'uses': {}})
+            self.assertEqual(response.status_code, 200, response.text)
+            return {'text': 'should not be accepted'}
+
+        payload = {'upstream_id': 'asr-1.0', 'purpose': 'transcription',
+                   'audio_base64': base64.b64encode(b'audio').decode(), 'filename': 'sample.mp3'}
+        with patch.object(provider_media, 'call_media_service', new=AsyncMock(side_effect=change_during_call)):
+            stream = await self.client.post(f'/providers/connections/{connection_id}/model-test-stream', json=payload)
+        events = [json.loads(frame[6:]) for frame in stream.text.strip().split('\n\n')]
+        self.assertEqual(events[-1]['phase'], 'failed')
+        self.assertEqual(events[-1]['data']['status'], 'failed')
+        self.assertNotIn('should not be accepted', stream.text)
+
     async def test_template_identity_survives_a_missing_provider_id(self):
         template = resolve_template('minimax', 'custom')
         self.assertEqual(template['id'], 'minimax')
