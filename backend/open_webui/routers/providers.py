@@ -4,8 +4,10 @@ import re
 import time
 import uuid
 from types import SimpleNamespace
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from open_webui.internal.db import get_async_session
 from open_webui.models.access_grants import AccessGrant, AccessGrants
 from open_webui.models.provider_connections import (
@@ -790,6 +792,7 @@ class ModelAdd(BaseModel):
     upstream_ids: list[str] = Field(min_length=1, max_length=500)
     display_names: dict[str, str] = Field(default_factory=dict)
     uses: dict[str, str] | None = None
+    source: Literal['provider', 'preset', 'manual'] = 'provider'
 
 
 @router.post('/connections/{connection_id}/models')
@@ -801,13 +804,28 @@ async def add_connection_models(
 ):
     """Add the models the user picked to the curated whitelist."""
     connection = await _connection_with_manage_access(connection_id, user, db)
+    if form.uses is not None:
+        form.uses = validate_model_uses(connection, form.uses)
+    if form.source == 'preset':
+        from open_webui.utils.provider_capabilities import service_declaration
+
+        declared = [
+            item
+            for purpose in (form.uses or {})
+            for item in service_declaration(connection, purpose).get('preset_models') or []
+        ]
+        if not form.uses or any(
+            not any(item.get('upstream_id') == model and item.get('uses') == form.uses for item in declared)
+            for model in form.upstream_ids
+        ):
+            raise HTTPException(400, 'Select an official preset for this service')
     added = await seed_connection_models(
         connection,
         form.upstream_ids,
         db,
         display_names=form.display_names,
         uses=form.uses,
-        source='provider',
+        source=form.source,
         user_id=user.id,
     )
     await db.commit()
@@ -971,6 +989,12 @@ def _media_test_usage(purpose: str, result: dict, payload: dict) -> dict | None:
 async def test_model(
     connection_id: str, form: ModelTest, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
+    return await _test_model(connection_id, form, user, db)
+
+
+async def _test_model(
+    connection_id: str, form: ModelTest, user, db, *, include_sample=False, start_time=None, expected_fingerprint=None
+):
     import time
 
     from open_webui.utils.provider_capabilities import fingerprint
@@ -993,19 +1017,26 @@ async def test_model(
         else await resolve_media_model(model_id, user, form.purpose, db, allow_disabled=True)
     )
     before = fingerprint(connection, resolved.model_metadata)
-    started = time.monotonic()
-    if connection.auth_type != 'api_key':
+    if expected_fingerprint is not None and before != expected_fingerprint:
+        raise HTTPException(409, 'Configuration changed before the test; no request was sent')
+    started = start_time if start_time is not None else time.monotonic()
+    if form.purpose == 'chat':
+        import asyncio
+
         from open_webui.utils.providers import catalog_error
 
         outcome, error, usage = 'passed', None, None
         try:
-            result = await provider_chat_completion(
-                model_id,
-                {'messages': [{'role': 'user', 'content': 'Reply OK.'}], 'stream': False},
-                user,
-                db,
-                allow_disabled=True,
-            )
+            async with asyncio.timeout(120):
+                result = await provider_chat_completion(
+                    model_id,
+                    {'messages': [{'role': 'user', 'content': 'Reply OK.'}], 'stream': False, 'max_tokens': 32},
+                    user,
+                    db,
+                    allow_disabled=True,
+                )
+            if not isinstance(result, dict) or not (result.get('choices') or result.get('output')):
+                raise HTTPException(502, 'Provider did not return a chat response')
             usage = result.get('usage') if isinstance(result, dict) else None
         except Exception as exc:
             outcome, error = 'failed', catalog_error(exc)
@@ -1014,49 +1045,6 @@ async def test_model(
         )
     connection, key = await get_media_api_connection(connection_id, user, db)
     outcome, error, usage = 'passed', None, None
-    if form.purpose == 'chat':
-        import json
-
-        import aiohttp
-        from open_webui.utils.providers import (
-            catalog_error,
-            media_http_session,
-            provider_base_url,
-            provider_http_error,
-            read_bounded_response,
-        )
-
-        if resolved.model_metadata['uses']['chat'] == 'responses':
-            path, payload = '/responses', {'model': form.upstream_id, 'input': 'Reply OK.', 'max_output_tokens': 32}
-        else:
-            path, payload = (
-                '/chat/completions',
-                {'model': form.upstream_id, 'messages': [{'role': 'user', 'content': 'Reply OK.'}], 'max_tokens': 32},
-            )
-        try:
-            # Explicit test only: exactly one upstream inference, never retry uncertain calls.
-            async with media_http_session(connection) as session:
-                async with session.post(
-                    provider_base_url(connection) + path,
-                    json=payload,
-                    headers={'Authorization': f'Bearer {key}'},
-                    allow_redirects=False,
-                    timeout=aiohttp.ClientTimeout(total=120),
-                ) as response:
-                    if not 200 <= response.status < 300:
-                        raise provider_http_error(response.status)
-                    raw = await read_bounded_response(response)
-                    result = json.loads(raw)
-                    usage = result.get('usage')
-                    if not (result.get('choices') or result.get('output')):
-                        raise HTTPException(502, 'Provider did not return a chat response')
-        except Exception as exc:
-            from open_webui.utils.providers import catalog_error
-
-            outcome, error = 'failed', catalog_error(exc)
-        return await _save_model_test(
-            connection, resolved.model_metadata, before, form.purpose, outcome, error, started, user, db, usage
-        )
     adapter = resolved.model_metadata['uses'].get(form.purpose)
     if not adapter:
         raise HTTPException(400, 'Select a model supporting this purpose')
@@ -1095,7 +1083,149 @@ async def test_model(
         'endpoint': service.endpoint,
         'model': form.upstream_id,
     }
+    if include_sample and outcome == 'passed':
+        if form.purpose == 'transcription' and isinstance(result.get('text'), str):
+            response['sample_text'] = result['text'].encode('utf-8')[:8192].decode('utf-8', errors='ignore')
+        elif form.purpose == 'speech' and isinstance(result.get('audio'), bytes):
+            import base64
+
+            response['sample_audio_base64'] = base64.b64encode(result['audio']).decode('ascii')
+            response['sample_audio_type'] = result.get('content_type') or 'audio/mpeg'
     return response
+
+
+@router.post('/connections/{connection_id}/model-test-stream')
+async def test_model_stream(
+    connection_id: str, form: ModelTest, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+):
+    """Stream only observed events; never start a second inference to obtain timings."""
+    import json
+
+    from open_webui.models.provider_calls import reported_usage
+    from open_webui.utils.provider_capabilities import fingerprint
+    from open_webui.utils.provider_stream import encode_event
+    from open_webui.utils.providers import provider_chat_completion, resolve_media_model, resolve_model, stable_model_id
+
+    connection = await _connection_with_manage_access(connection_id, user, db)
+    if connection.auth_type != 'api_key' and form.purpose != 'chat':
+        raise HTTPException(400, 'Account connections support chat testing only')
+    model_id = stable_model_id(connection_id, form.upstream_id)
+    resolved = (
+        await resolve_model(model_id, user, db, allow_disabled=True)
+        if form.purpose == 'chat'
+        else await resolve_media_model(model_id, user, form.purpose, db, allow_disabled=True)
+    )
+    if form.purpose != 'chat':
+        adapter = resolved.model_metadata.get('uses', {}).get(form.purpose)
+        if not adapter:
+            raise HTTPException(400, 'Select a model supporting this purpose')
+        _media_test_payload(form, adapter)
+    before = fingerprint(connection, resolved.model_metadata)
+    test_id = str(uuid.uuid4())
+
+    async def events():
+        import asyncio
+
+        started = time.monotonic()
+        seq = 0
+        timings = {'upstream_headers_ms': None, 'first_output_ms': None, 'upstream_total_ms': None}
+
+        def emit(phase, data=None):
+            nonlocal seq
+            seq += 1
+            return encode_event({'test_id': test_id, 'seq': seq, 'phase': phase,
+                                 'elapsed_ms': int((time.monotonic() - started) * 1000), 'data': data or {}})
+
+        yield emit('accepted')
+        if form.purpose != 'chat':
+            try:
+                result = await _test_model(
+                    connection_id, form, user, db, include_sample=True, start_time=started, expected_fingerprint=before
+                )
+                result['timings'] = timings
+                yield emit('completed' if result.get('status') == 'passed' else 'failed', result)
+            except Exception as exc:
+                yield emit('failed', {'status': 'failed', 'elapsed_ms': int((time.monotonic() - started) * 1000),
+                                      'error': catalog_error(exc), 'timings': timings})
+            return
+
+        outcome, error, usage = 'failed', None, None
+        terminal = False
+        preview_bytes = 0
+        stream = None
+        try:
+            start_signal = asyncio.Event()
+            task = asyncio.create_task(provider_chat_completion(
+                model_id, {'messages': [{'role': 'user', 'content': 'Reply OK.'}], 'stream': True,
+                           'max_tokens': 32}, user, db, allow_disabled=True, on_request_started=start_signal.set
+            ))
+            signal_task = asyncio.create_task(start_signal.wait())
+            try:
+                await asyncio.wait((task, signal_task), return_when=asyncio.FIRST_COMPLETED)
+                if start_signal.is_set():
+                    yield emit('request_started')
+                stream = await task
+            finally:
+                signal_task.cancel()
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            timings['upstream_headers_ms'] = int((time.monotonic() - started) * 1000)
+            yield emit('response_headers')
+            async for frame in stream.body_iterator:
+                raw = frame.decode('utf-8') if isinstance(frame, bytes) else frame
+                if not raw.startswith('data:'):
+                    raise ValueError('invalid stream frame')
+                data = raw[5:].strip()
+                if data == '[DONE]':
+                    terminal = True
+                    break
+                event = json.loads(data)
+                if not isinstance(event, dict) or event.get('error') or event.get('type') in ('error', 'response.failed', 'response.incomplete'):
+                    raise ValueError('upstream stream failed')
+                delta = ''
+                if event.get('type') == 'response.output_text.delta':
+                    delta = event.get('delta') or ''
+                elif isinstance(event.get('choices'), list):
+                    for choice in event['choices']:
+                        content = (choice.get('delta') or {}).get('content')
+                        if isinstance(content, str):
+                            delta += content
+                if isinstance(event.get('usage'), dict):
+                    usage = event['usage']
+                if event.get('type') == 'response.completed':
+                    terminal = True
+                    usage = (event.get('response') or {}).get('usage') or usage
+                if isinstance(delta, str) and delta:
+                    if timings['first_output_ms'] is None:
+                        timings['first_output_ms'] = int((time.monotonic() - started) * 1000)
+                    available = max(0, 8192 - preview_bytes)
+                    clipped = delta.encode('utf-8')[:available].decode('utf-8', errors='ignore')
+                    preview_bytes += len(clipped.encode('utf-8'))
+                    if clipped:
+                        yield emit('output_delta', {'text': clipped})
+                if terminal:
+                    break
+            if not terminal or timings['first_output_ms'] is None:
+                raise ValueError('incomplete stream')
+            timings['upstream_total_ms'] = int((time.monotonic() - started) * 1000)
+            outcome = 'passed'
+        except Exception as exc:
+            error = catalog_error(exc)
+        finally:
+            if stream is not None and hasattr(stream.body_iterator, 'aclose'):
+                await stream.body_iterator.aclose()
+        try:
+            result = await _save_model_test(connection, resolved.model_metadata, before, form.purpose,
+                                            outcome, error, started, user, db, usage)
+            result['timings'] = timings
+            result['usage'] = reported_usage(usage)
+            yield emit('completed' if outcome == 'passed' else 'failed', result)
+        except Exception as exc:
+            yield emit('failed', {'status': 'failed', 'elapsed_ms': int((time.monotonic() - started) * 1000),
+                                  'error': catalog_error(exc), 'timings': timings})
+
+    return StreamingResponse(events(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache'})
 
 
 class VoiceFetch(BaseModel):
@@ -1147,10 +1277,25 @@ async def _save_model_test(
     from open_webui.utils.provider_capabilities import fingerprint
 
     elapsed = int((time.monotonic() - started) * 1000)
-    await db.refresh(connection)
-    # The metadata already carries the curated purposes; re-deriving them would
-    # change the fingerprint and invalidate the result we are about to store.
-    current = metadata
+    await db.refresh(connection, with_for_update=True)
+    # Refresh a curated model as well as the connection: its uses may have
+    # changed while the upstream request was in flight.
+    from open_webui.models.provider_connections import ProviderModel
+    from open_webui.utils.providers import connection_models, registry_migrated
+
+    if registry_migrated(connection):
+        await db.execute(
+            select(ProviderModel)
+            .where(ProviderModel.connection_id == connection.id, ProviderModel.upstream_id == metadata['upstream_id'])
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    current = next(
+        (item for item in await connection_models(connection, db) if item['upstream_id'] == metadata['upstream_id']),
+        None,
+    )
+    if current is None:
+        raise HTTPException(409, 'Configuration changed during the test; result was not saved')
     if fingerprint(connection, current) != before:
         raise HTTPException(409, 'Configuration changed during the test; result was not saved')
     result = {

@@ -3,10 +3,13 @@
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 from fastapi import HTTPException
 from open_webui.models.provider_connections import ProviderConnectionUpdate, new_provider_connection
 from open_webui.utils import providers
+from open_webui.internal.db import get_async_db_context
+from open_webui.routers import kimi_auth, provider_auth, providers as provider_api
 
 
 class ProviderConnectionTests(unittest.IsolatedAsyncioTestCase):
@@ -27,6 +30,52 @@ class ProviderConnectionTests(unittest.IsolatedAsyncioTestCase):
             is_active=True,
         )
         self.db = SimpleNamespace(commit=AsyncMock())
+
+    async def test_disconnect_expired_oauth_hides_connection_without_claiming_revocation(self):
+        owner = SimpleNamespace(id='disconnect-' + str(uuid4()), role='user')
+        async with get_async_db_context() as db:
+            connection = await providers.create_provider_connection(
+                owner, {'client_id': 'client'}, db=db, credentials={'access_token': 'expired'}
+            )
+            await db.commit()
+            with patch.object(provider_auth, 'revoke_chatgpt_session', new=AsyncMock()) as revoke:
+                result = await provider_auth.disconnect_chatgpt(connection.id, owner, db)
+            self.assertFalse(result['revocation_confirmed'])
+            revoke.assert_not_awaited()
+            await db.refresh(connection)
+            self.assertFalse(connection.is_active)
+            self.assertIsNone(connection.credential)
+            self.assertEqual(connection.models, [])
+            with self.assertRaises(HTTPException):
+                await providers.resolve_model(providers.stable_model_id(connection.id, 'old-model'), owner, db)
+            await db.delete(connection)
+            await db.commit()
+
+    async def test_expired_kimi_disconnect_removes_local_access(self):
+        owner = SimpleNamespace(id='kimi-disconnect-' + str(uuid4()), role='user')
+        async with get_async_db_context() as db:
+            connection = await providers.create_provider_connection(
+                owner, {}, db=db, credentials={'access_token': 'expired'}, provider_id='kimi'
+            )
+            await db.commit()
+            result = await kimi_auth.disconnect_kimi(connection.id, owner, db)
+            self.assertFalse(result['revocation_confirmed'])
+            await db.refresh(connection)
+            self.assertFalse(connection.is_active)
+            self.assertIsNone(connection.credential)
+            await db.delete(connection)
+            await db.commit()
+
+    async def test_delete_rejects_non_owner_and_propagates_commit_failure(self):
+        db = SimpleNamespace(get=AsyncMock(return_value=self.connection), delete=AsyncMock(), commit=AsyncMock())
+        with self.assertRaises(HTTPException) as unauthorized:
+            await provider_api.delete_connection(self.connection.id, self.other, db)
+        self.assertEqual(unauthorized.exception.status_code, 404)
+        db.delete.assert_not_awaited()
+        db.commit.side_effect = RuntimeError('transaction failed')
+        with patch.object(provider_api.AccessGrants, 'replace_access_grants', new=AsyncMock()):
+            with self.assertRaisesRegex(RuntimeError, 'transaction failed'):
+                await provider_api.delete_connection(self.connection.id, self.owner, db)
 
     async def test_private_connection_is_owner_only_even_for_admin(self):
         self.assertTrue(await providers.can_access_connection(self.connection, self.owner, self.db))

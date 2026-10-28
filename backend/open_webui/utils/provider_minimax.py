@@ -120,10 +120,10 @@ def speech_payload(
     payload = {
         'model': model,
         'text': text,
+        'output_format': 'hex',
+        'stream': False,
         'audio_setting': {
             'format': audio_format,
-            'output_format': 'hex',
-            'stream': False,
         },
     }
     voice_setting = {}
@@ -217,20 +217,70 @@ def voice_payload(*, voice_type: str = 'system') -> dict:
     return {'voice_type': voice_type}
 
 
+VOICE_BUCKETS = (
+    ('system_voice', 'system'),
+    ('voice_cloning', 'cloning'),
+    ('voice_generation', 'generation'),
+    ('music_generation', 'music'),
+)
+
+
 def voice_response(payload) -> list[dict]:
-    """Normalize a MiniMax voice listing response."""
-    data = payload.get('data') if isinstance(payload, dict) else None
-    voices = []
-    for item in data or []:
+    """Normalize a MiniMax voice listing response.
+
+    The official ``/v1/get_voice`` protocol returns top-level buckets
+    (``system_voice`` / ``voice_cloning`` / ``voice_generation`` …) and the
+    display name lives in ``voice_name`` — not in a single ``data`` array.
+    OpenAI-compatible gateways that keep the ``data`` shape stay supported as
+    a fallback.
+    """
+    if not isinstance(payload, dict):
+        return []
+    voices: list[dict] = []
+    seen: set[str] = set()
+
+    def _normalize(item, source):
+        if not isinstance(item, dict):
+            return None
+        voice_id = item.get('voice_id') or item.get('id')
+        if not voice_id:
+            return None
+        key = str(voice_id)
+        if key in seen:
+            return None
+        seen.add(key)
+        name = item.get('voice_name') or item.get('name')
+        if not name:
+            description = item.get('description')
+            if isinstance(description, list):
+                description = ' '.join(str(part) for part in description if part)
+            name = description if isinstance(description, str) and description else None
+        return {'id': key, 'name': name or key, 'source': source}
+
+    if any(payload.get(bucket) is not None for bucket, _source in VOICE_BUCKETS):
+        for bucket, source in VOICE_BUCKETS:
+            for item in payload.get(bucket) or []:
+                normalized = _normalize(item, source)
+                if normalized:
+                    voices.append(normalized)
+        return voices
+
+    for item in payload.get('data') or []:
         if not isinstance(item, dict):
             continue
         voice_id = item.get('voice_id') or item.get('id')
         if not voice_id:
             continue
+        key = str(voice_id)
+        if key in seen:
+            continue
+        seen.add(key)
         voices.append(
             {
-                'id': str(voice_id),
-                'name': item.get('name') or item.get('description') or str(voice_id),
+                'id': key,
+                'name': item.get('voice_name') or item.get('name')
+                or item.get('description')
+                or key,
                 'source': item.get('type') or 'system',
             }
         )

@@ -198,8 +198,10 @@ class MiniMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call['json']['text'], 'hello')
         self.assertEqual(call['json']['voice_setting'], {'voice_id': 'voice-id'})
         self.assertEqual(call['json']['audio_setting']['format'], 'mp3')
-        self.assertEqual(call['json']['audio_setting']['output_format'], 'hex')
-        self.assertFalse(call['json']['audio_setting']['stream'])
+        self.assertEqual(call['json']['output_format'], 'hex')
+        self.assertFalse(call['json']['stream'])
+        self.assertNotIn('output_format', call['json']['audio_setting'])
+        self.assertNotIn('stream', call['json']['audio_setting'])
 
     async def test_speech_refuses_a_business_failure_inside_a_http_200(self):
         body = b'{"base_resp": {"status_code": 1004, "status_msg": "invalid api key"}}'
@@ -332,6 +334,40 @@ class MiniMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.calls[0]['url'], 'https://api.minimax.cn/v1/get_voice')
         self.assertEqual(session.calls[0]['json'], {'voice_type': 'system'})
 
+    async def test_the_official_get_voice_buckets_are_parsed(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                (
+                    '{"base_resp": {"status_code": 0}, '
+                    '"system_voice": ['
+                    '{"voice_id": "female-qn-qingse", "voice_name": "青涩青年女声", '
+                    '"description": ["标准女声"]}, '
+                    '{"voice_id": "v2"}], '
+                    '"voice_cloning": [{"voice_id": "clone-1", "description": []}], '
+                    '"voice_generation": [{"voice_id": "clone-1", "description": []}]}'
+                ).encode('utf-8'),
+            )
+        )
+
+        @asynccontextmanager
+        async def session_scope(connection, **_options):
+            yield session
+
+        with patch.object(providers, 'media_http_session', side_effect=session_scope):
+            voices = await provider_media.fetch_voices(
+                self.connection, self.service('speech', 'minimax-speech'), 'saved-key', 'all'
+            )
+        self.assertEqual(
+            voices,
+            [
+                {'id': 'female-qn-qingse', 'name': '青涩青年女声', 'source': 'system'},
+                {'id': 'v2', 'name': 'v2', 'source': 'system'},
+                {'id': 'clone-1', 'name': 'clone-1', 'source': 'cloning'},
+            ],
+        )
+        self.assertEqual(session.calls[0]['json'], {'voice_type': 'all'})
+
     async def test_a_service_without_a_voice_list_says_so_locally(self):
         connection = SimpleNamespace(
             **{
@@ -359,6 +395,8 @@ class MiniMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     def test_the_speech_body_never_streams(self):
         payload = provider_minimax.speech_payload(model='speech-2.8-hd', text='hi', voice='v')
-        self.assertFalse(payload['audio_setting']['stream'])
-        self.assertEqual(payload['audio_setting']['output_format'], 'hex')
+        self.assertFalse(payload['stream'])
+        self.assertEqual(payload['output_format'], 'hex')
+        self.assertNotIn('stream', payload['audio_setting'])
+        self.assertNotIn('output_format', payload['audio_setting'])
         self.assertEqual(payload['voice_setting'], {'voice_id': 'v'})

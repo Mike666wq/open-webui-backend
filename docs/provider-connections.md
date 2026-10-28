@@ -176,3 +176,11 @@ python scripts/test_provider_chat_integration.py
 ### Administrator model switches
 
 Saved model switches apply to stable provider model IDs as well as legacy models. Disabled provider chat models are omitted from each user's chat catalog and rejected again during request resolution, including calls from existing conversations. Enabling a model does not expand the provider connection's access permissions. Discovery caches do not cache this switch.
+
+### P-003 语音使用与独立 Key
+
+先保存服务地址，再显式选择并启用官方预设模型，最后进入录音页或管理员音频设置。
+MiniMax 转写使用 `asr-1.0`，合成使用相应 speech 模型；聊天模型不能当作语音模型。
+如聊天和语音需要不同 Key，使用“新建此语音连接”，新连接默认私有，只配置所选语音用途；
+不覆盖聊天连接的 Key。音色可显式获取系统列表，也可手填 voice ID。真实套餐和密钥权限
+仍须账号所有者另行验证，保存配置或查询音色不会触发付费推理。
