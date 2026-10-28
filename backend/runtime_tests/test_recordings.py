@@ -525,6 +525,57 @@ class RecordingTests(unittest.IsolatedAsyncioTestCase):
             denied = await self.client.post(f'/api/v1/recordings/{id}/retry')
             self.assertEqual(denied.status_code, 404)
 
+    async def test_the_chunk_geometry_follows_the_service_limit(self):
+        from open_webui.models.provider_connections import new_provider_connection
+        from open_webui.utils import providers
+
+        connection = new_provider_connection(
+            provider_id='minimax',
+            provider_template='minimax',
+            name='MiniMax ASR',
+            auth_type='api_key',
+            visibility='private',
+            owner_id=self.owner.id,
+            config={
+                'base_url': 'https://api.minimax.chat/v1',
+                '_catalog_version': 1,
+                'model_ids': ['asr-1.0'],
+                '_model_overrides': {'asr-1.0': {'transcription': 'minimax-transcription'}},
+                'services': {
+                    'transcription': {
+                        'enabled': True,
+                        'adapter': 'minimax-transcription',
+                        'endpoint': {
+                            'kind': 'endpoint_url',
+                            'url': 'https://api.minimax.cn/v1/speech_to_text',
+                        },
+                    }
+                },
+            },
+            credential=providers.encrypt_credential('synthetic-key'),
+            status='connected',
+            models=[],
+            is_active=True,
+        )
+        async with get_async_db_context() as db:
+            db.add(connection)
+            await db.commit()
+        model_ref = providers.stable_model_id(connection.id, 'asr-1.0')
+        with patch.object(providers, '_request_json', new=AsyncMock(return_value={'data': []})):
+            response = await self.client.post(
+                '/api/v1/recordings',
+                headers={'Idempotency-Key': str(uuid.uuid4())},
+                files={'file': ('class.wav', self.wav(), 'audio/wav')},
+                data={'model_ref': model_ref},
+            )
+        self.assertEqual(response.status_code, 202, response.text)
+        config = response.json()['config']
+        # The MiniMax limit is 500 seconds; the chunk stays below it.
+        self.assertEqual(config['chunk_seconds'], 480)
+        self.assertEqual(config['model_ref'], model_ref)
+        # A connection without a smaller service limit keeps the generic one.
+        self.assertEqual((await service.references())['chunk_seconds'], 600)
+
     async def test_switching_recording_model_requires_explicit_full_restart(self):
         id = await self.create_job(1)
         async with get_async_db_context() as db:

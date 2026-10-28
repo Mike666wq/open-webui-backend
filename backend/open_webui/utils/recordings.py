@@ -30,7 +30,12 @@ from sqlalchemy.exc import IntegrityError
 
 log = logging.getLogger(__name__)
 ROOT = Path(DATA_DIR) / 'recordings'
+# The generic chunk length. A service that declares a smaller limit gets its
+# own, smaller chunk length; the value is stored in the job snapshot.
 CHUNK_SECONDS = 600
+# The margin left between the chunk length and the service limit, so an
+# encoding boundary cannot push a chunk over the limit.
+CHUNK_BOUNDARY_MARGIN = 20
 COMMAND_SLOTS = asyncio.Semaphore(2)
 AUDIO_FORMATS = 'wav,mp3,mov,matroska,webm,ogg,flac,aac,amr,asf,avi,au,aiff,caf'
 ACTIVE = ('preparing', 'transcribing', 'saving')
@@ -84,20 +89,52 @@ async def authorize(user, *, stt=False, model_ref=None):
             raise HTTPException(400, 'Configure a transcription model first')
 
 
+async def chunk_seconds_for(resolved) -> int:
+    """The chunk length the resolved transcription service accepts.
+
+    A service that declares a smaller limit than the generic one gets a
+    smaller chunk. The value is part of the job snapshot, so a change of the
+    geometry invalidates an old checkpoint instead of replaying it.
+    """
+    adapter = (resolved.model_metadata.get('uses') or {}).get('transcription')
+    if not adapter:
+        return CHUNK_SECONDS
+    try:
+        from open_webui.utils.provider_media import resolve_service
+
+        service = resolve_service(resolved.connection, 'transcription', adapter)
+    except Exception:
+        return CHUNK_SECONDS
+    limit = (service.limits or {}).get('max_seconds')
+    if isinstance(limit, int) and 0 < limit < CHUNK_SECONDS:
+        return max(1, limit - CHUNK_BOUNDARY_MARGIN)
+    return CHUNK_SECONDS
+
+
 async def references(model_ref=None, user=None):
     if model_ref:
         from open_webui.utils.providers import provider_base_url, resolve_media_model
 
         resolved = await resolve_media_model(model_ref, user, 'transcription')
+        adapter = (resolved.model_metadata.get('uses') or {}).get('transcription')
+        chunk_seconds = await chunk_seconds_for(resolved)
+        endpoint = provider_base_url(resolved.connection)
+        try:
+            from open_webui.utils.provider_media import resolve_service
+
+            endpoint = resolve_service(resolved.connection, 'transcription', adapter).endpoint
+        except Exception:
+            pass
         return {
             'engine': 'provider',
             'model_ref': model_ref,
             'model': resolved.upstream_model_id,
             'provider_connection_id': resolved.connection.id,
             'response_format': await Config.get('recordings.response_format', 'json'),
+            'chunk_seconds': chunk_seconds,
             'endpoint_fingerprint': hashlib.sha256(
                 json.dumps(
-                    [provider_base_url(resolved.connection), resolved.model_metadata['uses']], sort_keys=True
+                    [endpoint, resolved.model_metadata['uses'], chunk_seconds], sort_keys=True
                 ).encode()
             ).hexdigest(),
         }
@@ -107,6 +144,7 @@ async def references(model_ref=None, user=None):
         for key in ('openai.api_base_url', 'azure.base_url', 'azure.region', 'mistral.api_base_url')
     ]
     result['response_format'] = await Config.get('recordings.response_format', 'json')
+    result['chunk_seconds'] = CHUNK_SECONDS
     result['endpoint_fingerprint'] = hashlib.sha256(json.dumps(endpoints).encode()).hexdigest()
     return result
 
@@ -227,6 +265,7 @@ def normalize(result, offset, chunk_index, chunk_duration):
 
 def public(job, detail=True):
     data = job.data or {}
+    chunk_seconds = int((data.get('config') or {}).get('chunk_seconds') or CHUNK_SECONDS)
     result = {
         name: getattr(job, name)
         for name in ('id', 'title', 'state', 'duration', 'size_bytes', 'created_at', 'updated_at', 'note_id')
@@ -234,7 +273,7 @@ def public(job, detail=True):
     result.update(
         source_present=bool(job.source_present),
         completed_chunks=len(data.get('chunks', [])),
-        total_chunks=math.ceil(job.duration / CHUNK_SECONDS),
+        total_chunks=math.ceil(job.duration / chunk_seconds),
         error=data.get('error'),
         config=data.get('config'),
         speaker_names=data.get('speaker_names', {}),
@@ -372,7 +411,11 @@ async def run_job(app, job_id, token, adapter=None):
         data = dict(job.data)
         data.pop('error', None)
         data.pop('error_diagnostic', None)
-        for index in range(len(data.get('chunks', [])), math.ceil(job.duration / CHUNK_SECONDS)):
+        # The chunk geometry comes from the job snapshot. A job that predates
+        # the snapshot keeps the generic 600 second geometry.
+        chunk_seconds = int((data.get('config') or {}).get('chunk_seconds') or CHUNK_SECONDS)
+        total_chunks = math.ceil(job.duration / chunk_seconds)
+        for index in range(len(data.get('chunks', [])), total_chunks):
             chunk_number = index + 1
             stage = 'authorization'
             user = await Users.get_user_by_id(job.user_id)
@@ -381,7 +424,7 @@ async def run_job(app, job_id, token, adapter=None):
                 raise HTTPException(409, 'ASR configuration changed; retry to restart with the new model')
             await change(job_id, token, state='preparing')
             stage = 'audio preparation'
-            offset = index * CHUNK_SECONDS
+            offset = index * chunk_seconds
             await command(
                 'ffmpeg',
                 '-nostdin',
@@ -397,7 +440,7 @@ async def run_job(app, job_id, token, adapter=None):
                 '-i',
                 str(directory(job_id) / 'source'),
                 '-t',
-                str(min(CHUNK_SECONDS, job.duration - offset)),
+                str(min(chunk_seconds, job.duration - offset)),
                 '-vn',
                 '-ar',
                 '16000',
@@ -414,7 +457,7 @@ async def run_job(app, job_id, token, adapter=None):
             stage = 'transcription response processing'
             data['chunks'] = [
                 *data.get('chunks', []),
-                normalize(raw, offset, index, min(CHUNK_SECONDS, job.duration - offset)),
+                normalize(raw, offset, index, min(chunk_seconds, job.duration - offset)),
             ]
             await change(job_id, token, data=data)
             chunk_path.unlink(missing_ok=True)

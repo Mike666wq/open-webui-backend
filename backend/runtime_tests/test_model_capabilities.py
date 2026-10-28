@@ -256,7 +256,7 @@ class ModelCapabilitiesTests(unittest.IsolatedAsyncioTestCase):
         session = SimpleNamespace(post=Mock(return_value=result()))
 
         @asynccontextmanager
-        async def session_scope(connection):
+        async def session_scope(connection, **_options):
             yield session
 
         with patch.object(providers, 'media_http_session', side_effect=session_scope):

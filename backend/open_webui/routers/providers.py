@@ -3,6 +3,7 @@
 import re
 import time
 import uuid
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from open_webui.internal.db import get_async_session
@@ -15,13 +16,23 @@ from open_webui.models.provider_connections import (
 )
 from open_webui.utils.apps import validate_app_url
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.provider_capabilities import ADAPTERS, provider_family
+from open_webui.utils.provider_capabilities import ADAPTERS, provider_family, validate_model_uses
 from open_webui.utils.provider_errors import (
     ProviderRequestError,
     is_provider_error,
     provider_error_response,
 )
-from open_webui.utils.provider_registry import GROUPS, require_supported_template
+from open_webui.utils.provider_media import (
+    MEDIA_PURPOSES,
+    resolve_service,
+    validate_service_config,
+)
+from open_webui.utils.provider_registry import (
+    GROUPS,
+    SERVICE_CONTRACT_VERSION,
+    require_supported_template,
+    resolve_template,
+)
 from open_webui.utils.providers import (
     PROVIDER_CATALOG,
     can_access_connection,
@@ -38,6 +49,7 @@ from open_webui.utils.providers import (
     refresh_connection_catalog,
     registry_migrated,
     require_connection_access,
+    resolved_services,
     seed_connection_models,
     verify_provider_connection,
     visible_catalog_statuses,
@@ -50,6 +62,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 _BAILIAN_REGIONS = {'cn-beijing', 'ap-southeast-1', 'cn-hongkong', 'eu-central-1', 'us-east-1', 'ap-northeast-1'}
 _BAILIAN_WORKSPACE_LABEL = re.compile(r'^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$')
 
+# The purposes a connection can serve. `chat` keeps its legacy meaning; the
+# three media purposes are configured one by one.
+CONFIGURED_PURPOSES = ('chat', *MEDIA_PURPOSES)
+
 router = APIRouter()
 
 
@@ -57,16 +73,52 @@ def _template_for(form: ProviderConnectionCreate) -> dict:
     """Resolve the provider template of a create request.
 
     A template this release cannot talk to is refused outright; the platform
-    never falls back to the OpenAI protocol for it.
+    never falls back to the OpenAI protocol for it. The template named by the
+    client wins over the legacy field, so a client that only sends
+    `provider_id=custom` cannot erase the MiniMax template it picked.
     """
-    template_id = form.provider_template or form.provider_id
     try:
-        template = require_supported_template(template_id)
+        template = resolve_template(form.provider_template, form.provider_id)
+        template = require_supported_template(template['id'])
     except ProviderRequestError as exc:
         raise HTTPException(400, exc.detail) from None
     if form.protocol and form.protocol != template['protocol']:
         raise HTTPException(400, f'{template["name"]} uses the {template["protocol"]} protocol')
     return template
+
+
+def _service_context(template: dict, config: dict, auth_type: str):
+    """A connection-shaped view of a connection that is not saved yet.
+
+    The service declarations of a template must be validated before the
+    connection exists; this gives the validators the same view they will get
+    once the row is written.
+    """
+    return SimpleNamespace(
+        id='',
+        provider_id=template['id'],
+        provider_template=template['id'],
+        auth_type=auth_type,
+        config=config or {},
+        models=[],
+    )
+
+
+def _validate_services(template: dict, config: dict, auth_type: str) -> dict:
+    """Validate the `services` block of a connection configuration."""
+    services = config.get('services')
+    if services is None:
+        return {}
+    if not isinstance(services, dict):
+        raise HTTPException(400, '服务配置必须是对象')
+    unknown = set(services) - set(CONFIGURED_PURPOSES)
+    if unknown:
+        raise HTTPException(400, 'Unsupported provider service field')
+    context = _service_context(template, config, auth_type)
+    cleaned = {}
+    for purpose, block in services.items():
+        cleaned[purpose] = validate_service_config(context, purpose, block)
+    return cleaned
 
 
 def _validate_form(form: ProviderConnectionCreate, user):
@@ -80,7 +132,7 @@ def _validate_form(form: ProviderConnectionCreate, user):
     elif not form.api_key:
         raise HTTPException(400, 'An API key is required')
     config = dict(form.config or {})
-    allowed = {'base_url', 'region', 'workspace_id', 'model_ids', 'api_type'}
+    allowed = {'base_url', 'region', 'workspace_id', 'model_ids', 'api_type', 'services'}
     if set(config) - allowed:
         raise HTTPException(400, 'Unsupported provider configuration field')
     for key in ('region', 'workspace_id', 'api_type'):
@@ -103,6 +155,9 @@ def _validate_form(form: ProviderConnectionCreate, user):
     if template['id'] == 'custom' and not config.get('base_url'):
         raise HTTPException(400, 'A base URL is required for custom providers')
     _validate_bailian_config(template['id'], config)
+    services = _validate_services(template, config, form.auth_type)
+    if services:
+        config['services'] = services
     return config
 
 
@@ -150,7 +205,12 @@ async def _connection_with_manage_access(connection_id: str, user, db):
 @router.get('')
 async def get_provider_catalog(user=Depends(get_verified_user)):
     """The provider templates, grouped by the protocol that decides a call."""
-    return {'object': 'list', 'data': PROVIDER_CATALOG, 'groups': GROUPS}
+    return {
+        'object': 'list',
+        'data': PROVIDER_CATALOG,
+        'groups': GROUPS,
+        'service_contract_version': SERVICE_CONTRACT_VERSION,
+    }
 
 
 @router.get('/connections')
@@ -199,9 +259,17 @@ async def list_connections(user=Depends(get_verified_user), db: AsyncSession = D
 
 @router.post('/connections/verify')
 async def verify_ephemeral_connection(form: ProviderConnectionCreate, user=Depends(get_verified_user)):
+    """Probe a connection without saving it.
+
+    The probe follows the services the user configured. A service whose
+    discovery is `preset` or `manual` never triggers a catalog call, so a
+    MiniMax media connection can be added and saved without a remote model
+    list. One failing service never hides the others.
+    """
     config = _validate_form(form, user)
+    template = _template_for(form)
     connection = new_provider_connection(
-        provider_id=form.provider_id,
+        provider_id=template['id'],
         name=form.name,
         auth_type=form.auth_type,
         visibility=form.visibility,
@@ -211,18 +279,58 @@ async def verify_ephemeral_connection(form: ProviderConnectionCreate, user=Depen
         status='configured',
         models=[],
         is_active=True,
+        protocol=template['protocol'],
+        provider_template=template['id'],
     )
     await initialize_model_catalog(connection)
-    try:
-        verified = await verify_provider_connection(connection, user)
-        models = await discover_connection_models(connection, user)
-    except HTTPException as exc:
-        # The taxonomy travels with the response: the wizard needs the stage,
-        # the reason and the suggested action to offer a recovery entry.
-        if not is_provider_error(exc):
-            raise
-        return provider_error_response(exc)
-    return {'ok': verified, 'status': 'connected' if verified else 'manual', 'models': models}
+    services = resolved_services(connection)
+    results: dict = {}
+    failures: list = []
+    models: list = []
+    verified = True
+    probeable = [
+        purpose
+        for purpose, entry in services.items()
+        if entry['supported'] and entry['enabled'] and entry['discovery'] == 'remote'
+    ]
+    for purpose, entry in services.items():
+        if not entry['supported']:
+            results[purpose] = {'status': 'not_applicable'}
+            continue
+        if not entry['enabled']:
+            results[purpose] = {'status': 'disabled'}
+            continue
+        if entry['discovery'] != 'remote':
+            # A preset or manual service has no catalog to fetch. It reports
+            # "not applicable", never a catalog failure.
+            results[purpose] = {'status': 'not_applicable', 'models': entry['preset_models']}
+            continue
+        try:
+            if purpose == 'chat':
+                verified = await verify_provider_connection(connection, user)
+                models = await discover_connection_models(connection, user)
+                results[purpose] = {'status': 'connected' if verified else 'manual', 'models': models}
+            else:
+                await verify_provider_connection(connection, user)
+                results[purpose] = {'status': 'connected'}
+        except HTTPException as exc:
+            # The taxonomy travels with the response: the wizard needs the
+            # stage, the reason and the suggested action to offer a recovery
+            # entry.
+            if not is_provider_error(exc):
+                raise
+            failures.append((purpose, exc))
+            results[purpose] = {'status': 'failed', 'error': catalog_error(exc)}
+    if failures and probeable == ['chat']:
+        # The legacy single-service flow keeps its error response.
+        return provider_error_response(failures[0][1])
+    ok = verified and not failures
+    return {
+        'ok': ok,
+        'status': 'connected' if ok else ('failed' if failures else 'manual'),
+        'models': models,
+        'services': results,
+    }
 
 
 @router.post('/connections')
@@ -231,6 +339,24 @@ async def create_connection(
 ):
     config = _validate_form(form, user)
     template = _template_for(form)
+    selections = form.model_selections or []
+    model_ids = [item for item in (config.get('model_ids') or []) if isinstance(item, str)]
+    if selections and model_ids:
+        # The two fields coexist for compatibility, but a request that states
+        # both differently is refused instead of being silently resolved.
+        if {selection.upstream_id for selection in selections} != set(model_ids):
+            raise HTTPException(400, '模型选择与 model_ids 不一致，请只提交其中一种')
+    context = _service_context(template, config, form.auth_type)
+    validated = []
+    for selection in selections:
+        validated.append(
+            {
+                'upstream_id': selection.upstream_id,
+                'display_name': selection.display_name,
+                'uses': validate_model_uses(context, selection.uses),
+                'source': selection.source,
+            }
+        )
     connection = new_provider_connection(
         provider_id=template['id'],
         name=form.name,
@@ -248,10 +374,10 @@ async def create_connection(
     db.add(connection)
     if form.visibility == 'shared':
         await AccessGrants.replace_access_grants(db, 'provider_connection', connection.id, form.access_control)
-    # The models the user picked in the wizard become the curated whitelist.
-    await seed_connection_models(
-        connection, [item for item in (config.get('model_ids') or []) if isinstance(item, str)], db
-    )
+    # The models the user picked become the curated whitelist, in the same
+    # transaction as the connection and its sharing rules.
+    upstream_ids = [selection['upstream_id'] for selection in validated] or model_ids
+    await seed_connection_models(connection, upstream_ids, db, selections=validated or None)
     await db.commit()
     return await public_connection(connection, db)
 
@@ -312,7 +438,7 @@ async def update_connection(
         config = values['config'] or {}
         if connection.auth_type == 'oauth':
             raise HTTPException(400, 'Manage OAuth through its provider settings')
-        allowed = {'base_url', 'region', 'workspace_id', 'model_ids', 'api_type'}
+        allowed = {'base_url', 'region', 'workspace_id', 'model_ids', 'api_type', 'services'}
         if set(config) - allowed:
             raise HTTPException(400, 'Unsupported provider configuration field')
         for key in ('region', 'workspace_id', 'api_type'):
@@ -335,6 +461,15 @@ async def update_connection(
             or any(not isinstance(x, str) or not x or len(x) > 256 for x in model_ids)
         ):
             raise HTTPException(400, 'model_ids must be a list of at most 500 non-empty strings')
+        if 'services' in config:
+            template = resolve_template(connection.provider_template, connection.provider_id)
+            context = _service_context(template, config, connection.auth_type)
+            cleaned = {}
+            for purpose, block in (config['services'] or {}).items():
+                if purpose not in CONFIGURED_PURPOSES:
+                    raise HTTPException(400, 'Unsupported provider service field')
+                cleaned[purpose] = validate_service_config(context, purpose, block)
+            config['services'] = cleaned
         connection.config = {**{k: v for k, v in (connection.config or {}).items() if k.startswith('_')}, **config}
     if connection.provider_id == 'chatgpt' and connection.auth_type == 'oauth':
         if api_key or 'visibility' in values or grants is not None:
@@ -408,19 +543,24 @@ async def refresh_models(
 
 @router.get('/models')
 async def get_visible_models(
-    purpose: str = 'chat', user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+    purpose: str = 'chat',
+    operation: str | None = None,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
 ):
-    from open_webui.utils.providers import list_visible_models
+    from open_webui.utils.providers import list_visible_models, service_enabled
 
     errors = []
     if purpose == 'chat':
         models = await list_visible_models(user, db)
     else:
-        from open_webui.utils.provider_capabilities import ADAPTERS
+        from open_webui.utils.provider_capabilities import ADAPTER_OPERATIONS
         from open_webui.utils.providers import visible_connection_models
 
         if purpose not in (*ADAPTERS, 'all'):
             raise HTTPException(400, 'Unknown model purpose')
+        if operation is not None and operation not in ('generate', 'edit'):
+            raise HTTPException(400, 'Unknown model operation')
         models = []
         for connection in (
             await db.scalars(select(ProviderConnection).where(ProviderConnection.is_active.is_(True)))
@@ -441,7 +581,12 @@ async def get_visible_models(
                 models.extend(
                     {**m, 'connection_name': connection.name}
                     for m in connection_models
-                    if purpose == 'all' or (m.get('enabled', True) and purpose in m.get('uses', {}))
+                    if (purpose == 'all' or (m.get('enabled', True) and purpose in m.get('uses', {})))
+                    and service_enabled(connection, purpose)
+                    and (
+                        operation is None
+                        or operation in (ADAPTER_OPERATIONS.get(m.get('uses', {}).get(purpose), ()) or ())
+                    )
                 )
     return {
         'object': 'list',
@@ -505,15 +650,14 @@ async def set_model_uses(
     connection = await _connection_with_manage_access(connection_id, user, db)
     if connection.auth_type != 'api_key':
         raise HTTPException(400, 'Account model capabilities cannot be overridden')
-    if any(use not in ADAPTERS or adapter not in ADAPTERS[use] for use, adapter in form.uses.items()):
-        raise HTTPException(400, 'Unsupported purpose or adapter')
-    if form.uses.get('image') == 'siliconflow-image' and provider_family(connection) != 'siliconflow':
-        raise HTTPException(400, 'SiliconFlow image adapter requires a SiliconFlow connection')
+    # The same validation as the create path: a purpose the template does not
+    # serve cannot be attached to one of its models.
+    uses = validate_model_uses(connection, form.uses)
     from open_webui.utils.providers import set_connection_model_uses
 
-    if not await set_connection_model_uses(connection, form.upstream_id, form.uses, db):
+    if not await set_connection_model_uses(connection, form.upstream_id, uses, db):
         config = dict(connection.config or {})
-        config['_model_overrides'] = {**config.get('_model_overrides', {}), form.upstream_id: form.uses}
+        config['_model_overrides'] = {**config.get('_model_overrides', {}), form.upstream_id: uses}
         if not any(m['upstream_id'] == form.upstream_id for m in connection.models or []):
             from open_webui.utils.providers import stable_model_id
 
@@ -564,14 +708,41 @@ async def list_connection_models(
 @router.post('/connections/{connection_id}/models/fetch')
 async def fetch_connection_models(
     connection_id: str,
+    purpose: str | None = None,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
     """Fetch the candidate pool from the provider.
 
-    The result never changes the whitelist: the user picks what to keep.
+    The result never changes the whitelist: the user picks what to keep. A
+    service whose models come from the official presets has no catalog to
+    fetch; it answers "not applicable" instead of pretending a catalog call
+    failed.
     """
+    from open_webui.utils.provider_capabilities import service_declaration
+
     connection = await _connection_with_manage_access(connection_id, user, db)
+    if purpose:
+        declaration = service_declaration(connection, purpose)
+        if not declaration.get('supported'):
+            raise HTTPException(
+                400, declaration.get('unsupported_reason') or '该提供商不支持此服务'
+            )
+        if declaration.get('discovery') != 'remote':
+            return {
+                'candidates': [
+                    {
+                        'upstream_id': model['upstream_id'],
+                        'display_name': model.get('display_name') or model['upstream_id'],
+                        'capabilities': [],
+                        'uses': model.get('uses') or {},
+                    }
+                    for model in declaration.get('preset_models') or []
+                ],
+                'error': None,
+                'status': 'not_applicable',
+                'fetched_at': int(time.time()),
+            }
     stamp = catalog_fingerprint(connection)
     try:
         candidates = await discover_connection_models(connection, user)
@@ -584,7 +755,7 @@ async def fetch_connection_models(
             db,
         )
         await db.commit()
-        return {'candidates': [], 'error': error, 'fetched_at': int(time.time())}
+        return {'candidates': [], 'error': error, 'status': 'failed', 'fetched_at': int(time.time())}
     await write_snapshot(
         connection,
         user.id,
@@ -610,6 +781,7 @@ async def fetch_connection_models(
             for candidate in candidates
         ],
         'error': None,
+        'status': 'ok',
         'fetched_at': int(time.time()),
     }
 
@@ -659,10 +831,9 @@ async def update_connection_model(
     """Rename a curated model, change its purposes or switch it off."""
     connection = await _connection_with_manage_access(connection_id, user, db)
     if form.uses is not None:
-        if any(use not in ADAPTERS or adapter not in ADAPTERS[use] for use, adapter in form.uses.items()):
-            raise HTTPException(400, 'Unsupported purpose or adapter')
-        if form.uses.get('image') == 'siliconflow-image' and provider_family(connection) != 'siliconflow':
-            raise HTTPException(400, 'SiliconFlow image adapter requires a SiliconFlow connection')
+        # The same validation as the create path: a purpose the template does
+        # not serve cannot be attached to one of its models.
+        form.uses = validate_model_uses(connection, form.uses)
     from open_webui.models.provider_connections import ProviderModel
 
     row = (
@@ -718,23 +889,95 @@ class ModelTest(BaseModel):
     voice: str = Field(default='', max_length=256)
     audio_base64: str | None = Field(default=None, max_length=2_800_000)
     filename: str | None = Field(default=None, max_length=256)
+    response_format: str | None = Field(default=None, max_length=32)
+    language: str | None = Field(default=None, max_length=32)
+    text: str | None = Field(default=None, max_length=20_000)
+    prompt: str | None = Field(default=None, max_length=4_000)
+    size: str | None = Field(default=None, max_length=32)
+    count: int | None = Field(default=None, ge=1, le=9)
+    aspect_ratio: str | None = Field(default=None, max_length=16)
+
+
+def _parse_size(size: str) -> tuple[int, int]:
+    try:
+        width, height = size.lower().split('x', 1)
+        return int(width), int(height)
+    except (AttributeError, ValueError):
+        raise HTTPException(400, '图片尺寸格式无效，请使用 宽x高 的形式') from None
+
+
+def _media_test_payload(form: ModelTest, adapter: str) -> dict:
+    """Build the input of an explicit media test.
+
+    The test uses the same adapter and the same limits as the daily feature;
+    only the input differs, and it comes from the operator.
+    """
+    if form.purpose == 'transcription':
+        import base64
+        from pathlib import Path
+
+        try:
+            audio = base64.b64decode(form.audio_base64 or '', validate=True)
+        except ValueError:
+            raise HTTPException(400, 'Invalid audio sample') from None
+        if not audio or len(audio) > 2 * 1024 * 1024:
+            raise HTTPException(400, 'Select a short audio sample under 2 MB')
+        extension = Path(form.filename or '').suffix.lower()
+        if extension not in ('.wav', '.mp3', '.m4a', '.ogg', '.webm', '.flac', '.aac'):
+            raise HTTPException(400, 'Unsupported audio sample format')
+        return {
+            'audio': audio,
+            'filename': form.filename or f'sample{extension}',
+            'response_format': form.response_format,
+            'language': form.language,
+        }
+    if form.purpose == 'speech':
+        return {'text': form.text or '你好，这是语音测试。', 'voice': form.voice or None}
+    if form.purpose == 'image':
+        payload = {
+            'prompt': form.prompt or 'A simple blue circle on white.',
+            'n': form.count or 1,
+        }
+        size = form.size or '1024x1024'
+        if adapter == 'minimax-image':
+            width, height = _parse_size(size)
+            payload['width'] = width
+            payload['height'] = height
+            if form.aspect_ratio:
+                payload['aspect_ratio'] = form.aspect_ratio
+        else:
+            payload['size'] = size
+        return payload
+    raise HTTPException(400, 'Unsupported test purpose')
+
+
+def _media_test_usage(purpose: str, result: dict, payload: dict) -> dict | None:
+    """Collect the units the provider actually reported."""
+    if purpose == 'transcription':
+        duration = (result or {}).get('duration')
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            return {'duration_seconds': round(float(duration), 3)}
+        return None
+    if purpose == 'speech':
+        characters = len((payload or {}).get('text') or '')
+        return {'characters': characters} if characters else None
+    if purpose == 'image':
+        images = len((result or {}).get('images') or [])
+        return {'images': images} if images else None
+    return None
 
 
 @router.post('/connections/{connection_id}/model-test')
 async def test_model(
     connection_id: str, form: ModelTest, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
 ):
-    import base64
     import time
 
-    import aiohttp
     from open_webui.utils.provider_capabilities import fingerprint
+    from open_webui.utils.provider_media import call_media_service, resolve_service
     from open_webui.utils.providers import (
         get_media_api_connection,
-        media_http_session,
-        provider_base_url,
-        provider_http_error,
-        read_bounded_response,
+        provider_chat_completion,
         resolve_media_model,
         resolve_model,
         stable_model_id,
@@ -752,7 +995,7 @@ async def test_model(
     before = fingerprint(connection, resolved.model_metadata)
     started = time.monotonic()
     if connection.auth_type != 'api_key':
-        from open_webui.utils.providers import catalog_error, provider_chat_completion
+        from open_webui.utils.providers import catalog_error
 
         outcome, error, usage = 'passed', None, None
         try:
@@ -770,10 +1013,19 @@ async def test_model(
             connection, resolved.model_metadata, before, form.purpose, outcome, error, started, user, db, usage
         )
     connection, key = await get_media_api_connection(connection_id, user, db)
-    base = provider_base_url(connection)
-    payload = None
-    data = None
+    outcome, error, usage = 'passed', None, None
     if form.purpose == 'chat':
+        import json
+
+        import aiohttp
+        from open_webui.utils.providers import (
+            catalog_error,
+            media_http_session,
+            provider_base_url,
+            provider_http_error,
+            read_bounded_response,
+        )
+
         if resolved.model_metadata['uses']['chat'] == 'responses':
             path, payload = '/responses', {'model': form.upstream_id, 'input': 'Reply OK.', 'max_output_tokens': 32}
         else:
@@ -781,80 +1033,114 @@ async def test_model(
                 '/chat/completions',
                 {'model': form.upstream_id, 'messages': [{'role': 'user', 'content': 'Reply OK.'}], 'max_tokens': 32},
             )
-    elif form.purpose == 'transcription':
         try:
-            audio = base64.b64decode(form.audio_base64 or '', validate=True)
-        except ValueError:
-            raise HTTPException(400, 'Invalid audio sample') from None
-        if not audio or len(audio) > 2 * 1024 * 1024:
-            raise HTTPException(400, 'Select a short audio sample under 2 MB')
-        from pathlib import Path
-
-        extension = Path(form.filename or '').suffix.lower()
-        if extension not in ('.wav', '.mp3', '.m4a', '.ogg', '.webm', '.flac', '.aac'):
-            raise HTTPException(400, 'Unsupported audio sample format')
-        data = aiohttp.FormData()
-        data.add_field('model', form.upstream_id)
-        data.add_field('file', audio, filename='sample' + extension, content_type='application/octet-stream')
-        path = '/audio/transcriptions'
-    elif form.purpose == 'speech':
-        if not form.voice.strip():
-            raise HTTPException(400, 'Select a voice for this model')
-        path, payload = (
-            '/audio/speech',
-            {'model': form.upstream_id, 'voice': form.voice, 'input': '你好，这是语音测试。', 'response_format': 'mp3'},
-        )
-    elif form.purpose == 'image':
-        silicon = resolved.model_metadata['uses']['image'] == 'siliconflow-image'
-        path, payload = (
-            '/images/generations',
-            {
-                'model': form.upstream_id,
-                'prompt': 'A simple blue circle on white.',
-                **({'image_size': '1024x1024'} if silicon else {'size': '1024x1024', 'n': 1}),
-            },
-        )
-    else:
-        raise HTTPException(400, 'Unsupported test purpose')
-    outcome, error, usage = 'passed', None, None
-    try:
-        # Explicit test only: exactly one upstream inference, never retry uncertain calls.
-        async with media_http_session(connection) as session:
-            async with session.post(
-                base + path,
-                json=payload,
-                data=data,
-                headers={'Authorization': f'Bearer {key}'},
-                allow_redirects=False,
-                timeout=aiohttp.ClientTimeout(total=120),
-            ) as response:
-                if not 200 <= response.status < 300:
-                    raise provider_http_error(response.status)
-                raw = await read_bounded_response(response)
-                if form.purpose == 'speech':
-                    if not raw or not response.headers.get('Content-Type', '').startswith('audio/'):
-                        raise HTTPException(502, 'Provider did not return audio')
-                else:
-                    import json
-
+            # Explicit test only: exactly one upstream inference, never retry uncertain calls.
+            async with media_http_session(connection) as session:
+                async with session.post(
+                    provider_base_url(connection) + path,
+                    json=payload,
+                    headers={'Authorization': f'Bearer {key}'},
+                    allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as response:
+                    if not 200 <= response.status < 300:
+                        raise provider_http_error(response.status)
+                    raw = await read_bounded_response(response)
                     result = json.loads(raw)
                     usage = result.get('usage')
-                    if form.purpose == 'transcription' and not isinstance(result.get('text'), str):
-                        raise HTTPException(502, 'Provider did not return transcription text')
-                    if form.purpose == 'image' and not (result.get('images') or result.get('data')):
-                        raise HTTPException(502, 'Provider did not return images')
-                    if form.purpose == 'chat' and not (result.get('choices') or result.get('output')):
+                    if not (result.get('choices') or result.get('output')):
                         raise HTTPException(502, 'Provider did not return a chat response')
+        except Exception as exc:
+            from open_webui.utils.providers import catalog_error
+
+            outcome, error = 'failed', catalog_error(exc)
+        return await _save_model_test(
+            connection, resolved.model_metadata, before, form.purpose, outcome, error, started, user, db, usage
+        )
+    adapter = resolved.model_metadata['uses'].get(form.purpose)
+    if not adapter:
+        raise HTTPException(400, 'Select a model supporting this purpose')
+    payload = _media_test_payload(form, adapter)
+    service = resolve_service(connection, form.purpose, adapter)
+    params_fingerprint = _params_fingerprint(payload)
+    outcome, error, usage = 'passed', None, None
+    try:
+        # The explicit test and the daily feature share the adapter, the
+        # address resolution, the input limits and the response parsing.
+        result = await call_media_service(
+            connection, service, model=form.upstream_id, credential=key, payload=payload
+        )
+        usage = _media_test_usage(form.purpose, result, payload)
     except Exception as exc:
         from open_webui.utils.providers import catalog_error
 
         outcome, error = 'failed', catalog_error(exc)
-    return await _save_model_test(
-        connection, resolved.model_metadata, before, form.purpose, outcome, error, started, user, db, usage
+    response = await _save_model_test(
+        connection,
+        resolved.model_metadata,
+        before,
+        form.purpose,
+        outcome,
+        error,
+        started,
+        user,
+        db,
+        usage,
+        params_fingerprint=params_fingerprint,
     )
+    # The operator sees which service and model were really used. The internal
+    # adapter identifier stays out of the interface.
+    response['service'] = {
+        'purpose': form.purpose,
+        'endpoint': service.endpoint,
+        'model': form.upstream_id,
+    }
+    return response
 
 
-async def _save_model_test(connection, metadata, before, purpose, outcome, error, started, user, db, usage):
+class VoiceFetch(BaseModel):
+    purpose: str = Field(default='speech')
+    voice_type: str = Field(default='system', max_length=64)
+
+
+@router.post('/connections/{connection_id}/voices/fetch')
+async def fetch_connection_voices(
+    connection_id: str,
+    form: VoiceFetch,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """List the voices of a speech service.
+
+    The call is a read-only metadata request: it never activates a voice and
+    never runs an inference. An adapter that cannot answer the question says
+    so locally, without touching the provider.
+    """
+    import time
+
+    from open_webui.utils.provider_media import fetch_voices, resolve_service
+    from open_webui.utils.providers import get_media_api_connection
+
+    if form.purpose != 'speech':
+        raise HTTPException(400, '只有语音合成服务支持音色查询')
+    connection = await _connection_with_access(connection_id, user, db)
+    connection, key = await get_media_api_connection(connection_id, user, db)
+    service = resolve_service(connection, 'speech')
+    try:
+        voices = await fetch_voices(connection, service, key, form.voice_type)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        from open_webui.utils.providers import catalog_error
+
+        error = catalog_error(exc)
+        return {'data': [], 'error': error, 'fetched_at': int(time.time())}
+    return {'data': voices, 'error': None, 'fetched_at': int(time.time())}
+
+
+async def _save_model_test(
+    connection, metadata, before, purpose, outcome, error, started, user, db, usage, params_fingerprint=None
+):
     import time
 
     from open_webui.models.provider_calls import reported_usage, save_call
@@ -874,6 +1160,8 @@ async def _save_model_test(connection, metadata, before, purpose, outcome, error
         'elapsed_ms': elapsed,
         'error': error,
     }
+    if params_fingerprint:
+        result['params_fingerprint'] = params_fingerprint
     from open_webui.utils.providers import set_connection_model_verification
 
     if not await set_connection_model_verification(connection, metadata['upstream_id'], purpose, result, db):
@@ -900,6 +1188,27 @@ async def _save_model_test(connection, metadata, before, purpose, outcome, error
         'error': error,
         'message': 'No automatic retry. A failed or timed-out request may already have been charged.',
     }
+
+
+def _params_fingerprint(payload: dict) -> str:
+    """Fingerprint the input of a test.
+
+    The sample content never leaves the server, but its size and digest are
+    enough to tell one test input from another.
+    """
+    import hashlib
+    import json
+
+    summary = {}
+    for key, value in (payload or {}).items():
+        if key == 'audio' and isinstance(value, (bytes, bytearray)):
+            summary[key] = {
+                'bytes': len(value),
+                'sha256': hashlib.sha256(bytes(value)).hexdigest(),
+            }
+        else:
+            summary[key] = value
+    return hashlib.sha256(json.dumps(summary, sort_keys=True, default=str).encode()).hexdigest()
 
 
 _MEDIA_SETTINGS = {

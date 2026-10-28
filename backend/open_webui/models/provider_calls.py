@@ -47,6 +47,12 @@ def reported_usage(value):
             if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
                 result[target] = count
                 break
+    # Media services are metered in their own units. A missing measurement
+    # stays missing: a fabricated token count or fee would be a lie.
+    for key in ('duration_seconds', 'characters', 'images'):
+        count = value.get(key)
+        if isinstance(count, (int, float)) and not isinstance(count, bool) and count >= 0:
+            result[key] = count
     return result or None
 
 

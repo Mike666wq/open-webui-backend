@@ -324,3 +324,293 @@ provider_model 中该连接的记录非空 → 用新表
 | 能力筛选 + 启用筛选（两个下拉）           | 单个用途筛选；候选池与白名单分区天然区分 |
 
 后端字段名 `uses` 保留不变（内部结构），只改**用户可见文案**。
+
+---
+
+## 11. 供应商、连接、服务、模型与适配器（五个层级）
+
+| 层级           | 负责什么                                        | 权威来源                                     |
+| -------------- | ----------------------------------------------- | -------------------------------------------- |
+| **供应商模板** | 预设、区域、认证方式、**支持哪些服务**          | `provider_registry.TEMPLATES[*]['services']`  |
+| **连接**       | 某个所有者的账户 / Key / 访问范围                | `provider_connection`                         |
+| **服务**       | chat / transcription / speech / image 的出站协议、地址、限制 | `provider_connection.config['services']` |
+| **模型**       | 该服务下的**明确选择**                          | `provider_model.upstream_id` + `uses`         |
+| **适配器**     | 请求 / 响应转换                                 | `provider_capabilities.ADAPTERS`              |
+
+- 保留根 `protocol` 的旧聊天语义与旧值，**不再**用它断言全部媒体支持。
+- **服务是否可用 = 模板支持 × 认证方式 × 适配器 × 模型声明的交集**；
+  无法确认的模型进入「待分类」，**不**默认 chat。
+- 同一 Key 可承载多用途，但每个用途可有自己的地址；不同账号 / 区域 / Key 用不同连接，
+  **不**自动跨连接或跨区发送已有凭据。
+
+完整矩阵、字段取值与本期支持范围见 `docs/PROVIDER_SERVICE_MATRIX.md`（两仓逐字一致）。
+
+### 11.1 模板身份解析（A1）
+
+**临时校验与正式保存必须走同一个解析函数**，结果必须完全相同：
+
+```
+resolve_template(provider_template, provider_id) -> {id, protocol, default_base_url, services, ...}
+```
+
+- `provider_template` 优先；缺省时才回退 `provider_id`。
+- `provider_id` 缺省值 `custom` **不得**覆盖已选中的 MiniMax / 百炼 / DeepSeek 模板。
+- 连接落库时 `provider_id = template.id`，`provider_template = template.id`，
+  `protocol = template.protocol`；临时校验用同一份解析结果构造临时连接。
+
+### 11.2 适配器枚举
+
+| purpose        | 允许的适配器                                                |
+| -------------- | ----------------------------------------------------------- |
+| `chat`         | `openai-chat`、`responses`                                  |
+| `transcription`| `openai-transcription`、`minimax-transcription`              |
+| `speech`       | `openai-speech`、`minimax-speech`                           |
+| `image`        | `openai-image`、`siliconflow-image`、`minimax-image`        |
+
+`uses` 的每次校验（`POST /connections`、`POST /connections/{id}/models`、
+`PUT .../model-uses`、`PUT .../models/{upstream_id}`）**使用同一套语义**：
+
+1. purpose 必须在 `ADAPTERS` 里，adapter 必须在该 purpose 的集合里；
+2. adapter 必须出现在**该模板该 purpose 的 `services[*].adapters`** 里
+   （模板不支持该 purpose 时直接拒绝并给出 `unsupported_reason`）；
+3. 认证方式必须被该服务声明允许（**OAuth 一律拒绝媒体**）；
+4. **不得**从 `POST /connections` 绕过注册表，也**不得**给 OAuth 连接添加媒体用途。
+
+---
+
+## 12. 服务配置与地址解析
+
+### 12.1 `config.services`
+
+在现有 `provider_connection.config` JSON 内新增**可选** `services` 对象，**不新增 ORM 表、不改 Alembic 链**：
+
+```json
+{
+  "services": {
+    "transcription": {
+      "enabled": true,
+      "adapter": "minimax-transcription",
+      "endpoint": { "kind": "base_url", "url": "https://api.minimax.cn/v1" },
+      "options": { "response_format": "json", "language": "zh" }
+    }
+  }
+}
+```
+
+| 字段      | 约束                                                                 |
+| --------- | -------------------------------------------------------------------- |
+| `enabled` | 布尔；省略视为 `true`                                                |
+| `adapter` | 必须属于该模板该 purpose 的 `services[*].adapters`                    |
+| `endpoint`| `{kind: 'base_url' \| 'endpoint_url', url: string}`                    |
+| `options` | **只能**是该适配器明确允许的字段与取值；未知字段在出站前拒绝         |
+
+- **省略 `services` 的旧连接原样读取**：原 `base_url` / `api_type` 与原模型 `uses` 全部保留。
+- 新服务默认值**只**用于新建连接或用户明确启用该原生服务；
+  **不**重写旧连接已有域名与 OpenAI 兼容媒体设置。
+- `options` 缺省时使用适配器声明的默认值；缺省的 `model` 参数**不**等于「不传」。
+
+### 12.2 地址两模式（A5）
+
+| `kind`         | 语义                                     | 拼装                                   |
+| -------------- | ---------------------------------------- | -------------------------------------- |
+| `base_url`     | 含版本前缀的 API 根地址                  | 根地址 + 适配器登记的相对路径**一次**   |
+| `endpoint_url` | 完整请求地址                             | **原样使用一次**，不再追加任何路径      |
+
+- 适配器登记的相对路径（**唯一来源**）：
+
+  | adapter                | 相对路径                |
+  | ---------------------- | ----------------------- |
+  | `openai-transcription` | `/audio/transcriptions` |
+  | `openai-speech`        | `/audio/speech`         |
+  | `openai-image`         | `/images/generations`   |
+  | `siliconflow-image`    | `/images/generations`   |
+  | `minimax-transcription`| `/speech_to_text`       |
+  | `minimax-speech`       | `/t2a_v2`               |
+  | `minimax-image`        | `/image_generation`     |
+
+- **不得**按末尾字符串随意剥离或追加 URL。
+- 用户把完整操作地址误填成 `base_url` 时，界面说明两种模式并提供修正；
+  后端**不**默默生成重复后缀。
+- 最终出站 URL（直填 endpoint 与生成结果下载地址）都要过校验：
+  拒绝 userinfo、查询串、片段与未登记协议；沿用 DNS 连接检查、TLS 与禁重定向。
+- 服务详情展示**脱敏**的最终 URL 预览，不含凭据。
+
+---
+
+## 13. 无列表创建与模型用途（A3 / A4）
+
+### 13.1 三种发现方式
+
+界面必须分别提供「获取模型列表」「使用官方预设」「手工添加」三条路径，
+**默认是「使用官方预设」**，不是从远程取得。
+
+| discovery | 是否请求远程 `/models` | 失败语义                       |
+| --------- | ----------------------- | ------------------------------ |
+| `remote`  | 是                      | 只描述该服务，既有候选/白名单不删除 |
+| `preset`  | **否**                  | `not_applicable`，不写伪造错误 |
+| `manual`  | 否                      | 同上                           |
+| `none`    | 否                      | 同上                           |
+
+`preset` / `manual` / `none` 的服务**不自动请求远程列表**，界面**不报「模型列表失败」**。
+
+### 13.2 `POST /connections` 的 `model_selections`
+
+```json
+POST /api/v1/providers/connections
+{
+  "provider_template": "minimax",
+  "name": "我的 MiniMax",
+  "api_key": "sk-...",
+  "config": {
+    "services": {
+      "transcription": {
+        "enabled": true,
+        "adapter": "minimax-transcription",
+        "endpoint": { "kind": "endpoint_url", "url": "https://api.minimax.cn/v1/speech_to_text" }
+      }
+    }
+  },
+  "model_selections": [
+    {
+      "upstream_id": "asr-1.0",
+      "display_name": "asr-1.0",
+      "uses": { "transcription": "minimax-transcription" },
+      "source": "preset"
+    }
+  ]
+}
+```
+
+- `source ∈ preset | manual | provider`；`preset` / `manual` 是**可追溯的声明**，**不是**验证成功。
+- 与旧 `config.model_ids` **并存兼容**；同一请求里两者同时存在且**不一致**时**拒绝**（400），
+  **不得**默默覆盖。
+- 后端逐条校验用途 / 适配器与模板服务、鉴权、区域一致（见 §11.2）。
+- **创建连接、初始白名单、用途与共享授权在同一事务提交**；任何一项失败不留下半个连接。
+- 保存后该模型保持 `untested` 状态；`asr-1.0` 被明确选中后成为**转写白名单**，
+  **不**进入聊天列表。
+
+### 13.3 旧数据兼容
+
+- **没有证据 / 没有显式用途的新模型 `uses={}`**，标「待分类」；**不**再以缺候选默认 chat。
+- 旧客户端明确使用原 chat 连接的兼容路径**保留既有行为**，
+  但必须与新「未知」区别测试；**不得**以兼容为名批量改旧白名单。
+- 旧连接、旧设置与已有非 provider 引擎**不**被自动迁移或清空。
+
+---
+
+## 14. 统一媒体调用语义（A10）
+
+**显式测试与日常功能必须使用同一个适配器选择、地址解析、输入约束与响应规范。**
+后端提供唯一入口 `open_webui/utils/provider_media.py`，任何一方都**不得**另复制一套 OpenAI 拼路径逻辑。
+
+```
+provider_media.call_media_service(service, *, model, credential, input) -> normalized
+```
+
+| 归一化结果              | 形状                                                        |
+| ----------------------- | ----------------------------------------------------------- |
+| 转写                    | `{text: str, duration: float \| None, segments: [...]}`      |
+| 合成                    | `{audio: bytes, content_type: str}`                          |
+| 生图                    | `{images: [{data: bytes \| None, url: str \| None, content_type}]}` |
+
+### 14.1 MiniMax ASR（A6 / A7）
+
+- `POST speech_to_text`，`Bearer` 鉴权，multipart 文件上传。
+- multipart **必有** `model=asr-1.0` 与音频文件；boundary 正确。
+- `language` 作为**该适配器的请求头**；`json` / `verbose_json` 结果规范化。
+- **不**发送 `diarized_json`、SSE、SRT/VTT，**不**把多语言当自动重试循环。
+- 输入限制：**≤ 50 MiB 且 ≤ 500 秒**；普通转写与录音**同时**遵守。
+- 浏览器 WebM 等未声明容器按现有受限 ffmpeg 流程转码；
+  **缺工具时在出站前给出明确不可用原因**，**不能**只改扩展名。
+
+### 14.2 录音分片（A7）
+
+- MiniMax 录音分片目标 **480 秒**（≤ 500，留编码边界余量）；
+  通用 **600 秒**上限仍对其他未声明更小限制的适配器成立。
+- 新任务快照保存实际 `chunk_seconds` 与服务 / 适配器 / 模型 / 参数指纹；
+  公共总片数、偏移、循环边界、检查点恢复**读同一快照**。
+- 已有任务**缺** `chunk_seconds` 时按旧 **600** 解释。
+- 切换模型 / 服务 / 分片几何使旧检查点不兼容时**必须明确重开**，
+  **不能**暗中重放可能已计费的片段。
+- 片段结果按序合并且不重复；**不**假造说话人跨片对应。
+
+### 14.3 MiniMax 同步 TTS（A8）
+
+- `POST t2a_v2`；携带有效 `model`、`text`、`voice_setting` 与 `audio_setting`，
+  `audio_setting.format=mp3`、`stream=false`、`output_format=hex`。
+- **非零 `base_resp` 先转错误**；合法 `data.audio` 按 hex 解码并校验实际音频。
+- **不得**把 JSON、错误文字或非法 hex 写成 mp3。
+- 系统音色查询（`POST /v1/get_voice`）与手工 voice ID 可用；
+  **不**硬塞 OpenAI alloy 或硅基流动音色。
+- 本期服务元数据标 `streaming=false`。
+
+### 14.4 MiniMax 文生图（A9）
+
+- `POST image_generation`；`model` 为已登记预设，`prompt` 必填，`n` 受支持范围约束。
+- 尺寸映射为该 model 支持的 `width`/`height` 或 `aspect_ratio`；
+  **不**发送 OpenAI `size` 字符串作为未知字段。
+- 首期默认请求 `base64`；若使用 URL 模式则解析 `data.image_urls` 并通过**受控下载**，
+  **不**把 Key 转发给外部 CDN。
+- 业务失败 / 部分失败**不**伪装全成功；全部失败**不得**记 `passed`。
+- 未支持的编辑、尺寸或参数在**发出请求前**拒绝。
+
+### 14.5 状态与错误（A11）
+
+- 某一服务的目录 / 鉴权 / 业务失败**不覆盖**其他服务。
+- HTTP 200 中的非零 `base_resp` **不当成功**。
+- Key / 服务地址 / 适配器 / 对应测试参数变化使相关测试**过期**；
+  结果写回前比对当前指纹，**迟到响应不覆盖新状态**。指纹**不得公开**。
+- 五类旧错误仍能显示。
+
+---
+
+## 15. 错误字段扩展（可选，兼容缺省）
+
+在 §4.1 的三个字段之外**新增可选字段**，旧客户端忽略即可：
+
+| 字段                 | 含义                                             |
+| -------------------- | ------------------------------------------------ |
+| `upstream_code`      | 上游业务码（如 MiniMax `1004`）                  |
+| `upstream_http_status` | 上游**真实** HTTP 状态（业务失败时为 `200`）   |
+| `trace_id`           | 上游追踪 ID（脱敏后展示）                        |
+| `purpose`            | 媒体错误的用途（`transcription`/`speech`/`image`） |
+
+- 原 `upstream_status` 对真正非 2xx **仍保留**。
+- HTTP 200 的业务失败用 `upstream_http_status=200` + 真实业务码表达，
+  **不**伪造上游 HTTP 401 / 429。
+- 新增 `reason`：`invalid_parameters`、`content_rejected`，
+  由固定脱敏 `hint` 说明参数或内容，沿用 `inspect_connection` 动作。
+  本地输入校验仍为**本地 4xx**，**不是**厂商故障。
+- 媒体错误标 `stage=inference`。
+
+---
+
+## 16. 本期新增 / 变更的接口
+
+| 接口 | 变更 | 说明 |
+| ---- | ---- | ---- |
+| `GET /` | 响应新增 `service_contract_version: 1` 与模板 `services` 元数据 | 前端不再自带一份能力清单 |
+| `GET /connections`、`GET /connections/{id}` | 响应新增 `resolved_services`（脱敏）与 `service_statuses` | 每个用途独立显示状态 |
+| `POST /connections` | 请求新增**可选** `model_selections` | 与旧 `config.model_ids` 并存兼容 |
+| `POST /connections/verify` | 与正式保存共用模板解析 | 修复身份丢失 |
+| `GET /models?purpose=` | 支持 `purpose` 与可选 `operation` | 媒体未配置**不**回退到 chat |
+| `POST /connections/{id}/models/fetch` | 请求新增**可选** `purpose` | 无参数保持旧行为 |
+| `POST /connections/{id}/voices/fetch` | **新增** | 入参 `purpose='speech'`、`voice_type`；返回 `{data, error, fetched_at}` |
+| `POST /connections/{id}/model-test` | 走统一媒体契约 | 新增音频上传、音色与受支持选项由测试对话框提交 |
+
+`POST /connections/{id}/voices/fetch` 的约束：
+
+- 不支持音色查询的适配器返回**明确本地 4xx**，**不发推理**。
+- 访问者须具有连接使用权。
+- `voice_type=all` 或自有克隆 / 生成音色**仅管理者**可查；
+  普通授权使用者默认只见 `system` 或连接明确共享的音色。
+- 查询**不是激活**：不在每次页面加载调用推理或音色激活。
+
+---
+
+## 17. 调用回执
+
+- 回执保留稳定模型、`purpose`、结果与耗时。
+- 能获取的时长 / 字符 / 图片数量用**对应单位**存进现有 `usage` JSON；
+  **无计量则 `null`**，**不伪造** token 或费用。
+- 记录**不得**包含上传音频、合成文本、图片内容、Key 或原始业务错误体。

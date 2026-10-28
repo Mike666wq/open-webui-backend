@@ -529,12 +529,51 @@ async def _tts_openai(request, payload, file_path, file_body_path, user):
     )
 
 
+async def _tts_minimax(request, payload, file_path, file_body_path, user, resolved, api_key):
+    """Generate speech through the MiniMax native endpoint.
+
+    The endpoint answers with the audio as a hexadecimal string and may carry
+    a business failure inside a HTTP 200. A failure never becomes an audio
+    file.
+    """
+    from open_webui.utils.provider_media import call_media_service, resolve_service
+
+    service = resolve_service(resolved.connection, 'speech', 'minimax-speech')
+    text = str(payload.get('input') or '').strip()
+    if not text:
+        raise HTTPException(400, 'Speech input must be nonempty text.')
+    voice = payload.get('voice') or await Config.get('audio.tts.voice')
+    if not voice:
+        raise HTTPException(400, '请为该语音合成服务选择一个音色。')
+    result = await call_media_service(
+        resolved.connection,
+        service,
+        model=resolved.upstream_model_id,
+        credential=api_key,
+        payload={'text': text, 'voice': voice},
+    )
+    audio = result['audio']
+    content_type = result.get('content_type') or 'audio/mpeg'
+    if USE_SLIM:
+        await _write_tts_cache(file_path, audio, file_body_path, payload, content_type)
+        return FileResponse(file_path, media_type=content_type)
+    if not await asyncio.to_thread(transcode_audio_to_mp3, audio, content_type, file_path):
+        async with aiofiles.open(file_path, 'wb') as f:
+            await f.write(audio)
+    async with aiofiles.open(file_body_path, 'w') as f:
+        await f.write(JSONCodec.dumps(payload))
+    return FileResponse(file_path)
+
+
 async def _tts_provider(request, payload, file_path, file_body_path, user):
     """Generate speech with an administrator-selected API-key connection."""
     resolved = await resolve_configured_media(
         await Config.get('audio.tts.provider_connection_id'), await Config.get('audio.tts.model'), user, 'speech'
     )
     connection, api_key = await get_media_api_connection(resolved.connection.id, user)
+    adapter = (resolved.model_metadata.get('uses') or {}).get('speech')
+    if adapter == 'minimax-speech':
+        return await _tts_minimax(request, payload, file_path, file_body_path, user, resolved, api_key)
     return await _tts_openai_compatible(
         request,
         payload,
@@ -848,14 +887,30 @@ async def speech(request: Request, user=Depends(get_verified_user)):
     media_cache_scope = b''
     if engine == 'provider':
         connection, api_key = await get_media_api_connection(await Config.get('audio.tts.provider_connection_id'), user)
-        await resolve_configured_media(
+        resolved = await resolve_configured_media(
             await Config.get('audio.tts.provider_connection_id'), await Config.get('audio.tts.model'), user, 'speech'
         )
+        # The cache key follows the real destination: the visible connection,
+        # the endpoint that is actually called, the adapter, the model, the
+        # voice and the parameters. A cache hit still re-checks the access
+        # rights above.
+        adapter = (resolved.model_metadata.get('uses') or {}).get('speech')
+        endpoint = ''
+        if adapter:
+            try:
+                from open_webui.utils.provider_media import resolve_service
+
+                endpoint = resolve_service(connection, 'speech', adapter).endpoint
+            except HTTPException:
+                endpoint = provider_base_url(connection)
         media_cache_scope = JSONCodec.dumps(
             {
                 'connection': connection.id,
                 'credential': connection.credential,
                 'base_url': provider_base_url(connection),
+                'endpoint': endpoint,
+                'adapter': adapter,
+                'model': resolved.upstream_model_id,
                 'user': user.id,
                 'voice': await Config.get('audio.tts.voice'),
             }
@@ -980,6 +1035,110 @@ async def _transcribe_whisper(request, file_path, languages, file_dir, id):
     return data
 
 
+def _probe_audio_duration(file_path) -> float | None:
+    """Best-effort duration of an audio file, in seconds.
+
+    A service limit on the duration can only be enforced when the duration is
+    known, so `ffprobe` is authoritative and a WAV header is the fallback. When
+    neither can answer, the caller refuses the request instead of guessing.
+    """
+    import json
+    import math
+    import shutil
+    import subprocess
+
+    if shutil.which('ffprobe'):
+        try:
+            output = subprocess.run(
+                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', str(file_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            ).stdout
+            value = float(json.loads(output).get('format', {}).get('duration'))
+            if math.isfinite(value) and value > 0:
+                return value
+        except Exception:
+            log.debug('ffprobe could not read the duration of %s', file_path)
+    if str(file_path).lower().endswith('.wav'):
+        try:
+            with wave.open(str(file_path), 'rb') as handle:
+                rate = handle.getframerate()
+                if rate:
+                    return handle.getnframes() / float(rate)
+        except Exception:
+            pass
+    return None
+
+
+async def _read_audio_bytes(file_path) -> bytes:
+    async with aiofiles.open(file_path, 'rb') as handle:
+        return await handle.read()
+
+
+async def _transcribe_minimax(
+    request,
+    file_path,
+    filename,
+    languages,
+    file_dir,
+    id,
+    user,
+    resolved,
+    api_key,
+    response_format=None,
+):
+    """Transcribe audio through the MiniMax native endpoint.
+
+    The endpoint takes a multipart file and a fixed model, and it refuses
+    audio that is longer than its limit or in a container it does not accept.
+    Both are settled before the request leaves the server.
+    """
+    from open_webui.utils.provider_media import call_media_service, resolve_service
+
+    service = resolve_service(resolved.connection, 'transcription', 'minimax-transcription')
+    target_path = file_path
+    extension = Path(str(file_path)).suffix.lower().lstrip('.')
+    supported = ('wav', 'aiff', 'flac', 'm4a', 'mp3', 'aac', 'opus', 'ogg')
+    if extension not in supported:
+        # A browser recording arrives as WebM. It is transcoded when the
+        # server can do it; renaming the extension would not help.
+        converted = await asyncio.to_thread(convert_audio_to_mp3, str(file_path))
+        if not converted:
+            raise HTTPException(
+                400,
+                f'该语音转写服务不支持 {extension or "未知"} 格式的音频，且服务器无法将其转码为 mp3。',
+            )
+        target_path = converted
+        filename = Path(converted).name
+    duration = _probe_audio_duration(target_path)
+    if duration is None:
+        raise HTTPException(
+            503,
+            '该语音转写服务要求确认音频时长，请在后端安装 ffmpeg 与 ffprobe，或改用其它转写服务。',
+        )
+    # The language travels in a header and the adapter never probes several
+    # languages in turn: an unset language means the mixed-language mode.
+    language = next((item for item in (languages or []) if item), None)
+    payload = {
+        'audio': await _read_audio_bytes(target_path),
+        'filename': filename,
+        'duration': duration,
+        'language': language,
+        'response_format': response_format if response_format in ('json', 'verbose_json') else None,
+    }
+    result = await call_media_service(
+        resolved.connection,
+        service,
+        model=resolved.upstream_model_id,
+        credential=api_key,
+        payload=payload,
+    )
+    async with aiofiles.open(os.path.join(file_dir, f'{id}.json'), 'w') as f:
+        await f.write(JSONCodec.dumps(result))
+    return result
+
+
 async def _transcribe_openai(
     request,
     file_path,
@@ -1011,6 +1170,20 @@ async def _transcribe_openai(
                 )
             )
             connection, api_key = await get_media_api_connection(resolved.connection.id, user)
+            adapter = (resolved.model_metadata.get('uses') or {}).get('transcription')
+            if adapter == 'minimax-transcription':
+                return await _transcribe_minimax(
+                    request,
+                    file_path,
+                    filename,
+                    languages,
+                    file_dir,
+                    id,
+                    user,
+                    resolved,
+                    api_key,
+                    response_format=response_format,
+                )
             api_base_url = provider_base_url(connection)
             request_format = 'multipart'
         else:
@@ -1828,6 +2001,14 @@ async def get_available_voices(request, user=None) -> dict:
         )
         if provider_family(resolved.connection) == 'siliconflow':
             return {f'{resolved.upstream_model_id}:{voice}': voice for voice in SILICONFLOW_PRESET_VOICES}
+        adapter = (resolved.model_metadata.get('uses') or {}).get('speech')
+        if adapter == 'minimax-speech':
+            # The MiniMax voice list comes from the provider, not from a
+            # preset. The interface fetches it through the voice endpoint; the
+            # configured voice is the only honest answer here. Another
+            # provider's voice id would be rejected by the vendor.
+            voice = await Config.get('audio.tts.voice')
+            return {voice: voice} if voice else {}
         return dict(_OPENAI_DEFAULT_VOICES)
 
     if engine == 'openai':

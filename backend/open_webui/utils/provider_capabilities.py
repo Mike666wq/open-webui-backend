@@ -3,13 +3,49 @@
 import hashlib
 import json
 
+from fastapi import HTTPException
+from open_webui.utils.provider_registry import (
+    ADAPTER_OPERATIONS,
+    MODEL_REQUIREMENT_NONE,
+    resolve_template,
+)
+
 ADAPTERS = {
     'chat': {'openai-chat', 'responses'},
-    'transcription': {'openai-transcription'},
-    'speech': {'openai-speech'},
-    'image': {'openai-image', 'siliconflow-image'},
+    'transcription': {'openai-transcription', 'minimax-transcription'},
+    'speech': {'openai-speech', 'minimax-speech'},
+    'image': {'openai-image', 'siliconflow-image', 'minimax-image'},
 }
 DEFAULT_ADAPTER = {key: sorted(value)[0] for key, value in ADAPTERS.items()}
+
+# The single place where an adapter's relative path is registered. An adapter
+# appends its own path exactly once to a base URL; a complete endpoint is used
+# verbatim. Nothing may guess a path from the shape of a URL.
+ADAPTER_PATHS = {
+    'openai-transcription': '/audio/transcriptions',
+    'openai-speech': '/audio/speech',
+    'openai-image': '/images/generations',
+    'siliconflow-image': '/images/generations',
+    'minimax-transcription': '/speech_to_text',
+    'minimax-speech': '/t2a_v2',
+    'minimax-image': '/image_generation',
+}
+
+# Adapters that speak an OpenAI-compatible media protocol. They may be used on
+# a template that declares them; a native adapter never may.
+NATIVE_ADAPTERS = {'minimax-transcription', 'minimax-speech', 'minimax-image'}
+
+# The operations an image adapter supports. Text-to-image does not imply
+# image editing: the two use different endpoints and different payloads. The
+# table lives with the templates, so the metadata and the call path cannot
+# drift apart.
+
+
+def adapter_supports_operation(adapter: str, operation: str) -> bool:
+    """Whether an adapter can serve one image operation."""
+    if operation == 'generate':
+        return True
+    return operation in (ADAPTER_OPERATIONS.get(adapter) or ())
 
 
 def provider_family(connection):
@@ -21,6 +57,94 @@ def provider_family(connection):
     ):
         return 'siliconflow'
     return connection.provider_id
+
+
+def connection_template_id(connection) -> str:
+    """Return the template a connection was created from.
+
+    A custom connection pointing at SiliconFlow behaves like the SiliconFlow
+    template for service declarations, because that is the protocol it speaks.
+    """
+    template_id = getattr(connection, 'provider_template', None) or connection.provider_id
+    if template_id == 'custom' and provider_family(connection) == 'siliconflow':
+        return 'siliconflow'
+    return template_id
+
+
+def connection_services(connection) -> dict:
+    """Return the service declarations that apply to a connection."""
+    try:
+        template = resolve_template(connection_template_id(connection))
+    except Exception:
+        return {}
+    return template.get('services') or {}
+
+
+def service_declaration(connection, purpose: str) -> dict:
+    """Return one service declaration, or an explicit unsupported one."""
+    services = connection_services(connection)
+    declaration = services.get(purpose)
+    if isinstance(declaration, dict):
+        return declaration
+    return {
+        'supported': False,
+        'unsupported_reason': '该提供商未声明此服务。',
+        'adapters': [],
+        'auth_types': [],
+        'discovery': 'none',
+        'model_requirement': MODEL_REQUIREMENT_NONE,
+        'endpoint': {'kind': 'base_url', 'url': ''},
+        'preset_models': [],
+        'limits': {},
+        'options': {},
+        'notes': None,
+    }
+
+
+def validate_model_uses(connection, uses: dict, *, auth_type: str | None = None) -> dict:
+    """Validate a set of purposes against the template's service declarations.
+
+    Every write path uses this, so a purpose can never be smuggled in through
+    `POST /connections` that the same connection could not get through the
+    model endpoints. An OAuth connection can never obtain a media purpose.
+    """
+    if not isinstance(uses, dict):
+        raise HTTPException(400, 'Model purposes must be an object')
+    auth = auth_type if auth_type is not None else getattr(connection, 'auth_type', 'api_key')
+    result = {}
+    for purpose, adapter in uses.items():
+        if purpose not in ADAPTERS:
+            raise HTTPException(400, 'Unsupported purpose or adapter')
+        if not isinstance(adapter, str) or adapter not in ADAPTERS[purpose]:
+            raise HTTPException(400, 'Unsupported purpose or adapter')
+        declaration = service_declaration(connection, purpose)
+        if not declaration.get('supported'):
+            raise HTTPException(
+                400,
+                declaration.get('unsupported_reason')
+                or f'{connection_template_id(connection)} 不支持此服务。',
+            )
+        allowed = declaration.get('adapters') or []
+        if adapter not in allowed:
+            raise HTTPException(
+                400,
+                f'{connection_template_id(connection)} 的该服务不支持 {adapter} 适配器。',
+            )
+        if auth == 'oauth' and purpose != 'chat':
+            raise HTTPException(400, '账号登录仅覆盖文本推理，不能用于媒体服务。')
+        if auth != 'oauth' and 'oauth' in (declaration.get('auth_types') or ['api_key']):
+            raise HTTPException(400, '该服务需要账号登录，而不是 API Key。')
+        result[purpose] = adapter
+    return result
+
+
+def service_uses(declaration: dict) -> dict:
+    """Return the purpose/adapter pair a preset model declares."""
+    for model in declaration.get('preset_models') or []:
+        uses = model.get('uses') or {}
+        if uses:
+            return dict(uses)
+    return {}
 
 
 SILICONFLOW_SPEECH = {'FunAudioLLM/CosyVoice2-0.5B', 'fnlp/MOSS-TTSD-v0.5'}

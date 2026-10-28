@@ -617,6 +617,57 @@ async def generate_images(request: Request, form_data: CreateImageForm, user=Dep
     return result
 
 
+async def _parse_image_size(size: str) -> tuple[int, int]:
+    """Read a ``宽x高`` size into two integers."""
+    try:
+        width, height = str(size).lower().split('x', 1)
+        return int(width), int(height)
+    except (AttributeError, ValueError):
+        raise HTTPException(400, '图片尺寸格式无效，请使用 宽x高 的形式') from None
+
+
+async def _image_generations_minimax(
+    request, resolved, connection, api_key, form_data, metadata, user
+):
+    """Generate images through the MiniMax native endpoint.
+
+    The endpoint returns URLs or base64 payloads of its own; both are stored
+    through the existing controlled file flow. A temporary provider URL is
+    never kept as a permanent chat attachment.
+    """
+    from open_webui.utils.provider_media import call_media_service, resolve_service
+
+    service = resolve_service(connection, 'image', 'minimax-image')
+    width, height = _parse_image_size(form_data.size or '1024x1024')
+    payload = {
+        'prompt': form_data.prompt,
+        'n': form_data.n or 1,
+        'width': width,
+        'height': height,
+    }
+    result = await call_media_service(
+        connection,
+        service,
+        model=resolved.upstream_model_id,
+        credential=api_key,
+        payload=payload,
+    )
+    images = []
+    for item in result.get('images') or []:
+        if item.get('b64'):
+            image_data, content_type = await get_image_data(item['b64'])
+        elif item.get('url'):
+            # The provider key is never forwarded to the image host.
+            image_data, content_type = await get_image_data(item['url'])
+        else:
+            continue
+        _, image_file = await upload_image(request, image_data, content_type, {**payload, **metadata}, user)
+        images.append(image_file)
+    if not images:
+        raise HTTPException(502, 'Provider did not return images')
+    return images
+
+
 async def image_generations(
     request: Request,
     form_data: CreateImageForm,
@@ -656,6 +707,10 @@ async def image_generations(
         raise HTTPException(400, 'Select an image model for this provider connection')
     if media_connection and form_data.model and form_data.model not in (model, image_config.IMAGE_GENERATION_MODEL):
         raise HTTPException(400, 'Use the configured image model for this provider connection')
+    if media_connection and (resolved_image.model_metadata.get('uses') or {}).get('image') == 'minimax-image':
+        return await _image_generations_minimax(
+            request, resolved_image, media_connection, api_key, form_data, metadata, user
+        )
 
     try:
         if image_config.IMAGE_GENERATION_ENGINE == 'openai':
@@ -986,6 +1041,16 @@ async def image_edits(
         if form_data.model and form_data.model != image_config.IMAGE_EDIT_MODEL:
             raise HTTPException(400, 'Use the configured image edit model for this provider connection')
         model = image_config.IMAGE_EDIT_MODEL
+        # The edit path resolves the same stable model as the generation path
+        # and checks that the adapter really serves the edit operation. Text
+        # to image does not imply image editing.
+        from open_webui.utils.provider_capabilities import adapter_supports_operation
+
+        resolved_edit = await resolve_configured_media(media_connection.id, model, user, 'image')
+        adapter = (resolved_edit.model_metadata.get('uses') or {}).get('image')
+        if not adapter_supports_operation(adapter, 'edit'):
+            raise HTTPException(400, '该连接的生图服务不支持图片编辑。')
+        model = resolved_edit.upstream_model_id
 
     try:
 
