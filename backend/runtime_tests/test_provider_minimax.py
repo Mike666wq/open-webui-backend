@@ -334,6 +334,40 @@ class MiniMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.calls[0]['url'], 'https://api.minimax.cn/v1/get_voice')
         self.assertEqual(session.calls[0]['json'], {'voice_type': 'system'})
 
+    async def test_the_official_get_voice_buckets_are_parsed(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                (
+                    '{"base_resp": {"status_code": 0}, '
+                    '"system_voice": ['
+                    '{"voice_id": "female-qn-qingse", "voice_name": "青涩青年女声", '
+                    '"description": ["标准女声"]}, '
+                    '{"voice_id": "v2"}], '
+                    '"voice_cloning": [{"voice_id": "clone-1", "description": []}], '
+                    '"voice_generation": [{"voice_id": "clone-1", "description": []}]}'
+                ).encode('utf-8'),
+            )
+        )
+
+        @asynccontextmanager
+        async def session_scope(connection, **_options):
+            yield session
+
+        with patch.object(providers, 'media_http_session', side_effect=session_scope):
+            voices = await provider_media.fetch_voices(
+                self.connection, self.service('speech', 'minimax-speech'), 'saved-key', 'all'
+            )
+        self.assertEqual(
+            voices,
+            [
+                {'id': 'female-qn-qingse', 'name': '青涩青年女声', 'source': 'system'},
+                {'id': 'v2', 'name': 'v2', 'source': 'system'},
+                {'id': 'clone-1', 'name': 'clone-1', 'source': 'cloning'},
+            ],
+        )
+        self.assertEqual(session.calls[0]['json'], {'voice_type': 'all'})
+
     async def test_a_service_without_a_voice_list_says_so_locally(self):
         connection = SimpleNamespace(
             **{
