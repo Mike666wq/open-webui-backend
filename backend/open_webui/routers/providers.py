@@ -992,7 +992,9 @@ async def test_model(
     return await _test_model(connection_id, form, user, db)
 
 
-async def _test_model(connection_id: str, form: ModelTest, user, db, *, include_sample=False):
+async def _test_model(
+    connection_id: str, form: ModelTest, user, db, *, include_sample=False, start_time=None, expected_fingerprint=None
+):
     import time
 
     from open_webui.utils.provider_capabilities import fingerprint
@@ -1015,7 +1017,9 @@ async def _test_model(connection_id: str, form: ModelTest, user, db, *, include_
         else await resolve_media_model(model_id, user, form.purpose, db, allow_disabled=True)
     )
     before = fingerprint(connection, resolved.model_metadata)
-    started = time.monotonic()
+    if expected_fingerprint is not None and before != expected_fingerprint:
+        raise HTTPException(409, 'Configuration changed before the test; no request was sent')
+    started = start_time if start_time is not None else time.monotonic()
     if form.purpose == 'chat':
         import asyncio
 
@@ -1135,7 +1139,9 @@ async def test_model_stream(
         yield emit('accepted')
         if form.purpose != 'chat':
             try:
-                result = await _test_model(connection_id, form, user, db, include_sample=True)
+                result = await _test_model(
+                    connection_id, form, user, db, include_sample=True, start_time=started, expected_fingerprint=before
+                )
                 result['timings'] = timings
                 yield emit('completed' if result.get('status') == 'passed' else 'failed', result)
             except Exception as exc:

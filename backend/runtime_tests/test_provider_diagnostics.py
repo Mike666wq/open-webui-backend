@@ -6,6 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from fastapi import HTTPException
 from open_webui.routers import providers
 
 
@@ -19,6 +20,21 @@ def frames(*values):
 
 
 class ProviderDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_media_fingerprint_change_before_request_prevents_inference(self):
+        connection = SimpleNamespace(auth_type='api_key')
+        resolved = SimpleNamespace(model_metadata={'uses': {'transcription': 'minimax-transcription'}})
+        form = providers.ModelTest(upstream_id='asr-1.0', purpose='transcription')
+        with (
+            patch.object(providers, '_connection_with_manage_access', new=AsyncMock(return_value=connection)),
+            patch('open_webui.utils.providers.resolve_media_model', new=AsyncMock(return_value=resolved)),
+            patch('open_webui.utils.provider_capabilities.fingerprint', return_value='changed'),
+            patch('open_webui.utils.provider_media.call_media_service', new=AsyncMock()) as call,
+        ):
+            with self.assertRaises(HTTPException) as error:
+                await providers._test_model('connection', form, object(), object(), expected_fingerprint='before')
+        self.assertEqual(error.exception.status_code, 409)
+        call.assert_not_awaited()
+
     async def run_case(self, upstream):
         connection = SimpleNamespace(auth_type='api_key')
         resolved = SimpleNamespace(model_metadata={'uses': {'chat': 'openai-chat'}})

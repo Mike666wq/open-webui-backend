@@ -628,7 +628,8 @@ provider_media.call_media_service(service, *, model, credential, input) -> norma
   建立流之前拒绝返回 HTTP 错误，建立之后失败以终态事件返回。
 - 终态包含原有 `status`、`elapsed_ms`、`error`，并提供 `timings`：
   `upstream_headers_ms`、`first_output_ms`、`upstream_total_ms`；无法观测为 null。
-  测试总耗时包括上游请求及响应处理，不包含鉴权与模型解析，浏览器耗时单独标注。
+  测试总耗时从首次管理权限检查和模型解析之后开始，包括后续凭据准备、上游请求与响应处理，
+  不含结果写回；事件耗时使用同一计时起点，终态事件可包含写回时间。浏览器耗时单独标注。
 - 支持流式的聊天模型仅发一次流式推理，以首个非空回答文本增量记录首输出；
   非流式不测首输出。取消、断流、超时或解析失败不得记成功、自动重试或重新推理；
   样例输出只临时展示，最多 8 KiB，不能存入调用记录。旧后端不支持流端点时，
