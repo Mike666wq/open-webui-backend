@@ -52,6 +52,8 @@ REASON_DNS_FAILURE = 'dns_failure'
 REASON_TLS_FAILURE = 'tls_failure'
 REASON_TIMEOUT = 'timeout'
 REASON_UPSTREAM_FAILURE = 'upstream_failure'
+REASON_INVALID_PARAMETERS = 'invalid_parameters'
+REASON_CONTENT_REJECTED = 'content_rejected'
 REASON_UNKNOWN = 'unknown'
 
 REASONS = (
@@ -65,6 +67,8 @@ REASONS = (
     REASON_TLS_FAILURE,
     REASON_TIMEOUT,
     REASON_UPSTREAM_FAILURE,
+    REASON_INVALID_PARAMETERS,
+    REASON_CONTENT_REJECTED,
     REASON_UNKNOWN,
 )
 
@@ -120,6 +124,8 @@ _REASON_HINTS = {
     REASON_QUOTA_EXHAUSTED: '厂商额度或余额不足，请检查账户套餐与余额。',
     REASON_RATE_LIMITED: '厂商限流，请等待片刻后重试。',
     REASON_ADDRESS_BLOCKED: '连接被服务器的安全策略拦截，请检查地址解析结果与代理配置。',
+    REASON_INVALID_PARAMETERS: '厂商拒绝了这次请求的参数，请检查模型、尺寸与内容是否符合该服务的要求。',
+    REASON_CONTENT_REJECTED: '厂商拒绝了这次请求的内容，请检查输入文本或图片。',
 }
 
 
@@ -201,6 +207,10 @@ def build_error(
     stage: str | None = None,
     reason: str | None = None,
     suggested_action: str | None = None,
+    upstream_code: str | None = None,
+    upstream_http_status: int | None = None,
+    trace_id: str | None = None,
+    purpose: str | None = None,
 ) -> dict:
     """Build the persisted/public error payload for a provider failure."""
     category = category if category in CATEGORIES else UPSTREAM
@@ -219,6 +229,10 @@ def build_error(
         'stage': stage if stage in STAGES else None,
         'reason': resolved_reason,
         'suggested_action': resolved_action,
+        'upstream_code': upstream_code,
+        'upstream_http_status': upstream_http_status,
+        'trace_id': trace_id,
+        'purpose': purpose,
     }
 
 
@@ -303,4 +317,8 @@ def error_from_exception(exc) -> dict:
         stage=stage,
         reason=reason,
         suggested_action=suggested_action,
+        upstream_code=getattr(exc, 'provider_upstream_code', None),
+        upstream_http_status=getattr(exc, 'provider_upstream_http_status', None),
+        trace_id=getattr(exc, 'provider_trace_id', None),
+        purpose=getattr(exc, 'provider_purpose', None),
     )

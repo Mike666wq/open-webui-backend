@@ -29,6 +29,21 @@
 - [后端流水线](https://github.com/Mike666wq/open-webui-backend/actions/workflows/backend.yml)
 - [后端前端锁](https://github.com/Mike666wq/open-webui-backend/blob/main/frontend.lock.json)
 
+## 供应商按服务接入与 MiniMax 原生媒体（P-002，2026-10-28）
+
+供应商接入从「一个连接一种协议」细化为「按服务接入」：每个连接按聊天 / 语音转写 / 语音合成 / 生图四种用途分别声明支持情况、鉴权限制、发现策略（远程列表 / 官方预设 / 手工）、参数与限制；服务是否可用由「模板支持 × 认证方式 × 适配器 × 模型声明」共同决定，OAuth 订阅连接明确不支持媒体服务。服务配置存在连接的 `config.services` JSON 里，不新增数据库表；省略 `services` 的旧连接按旧行为原样读取。
+
+- **无列表流程**：MiniMax 转写 / 合成 / 生图无需先获取远程模型列表即可添加与保存；`asr-1.0` 等预设模型明确选定后进入白名单并保持「未测试」状态，不报「模型列表失败」。手工添加的模型来源标记为 manual，不会因缺临时候选快照被自动归为聊天。
+- **地址两模式**：`base_url`（含版本前缀的 API 根，适配器只追加一次登记路径）与 `endpoint_url`（完整地址原样使用一次）。用户给出的 `https://api.minimax.cn/v1/speech_to_text` 作为完整地址时恰好调用一次，不再叠加 `/models` 或 `/audio/transcriptions`。
+- **MiniMax 原生适配**：转写 `POST /v1/speech_to_text`（multipart 必带 `model=asr-1.0`，语言走请求头，≤50MiB 且 ≤500 秒）；合成 `POST /v1/t2a_v2`（hex 音频解码为 MP3，`base_resp` 非零先转错误）；文生图 `POST /v1/image_generation`（`image_urls` / `image_base64`，partial 语义保留）。HTTP 200 里的业务失败不再当成功，业务码 1004/2049/1008/1002/2013 分别映射为凭据 / 额度 / 限流 / 参数错误。
+- **录音分片**：MiniMax 转写分片目标 480 秒（500 上限留余量），任务快照保存实际 `chunk_seconds` 与参数指纹；旧任务缺该字段时按 600 秒解释，分片几何不兼容时明确重开，不自动重放可能已计费的片段。
+- **生图操作分层**：服务声明新增 `operations`（`openai-image` 为 `['edit','generate']`，`minimax-image` 仅 `['generate']`），按连接实际生效的适配器计算；前端据此决定是否展示图片编辑入口，后端在出站前再次判定——生图可用不等于编辑可用。
+- **测试与日常调用对齐**：模型测试与真实功能使用同一适配器、地址解析、输入约束和响应规范；转写测试可上传音频样本、合成测试可选音色（新增 `voices/fetch` 查询 system 音色）、图片测试可设支持尺寸；点击测试前展示实际服务、模型与可能计费，单次操作只发一次推理。
+
+契约与矩阵见 [接口契约](PROVIDER_CONTRACT.md) 与 [服务矩阵](PROVIDER_SERVICE_MATRIX.md)。
+
+自动化（本地 Python 3.11 `.venv` 预检）：runtime 测试 221 项、unittest 55 项、chat integration、`check_source` 全部通过；前端 vitest 28 文件 126 项通过。**尚未完成**：本分支的 GitHub Actions run、真实 MiniMax 账号下的 ASR / TTS / 生图验收、浏览器与 Android 真机验收、PR 合并与正式发布。
+
 ## 本次迁移验收记录
 
 - 原签名迁移：[run 39759453405，第 3 次](https://github.com/Mike666wq/open-webui-client/actions/runs/39759453405/attempts/3) 成功；一次性入口已删除。

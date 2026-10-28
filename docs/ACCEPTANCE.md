@@ -1,6 +1,6 @@
 # 当前验收清单
 
-核对日期：2026-10-27（对应规划件 P-001 r2）。共同进度见 [PROJECT_STATUS.md](PROJECT_STATUS.md)。
+核对日期：2026-10-28（对应规划件 P-001 r2 与 P-002）。共同进度见 [PROJECT_STATUS.md](PROJECT_STATUS.md)。
 勾选只代表**该项的证据已经存在**；自动检查通过**不等于**人工验收完成，也不等于生产根因已定位。
 
 ## 已验证的自动交付
@@ -18,7 +18,40 @@
 - [x] 显式放行 `198.18.0.0/15` 时匹配地址可进入连接流程，回环 / 其它私网 / 元数据地址仍被拒，TLS 校验与禁止重定向不变。
   证据：`backend/runtime_tests/test_provider_http.py`。
 
-## 尚未完成的验收
+## P-002 供应商按服务接入（2026-10-28，规划件 P-002）
+
+以下勾选的证据来自本地 Python 3.11 `.venv` 预检（`scripts/test_provider_runtime.py` 221 项、`unittest discover -s tests` 55 项、`test_provider_chat_integration.py`、`check_source.py` 全部通过）；该分支的 GitHub Actions run 尚未产生，合并与发布未做。
+
+### 已验证的自动交付
+
+- [x] 模板身份：临时校验与正式保存共享同一解析契约，选中的 MiniMax / 百炼 / DeepSeek 模板不再被缺省 `custom` 覆盖。
+      证据：`backend/runtime_tests/test_provider_services.py`、`test_provider_connections.py`。
+- [x] 服务声明：`GET /providers` 返回各模板按 chat/transcription/speech/image 的支持情况、鉴权限制、发现策略、`model_requirement`、preset 与限制；OAuth 模板的媒体服务声明不可用。
+      证据：`backend/runtime_tests/test_provider_services.py`。
+- [x] 无列表流程：MiniMax ASR/TTS/image 不请求 `/models` 即可保存；`asr-1.0` 明确选定后进入转写白名单并保持未测试；`model_requirement='defaulted'` 仍必发 `model=asr-1.0`，不是 model-less。
+      证据：`backend/runtime_tests/test_provider_services.py`、`test_provider_minimax.py`。
+- [x] 用途保存：`model_selections` 携带 display_name/uses/source，与旧 `config.model_ids` 并存但同时不一致时拒绝；手工用途保存为 manual+untested，刷新后不降级为 chat。
+      证据：`backend/runtime_tests/test_provider_services.py`。
+- [x] 地址规则：`base_url` 只追加一次登记相对路径、`endpoint_url` 原样使用一次；完整 ASR 地址恰好调用一次；错误地址在出站前给出可理解提示。
+      证据：`backend/runtime_tests/test_provider_minimax.py`、`test_provider_http.py`。
+- [x] ASR 契约与限制：multipart 必带 `model=asr-1.0`，language 走请求头；json/verbose_json 规范化；50MiB/500 秒上限；录音分片 480 秒并保存 `chunk_seconds` 快照，旧任务按 600 秒解释，检查点不兼容时明确重开。
+      证据：`backend/runtime_tests/test_provider_minimax.py`、`test_recordings.py`。
+- [x] TTS 契约：`t2a_v2` 携带 model/text/voice_setting/audio_setting，hex 解码校验后才入音频链路；`base_resp` 非零转错误，HTTP 200 业务失败不当成功（`upstream_http_status=200` + 业务码）；业务码 1004/2049/1008/1002/2013 分类映射。
+      证据：`backend/runtime_tests/test_provider_minimax.py`。
+- [x] 生图契约：文生图映射 model/prompt/尺寸/n，解析 `image_urls`/`image_base64`，partial 失败数保留；编辑操作（operation=edit）在出站前按实际生效适配器拒绝。
+      证据：`backend/runtime_tests/test_provider_minimax.py`、`test_provider_services.py`（operations 声明）、`routers/images.py` 编辑分支。
+- [x] 共用调用语义与权限回归：显式测试与日常调用走同一适配器/地址/约束/响应规范；禁用连接与模型在媒体下拉隐藏且调用时拒绝；共享撤销、缓存命中重新校验、SSRF/TLS 防线不放松。
+      证据：`backend/runtime_tests/test_provider_media.py`、`test_provider_http.py`、`test_provider_api_v2.py`。
+
+### 尚未完成的验收（P-002）
+
+- [ ] 本分支 GitHub Actions 全绿（后端检查 + runtime 测试），PR 开启与合并。
+- [ ] 真实 MiniMax 账号：短音频 ASR、超过 500 秒录音分片、TTS 播放、文生图保存——需要账号所有者触发，逐服务单独判定。
+- [ ] 浏览器人工验收（服务选择、无列表保存、音色/文件测试对话框、390×844 等视口）与 Android 真机。
+- [ ] 待取证：MiniMax ASR 语言请求头名（现用 `Language`，集中常量可改）；音色 `output_format=url` 字段名；国际区 `image-01-live` 枚举；生产镜像内 ffmpeg 可用性。
+- [ ] P-001 遗留：真实 ChatGPT 授权、真实厂商凭据下的推理（见下节）。
+
+## 尚未完成的验收（P-001 r2）
 
 - [ ] 真实 ChatGPT 授权、真实厂商凭据下的推理、额度与套餐验证；需要账号所有者与部署责任人。
       （2026-10-28 取证：ChatGPT 连接的快照错误是 `stage=oauth_refresh` / `reason=token_expired` /

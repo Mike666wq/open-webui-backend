@@ -36,6 +36,19 @@ class ProviderConnection(Base):
     )
 
 
+class ProviderModelSelection(BaseModel):
+    """One model the user picked for a connection, with its purposes.
+
+    A selection is a traceable declaration: it says which purpose the model
+    serves and where the id came from. It never claims the model works.
+    """
+
+    upstream_id: str = Field(min_length=1, max_length=256)
+    display_name: str | None = Field(default=None, max_length=256)
+    uses: dict[str, str] = Field(default_factory=dict)
+    source: Literal['preset', 'manual', 'provider'] = 'manual'
+
+
 class ProviderConnectionCreate(BaseModel):
     # The provider template id. `provider_template` is the preferred field name;
     # `provider_id` stays accepted for older clients.
@@ -48,6 +61,10 @@ class ProviderConnectionCreate(BaseModel):
     api_key: SecretStr | None = Field(default=None, min_length=1, max_length=4096)
     config: dict = Field(default_factory=dict)
     access_control: list[dict] = Field(default_factory=list)
+    # The models the user picked, with their purposes. It coexists with the
+    # legacy `config.model_ids`; sending both with different content is
+    # refused rather than silently resolved.
+    model_selections: list[ProviderModelSelection] | None = Field(default=None, max_length=500)
 
 
 class ProviderConnectionUpdate(BaseModel):

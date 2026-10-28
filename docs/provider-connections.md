@@ -114,6 +114,28 @@ OpenAI/Azure API Key 设置。[ChatGPT OAuth 限制](https://developers.openai.c
 [语音转写](https://docs.siliconflow.cn/docs/api/audio-transcriptions-post) 和
 [图片生成](https://docs.siliconflow.cn/docs/userguide/capabilities/images)。
 
+## 按服务接入：聊天、转写、合成、生图分开配置（P-002）
+
+每个连接按四种用途分别配置：**聊天 / 语音转写 / 语音合成 / 生图**。后端对每个模板返回各服务的支持情况、鉴权限制、发现策略（远程列表 / 官方预设 / 手工）、参数与限制；服务是否可用由「模板支持 × 认证方式 × 适配器 × 模型声明」共同决定。OAuth 订阅连接（ChatGPT、Kimi Code）明确声明媒体服务不可用，订阅登录不会自动获得转写 / 合成 / 生图权限。
+
+服务配置保存在连接的 `config.services` JSON 中，不新增数据库表：
+
+- 省略 `services` 的旧连接原样读取，原 `base_url`、`api_type` 与模型用途不变。
+- 存在 `services` 时表示「只启用列出的用途」；每项可设 `enabled`、`adapter`、`endpoint`、`options`，未知字段或不匹配的适配器 / 鉴权组合在出站前拒绝。
+- 地址支持两种模式：`base_url` 是含版本前缀的 API 根，适配器只追加自己登记的相对路径一次；`endpoint_url` 是完整请求地址，原样使用一次。把完整操作地址误填为 `base_url` 时界面会说明两种模式，后端不默默生成重复后缀。服务详情展示脱敏后的最终 URL 预览。
+
+### MiniMax 原生媒体
+
+MiniMax 的转写 / 合成 / 文生图使用厂商原生接口，默认根地址 `https://api.minimax.cn/v1`，无需先获取远程模型列表即可添加与保存：
+
+- **语音转写** `POST /v1/speech_to_text`：multipart 必带 `model=asr-1.0`（预设+默认模型，仍必须发送，不是 model-less）；`language` 走请求头，未指定时省略（混合识别）；输入不超过 50 MiB 且 500 秒。返回 json / verbose_json；segments 的 start/end/speaker 转入录音结果结构。
+- **语音合成** `POST /v1/t2a_v2`：同步请求，返回 hex 音频解码为 MP3 后进入现有播放链路；`base_resp.status_code` 非零先转错误，HTTP 200 的业务失败不当成功。音色通过 `POST /v1/get_voice` 查询 system 类别，也支持手工 voice ID；不使用其他厂商的预设音色冒充。
+- **文生图** `POST /v1/image_generation`：`model` 选 `image-01` 等已登记预设，`prompt` 必填，尺寸映射为该模型支持的宽高；结果从 `image_urls`（受控下载）或 `image_base64` 解析，部分失败保留有效结果并标明失败数。**生图可用不等于编辑可用**：服务声明带 `operations` 元数据（`openai-image` 为 `['edit','generate']`，MiniMax / SiliconFlow 生图仅 `['generate']`），前端据此决定是否展示编辑入口，后端在出站前按实际生效适配器再次判定。
+- 业务码映射：1004/2049→凭据无效，1008→额度不足，1002→限流，2013→参数错误；未知码保持 unknown，不猜测原因。错误对象可带 `upstream_code`、`upstream_http_status`（HTTP 200 业务失败时为 200）、`trace_id` 与 `purpose`。
+- 录音转写分片目标 **480 秒**（500 秒上限留余量），任务快照保存实际 `chunk_seconds` 与参数指纹；旧任务缺该字段按 600 秒解释，分片几何不兼容时明确重开，不自动重放可能已计费的片段。
+
+接口返回的可选用途与限制以后端为权威，前端不维护另一份「协议都支持媒体」的清单。模型测试与日常调用使用同一套适配器、地址解析、输入约束与响应规范；转写测试可上传音频样本（≤2MiB 显式测试上限）、合成测试可选音色、图片测试可设支持尺寸，点击测试前会展示实际服务、模型与可能计费。
+
 ## 失败时怎么恢复
 
 连接失败会按**真实阶段**与**真实原因**显示，而不是笼统的「失败」：

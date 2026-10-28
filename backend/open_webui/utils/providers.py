@@ -65,7 +65,7 @@ from open_webui.utils.provider_http import (
     allowed_ip_networks,
     provider_request_json,
 )
-from open_webui.utils.provider_registry import default_base_urls, public_templates
+from open_webui.utils.provider_registry import PURPOSE_CHAT, default_base_urls, public_templates
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -270,12 +270,16 @@ async def seed_connection_models(
     uses: dict | None = None,
     source: str = 'provider',
     user_id: str | None = None,
+    selections: list | None = None,
 ) -> list[str]:
     """Create whitelist rows for the given upstream model ids.
 
     Only the models the user picked end up in the whitelist; a catalog refresh
     never calls this on its own. The purposes are taken from the candidate
-    pool unless the caller states them.
+    pool, from an explicit selection or from the caller.
+
+    A selection is a traceable declaration: it says which purpose the user
+    picked and where the id came from. It never claims the model works.
     """
     now = int(time.time())
     candidates = {}
@@ -283,6 +287,10 @@ async def seed_connection_models(
     for candidate in snapshot.get('models') or []:
         if isinstance(candidate, dict) and candidate.get('upstream_id'):
             candidates[candidate['upstream_id']] = candidate
+    declared = {}
+    for selection in selections or []:
+        if isinstance(selection, dict) and selection.get('upstream_id'):
+            declared[selection['upstream_id']] = selection
     added = []
     existing = {
         row.upstream_id: row
@@ -299,15 +307,24 @@ async def seed_connection_models(
             added.append(upstream_id)
             continue
         candidate = candidates.get(upstream_id) or {}
-        resolved_uses = uses if uses is not None else (candidate.get('uses') or {})
+        selection = declared.get(upstream_id)
+        has_selection = selection is not None
+        resolved_uses = (selection or {}).get('uses')
+        if resolved_uses is None:
+            resolved_uses = uses if uses is not None else (candidate.get('uses') or {})
         if not resolved_uses:
-            resolved_uses = {'chat': 'openai-chat'}
+            # The legacy path: a client that only sends model ids means the
+            # chat service. A new selection without purposes stays unclassified
+            # instead of silently becoming a chat model.
+            resolved_uses = {} if has_selection else {'chat': 'openai-chat'}
+        resolved_source = (selection or {}).get('source') or source
         db.add(
             ProviderModel(
                 id=str(uuid.uuid4()),
                 connection_id=connection.id,
                 upstream_id=upstream_id,
-                display_name=(display_names or {}).get(upstream_id)
+                display_name=(selection or {}).get('display_name')
+                or (display_names or {}).get(upstream_id)
                 or candidate.get('name')
                 or upstream_id,
                 uses=dict(resolved_uses),
@@ -315,7 +332,7 @@ async def seed_connection_models(
                 features=[],
                 model_info={},
                 enabled=True,
-                source=source,
+                source=resolved_source,
                 verification={},
                 sort_order=order,
                 created_at=now,
@@ -392,6 +409,129 @@ async def set_connection_model_uses(
     return True
 
 
+def configured_purposes(connection: ProviderConnection) -> set[str] | None:
+    """Return the purposes the user explicitly configured for a connection.
+
+    `None` means the connection predates the service configuration: every
+    purpose keeps its legacy behaviour, including the OpenAI-compatible media
+    paths and the chat base URL.
+    """
+    services = (connection.config or {}).get('services')
+    if not isinstance(services, dict) or not services:
+        return None
+    return {
+        purpose
+        for purpose, block in services.items()
+        if not (isinstance(block, dict) and block.get('enabled') is False)
+    }
+
+
+def service_enabled(connection: ProviderConnection, purpose: str) -> bool:
+    """Whether a purpose is switched on for this connection."""
+    configured = configured_purposes(connection)
+    if configured is None:
+        return True
+    return purpose in configured
+
+
+def resolved_services(connection: ProviderConnection) -> dict:
+    """Return the effective service configuration of one connection.
+
+    The frontend renders this; it must not keep a second opinion about what a
+    template can do. The endpoint is the URL the server would really call,
+    without any credential in it.
+    """
+    from open_webui.utils.provider_capabilities import service_declaration
+    from open_webui.utils.provider_media import MEDIA_PURPOSES, resolve_service, service_config
+    from open_webui.utils.provider_registry import ADAPTER_OPERATIONS
+
+    result = {}
+    for purpose in (PURPOSE_CHAT, *MEDIA_PURPOSES):
+        declaration = service_declaration(connection, purpose)
+        config = service_config(connection, purpose)
+        effective_adapter = config.get('adapter') or (declaration.get('adapters') or [None])[0]
+        entry = {
+            'supported': bool(declaration.get('supported')),
+            'unsupported_reason': declaration.get('unsupported_reason'),
+            'adapters': declaration.get('adapters') or [],
+            'adapter': effective_adapter,
+            # The operations of the adapter this connection really uses. The
+            # template may declare several adapters; only the effective one
+            # decides what a call can do.
+            'operations': sorted(ADAPTER_OPERATIONS.get(effective_adapter, ()) or ()),
+            'enabled': bool(config.get('enabled', True)) and service_enabled(connection, purpose),
+            'discovery': declaration.get('discovery'),
+            'model_requirement': declaration.get('model_requirement'),
+            'limits': declaration.get('limits') or {},
+            'options': declaration.get('options') or {},
+            'preset_models': declaration.get('preset_models') or [],
+            'notes': declaration.get('notes'),
+            'endpoint': None,
+            'endpoint_kind': None,
+            'configured': False,
+        }
+        if purpose == PURPOSE_CHAT:
+            try:
+                entry['endpoint'] = provider_base_url(connection) or None
+                entry['endpoint_kind'] = 'base_url'
+                entry['configured'] = bool(entry['endpoint'])
+            except HTTPException as exc:
+                entry['configuration_error'] = exc.detail
+        elif entry['supported']:
+            try:
+                service = resolve_service(connection, purpose)
+                entry['endpoint'] = service.endpoint
+                entry['endpoint_kind'] = service.endpoint_kind
+                entry['configured'] = True
+            except HTTPException as exc:
+                entry['configuration_error'] = exc.detail
+        else:
+            entry['configuration'] = 'unsupported'
+        result[purpose] = entry
+    return result
+
+
+def service_statuses(connection: ProviderConnection, user_id=None, snapshot=None) -> dict:
+    """Return the four status layers of every service of a connection.
+
+    The layers never replace each other: a valid configuration is not a
+    working model, a working model list is not a passed test and a passed
+    test is not a free probe.
+    """
+    from open_webui.utils.provider_media import MEDIA_PURPOSES
+
+    resolved = resolved_services(connection)
+    catalog = catalog_status(connection, user_id, snapshot)
+    statuses = {}
+    for purpose, entry in resolved.items():
+        if not entry['supported']:
+            statuses[purpose] = {
+                'configuration': 'unsupported',
+                'catalog': 'not_applicable',
+                'probe': 'not_available',
+            }
+            continue
+        configuration = 'invalid' if entry.get('configuration_error') else (
+            'valid' if entry.get('configured') else 'missing'
+        )
+        if purpose == PURPOSE_CHAT:
+            catalog_state = 'failed' if catalog.get('error') else (
+                'ok' if catalog.get('updated_at') else 'unknown'
+            )
+        else:
+            catalog_state = (
+                'not_applicable'
+                if entry.get('discovery') != 'remote'
+                else ('failed' if catalog.get('error') else 'unknown')
+            )
+        statuses[purpose] = {
+            'configuration': configuration,
+            'catalog': catalog_state,
+            'probe': 'not_available',
+        }
+    return statuses
+
+
 async def public_connection(connection: ProviderConnection, db: AsyncSession | None = None) -> dict:
     config = dict(connection.config or {})
     config = {key: value for key, value in config.items() if not key.startswith('_')}
@@ -412,6 +552,8 @@ async def public_connection(connection: ProviderConnection, db: AsyncSession | N
         'status': connection.status,
         'models': await connection_models(connection, db),
         'catalog': catalog_status(connection, snapshot=snapshot),
+        'resolved_services': resolved_services(connection),
+        'service_statuses': service_statuses(connection, connection.owner_id, snapshot),
         'configured': bool(connection.credential)
         or (connection.auth_type == 'oauth' and connection.status != 'disconnected'),
         'created_at': connection.created_at,
@@ -1582,14 +1724,19 @@ async def get_media_api_connection(
 
 
 @asynccontextmanager
-async def media_http_session(connection: ProviderConnection | None = None):
-    """Keep user-configured media endpoints behind the provider DNS guard."""
+async def media_http_session(connection: ProviderConnection | None = None, *, target_url: str | None = None):
+    """Keep user-configured media endpoints behind the provider DNS guard.
+
+    The private-address decision follows the URL that is actually called. A
+    connection may serve its chat traffic from one host and its media traffic
+    from another, and the guard must judge the real destination.
+    """
     if connection is None:
         from open_webui.utils.session_pool import get_session
 
         yield await get_session()
         return
-    allow_private = validate_app_url(provider_base_url(connection))
+    allow_private = validate_app_url(target_url or provider_base_url(connection))
     async with aiohttp.ClientSession(
         connector=ProviderTCPConnector(
             allow_private=allow_private, allowed_networks=allowed_ip_networks()
