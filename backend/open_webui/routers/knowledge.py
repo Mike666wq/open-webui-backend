@@ -2276,14 +2276,17 @@ async def batch_create_knowledge_directories(
             seen_paths.add(normalized)
             requested_paths.append(normalized)
 
-    # Every level of every requested tree, shallowest first.
+    # Every level of every requested tree, shallowest first. Deduplicate on
+    # a fresh set — seen_paths already holds the requested paths, and the
+    # leaves among them must still be created and returned.
     required_paths: list[str] = []
+    seen_levels: set[str] = set()
     for path in requested_paths:
         segments = path.split('/')
         for depth in range(1, len(segments) + 1):
             level_path = '/'.join(segments[:depth])
-            if level_path not in seen_paths:
-                seen_paths.add(level_path)
+            if level_path not in seen_levels:
+                seen_levels.add(level_path)
                 required_paths.append(level_path)
     required_paths.sort(key=lambda p: (p.count('/'), p))
 

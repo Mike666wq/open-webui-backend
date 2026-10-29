@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi import FastAPI
+from open_webui.constants import ERROR_MESSAGES
 from sqlalchemy import delete
 
 from open_webui.internal.db import get_async_db_context
@@ -196,7 +197,7 @@ class KnowledgeImportTests(unittest.IsolatedAsyncioTestCase):
                 f'/api/v1/knowledge/{kb.id}/file/add', json={'file_id': file.id}
             )
         self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()['detail'], 'FILE_NOT_PROCESSED')
+        self.assertEqual(response.json()['detail'], ERROR_MESSAGES.FILE_NOT_PROCESSED)
         vectorize.assert_not_awaited()
         self.assertFalse(await Knowledges.has_file(kb.id, file.id))
 
