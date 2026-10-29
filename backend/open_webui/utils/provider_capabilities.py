@@ -17,6 +17,52 @@ ADAPTERS = {
     'image': {'openai-image', 'siliconflow-image', 'minimax-image'},
 }
 DEFAULT_ADAPTER = {key: sorted(value)[0] for key, value in ADAPTERS.items()}
+MODEL_CAPABILITY_KEYS = frozenset({'vision', 'file_upload', 'web_search', 'file_context'})
+
+
+def validate_model_capabilities(value: dict) -> dict[str, bool | None]:
+    """Validate per-key updates; null deletes one explicit declaration."""
+    if not isinstance(value, dict) or any(
+        key not in MODEL_CAPABILITY_KEYS or (enabled is not None and type(enabled) is not bool)
+        for key, enabled in value.items()
+    ):
+        raise HTTPException(400, 'Model capabilities must contain supported boolean or null flags')
+    return dict(value)
+
+
+def update_model_capability_declarations(model_info: dict, updates: dict | None) -> dict:
+    """Preserve other model metadata while applying per-key declarations."""
+    result = dict(model_info) if isinstance(model_info, dict) else {}
+    if updates is None:
+        result.pop('capabilities', None)
+        return result
+    declarations = result.get('capabilities')
+    declarations = dict(declarations) if isinstance(declarations, dict) else {}
+    for key, value in validate_model_capabilities(updates).items():
+        if value is None:
+            declarations.pop(key, None)
+        else:
+            declarations[key] = value
+    if declarations:
+        result['capabilities'] = declarations
+    else:
+        result.pop('capabilities', None)
+    return result
+
+
+def resolve_model_capabilities(connection, model_row, vendor_record) -> dict[str, bool]:
+    """Resolve explicit declarations before vendor evidence, leaving unknown keys absent."""
+    info = model_row.get('model_info') if isinstance(model_row, dict) else getattr(model_row, 'model_info', None)
+    explicit = info.get('capabilities') if isinstance(info, dict) else None
+    result = {'web_search': True}  # Platform search, independent of provider-hosted search.
+    for record in (vendor_record, model_row):
+        tags = record.get('capabilities') if isinstance(record, dict) else getattr(record, 'capabilities', None)
+        if isinstance(tags, list) and any(tag in ('VU', 'Visual Understanding') for tag in tags):
+            result['vision'] = True
+            break
+    if isinstance(explicit, dict):
+        result.update({key: value for key, value in explicit.items() if key in MODEL_CAPABILITY_KEYS and type(value) is bool})
+    return result
 
 # The single place where an adapter's relative path is registered. An adapter
 # appends its own path exactly once to a base URL; a complete endpoint is used

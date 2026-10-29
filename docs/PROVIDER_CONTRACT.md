@@ -250,6 +250,33 @@ PUT /connections/{id}/models/{upstream_id}
 { "display_name": "...", "uses": { "chat": "openai-chat" }, "enabled": true }
 ```
 
+P-005 S1 扩展此 PUT 请求：可选 `capabilities` 为对象或 `null`。对象仅允许
+`vision`、`file_upload`、`web_search`、`file_context` 四个键，值为 JSON 布尔值或
+`null`；未知键、非对象和其他值拒绝（400）。省略表示不修改；顶层 `null`
+清除全部显式声明；对象按键更新，`true` / `false` 设置显式声明，单键 `null`
+删除该键声明（恢复供应商默认或未知），其他已声明键保留；`{}` 不改动。
+`false` 不能当作未声明。
+声明写在 `provider_model.model_info.capabilities`，原 `provider_model.capabilities` 保持
+供应商能力标签的 list 语义，不迁移、不新增列。保留 `model_info` 的其他键。
+写权限（裁决 A）：`capabilities` 声明沿用连接管理权限，即
+`_connection_with_manage_access` 的现有语义——shared 连接仅管理员可写（403），
+private 连接仅 owner 可写（其他用户 404）；不新增管理员查看或管理他人
+私有连接的能力。
+
+模型返回的 `model_info.capabilities` 是显式声明；`info.meta.capabilities` 是最终判定，
+逐字段按「显式 bool > 供应商目录元数据 > 未知（字段缺失）」解析。
+`vision` 的供应商证据是目录 `capabilities` 含 `VU` / `Visual Understanding`，
+也兼容旧模型自身保存的同类标签；仅当目录快照 `fingerprint` 与当前连接
+`catalog_fingerprint` 一致时采用目录标签，端点或凭据变化后的旧快照不作为能力证据；
+目录没有视觉标签不能推断为 `false`。
+`file_upload`、`file_context` 缺供应商证据时保持缺失；平台自身的 `web_search`
+保持现有默认 `true`（与供应商原生搜索功能无关），可由显式 bool 覆盖。
+`GET /api/models` 中服务商模型的 `info.meta.capabilities` 与单模型解析使用同一函数，
+两者不能把未知视觉值填为 `false`。旧模型 alias 的 `info.meta.capabilities.vision`
+也采用同一个服务商视觉判定（未知时移除该键），但保留 workspace 保存的其他能力、
+元数据与原有模型访问检查；普通 workspace 模型能力默认值不变。
+聊天的 OpenAI `image_url` 内容在服务商出站请求中原样透传，不做格式转换。
+
 ```
 DELETE /connections/{id}/models/{upstream_id}
 ```

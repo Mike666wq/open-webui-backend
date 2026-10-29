@@ -108,8 +108,8 @@ class ProviderConnectionTests(unittest.IsolatedAsyncioTestCase):
                     resolved = await providers.resolve_model(model_id, self.owner, db)
                 for model in (listing[0], resolved.model_metadata):
                     self.assertTrue(model['info']['meta']['capabilities']['web_search'])
-                    self.assertFalse(model['info']['meta']['capabilities']['vision'])
-                    self.assertFalse(model['info']['meta']['capabilities']['file_upload'])
+                    self.assertNotIn('vision', model['info']['meta']['capabilities'])
+                    self.assertNotIn('file_upload', model['info']['meta']['capabilities'])
                     self.assertEqual(model['features'], features)
 
     async def test_disabled_provider_model_is_hidden_and_rejected_without_discovery(self):
