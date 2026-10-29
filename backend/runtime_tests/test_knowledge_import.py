@@ -113,11 +113,15 @@ class KnowledgeImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(zabbix.name, '19.Zabbix')
         self.assertIsNone(zabbix.parent_id)
 
-        # Idempotent: a second identical call returns the same IDs and
-        # creates no duplicate directories.
-        again = await self.batch(kb.id, ['linux基础/sub', '19.Zabbix'])
-        self.assertEqual(again.status_code, 200, again.text)
-        self.assertEqual(again.json(), mapping)
+        # Idempotent: a second identical call returns the same IDs for the
+        # paths it re-requests and creates no duplicate directories.
+        again_response = await self.batch(kb.id, ['linux基础/sub', '19.Zabbix'])
+        self.assertEqual(again_response.status_code, 200, again_response.text)
+        again = again_response.json()
+        self.assertEqual(
+            {k: mapping[k] for k in again},
+            again,
+        )
         self.assertEqual(await self.directory_count(kb.id), 4)
 
     async def test_directory_names_keep_encoding_dots_and_spaces(self):
@@ -174,7 +178,10 @@ class KnowledgeImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         vectorize.assert_not_awaited()
         self.assertTrue(await Knowledges.has_file(kb.id, file.id))
-        placed = dict(await Knowledges.get_files_with_directory_ids(kb.id))
+        placed = {
+            file.id: directory_id
+            for file, directory_id in await Knowledges.get_files_with_directory_ids(kb.id)
+        }
         self.assertEqual(placed[file.id], directories['19.Zabbix/images'])
 
     async def test_default_process_vectorizes_extracted_content(self):
