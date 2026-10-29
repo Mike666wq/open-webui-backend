@@ -214,7 +214,7 @@ class ProviderModelCapabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         # Ruling A: administrators may write a shared connection's declarations.
         row = await write(shared, SimpleNamespace(id='root', role='admin'))
-        self.assertEqual(row.model_info['capabilities'], {'vision': False})
+        self.assertEqual(row.model_info['capabilities'], {'vision': False, 'web_search': False})
         self.assertEqual(row.model_info['description'], 'kept')
         # A non-admin can never manage a shared connection, even their own row.
         with self.assertRaises(HTTPException) as caught:
@@ -222,7 +222,7 @@ class ProviderModelCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.status_code, 403)
         # The owner of a private connection may write their own declarations.
         row = await write(self.connection, self.user)
-        self.assertEqual(row.model_info['capabilities'], {'vision': False})
+        self.assertEqual(row.model_info['capabilities'], {'vision': False, 'web_search': False})
         # Any other user is denied on a private connection.
         with self.assertRaises(HTTPException) as caught:
             await write(self.connection, SimpleNamespace(id='intruder', role='user'))
