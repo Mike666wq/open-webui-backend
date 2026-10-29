@@ -35,6 +35,7 @@ from open_webui.utils.provider_capabilities import (
     normalize_model,
     normalize_whitelist_model,
     provider_family,
+    resolve_model_capabilities,
 )
 from open_webui.utils.provider_errors import (
     ACTION_CHECK_PERMISSIONS,
@@ -1230,6 +1231,18 @@ async def disabled_provider_model_ids(db: AsyncSession) -> set[str]:
     return set(await db.scalars(select(Model.id).where(Model.is_active.is_(False), Model.id.startswith('provider:'))))
 
 
+def _vendor_models_by_id(connection, snapshot: dict) -> dict[str, dict]:
+    """Use catalog evidence only while it belongs to this connection configuration."""
+    if not isinstance(snapshot, dict) or snapshot.get('fingerprint') != catalog_fingerprint(connection):
+        return {}
+    models = snapshot.get('models')
+    return {
+        model['upstream_id']: model
+        for model in models or []
+        if isinstance(model, dict) and isinstance(model.get('upstream_id'), str)
+    }
+
+
 async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
     connections = (await db.scalars(select(ProviderConnection).where(ProviderConnection.is_active.is_(True)))).all()
     disabled_ids = await disabled_provider_model_ids(db)
@@ -1240,6 +1253,7 @@ async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
         if await can_access_connection(connection, user, db):
             try:
                 snapshot = await catalog_snapshot(connection, user.id, db)
+                vendor_models = _vendor_models_by_id(connection, snapshot)
                 result.extend(
                     {
                         **model,
@@ -1252,15 +1266,9 @@ async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
                         'catalog': catalog_status(connection, user.id, snapshot),
                         'info': {
                             'meta': {
-                                'capabilities': {
-                                    'vision': bool(
-                                        {'VU', 'Visual Understanding'} & set(model.get('capabilities') or [])
-                                    ),
-                                    'file_upload': False,
-                                    # This gates Open WebUI's search UI/tools,
-                                    # not the provider's hosted search feature.
-                                    'web_search': True,
-                                }
+                                'capabilities': resolve_model_capabilities(
+                                    connection, model, vendor_models.get(model['upstream_id'])
+                                )
                             }
                         },
                     }
@@ -1288,6 +1296,17 @@ async def _list_visible_models(user, db: AsyncSession) -> list[dict]:
                 if saved and not saved.is_active:
                     continue
                 info = saved.model_dump() if saved else item.get('info', {})
+                if saved:
+                    # Keep workspace metadata and access grants, but a legacy alias
+                    # uses the same provider vision declaration as its stable ID.
+                    info['meta'] = dict(info.get('meta') or {})
+                    capabilities = dict(info['meta'].get('capabilities') or {})
+                    provider_capabilities = item['info']['meta']['capabilities']
+                    if 'vision' in provider_capabilities:
+                        capabilities['vision'] = provider_capabilities['vision']
+                    else:
+                        capabilities.pop('vision', None)
+                    info['meta']['capabilities'] = capabilities
                 aliases.append({**item, 'id': alias, 'provider_model_id': item['id'], 'info': info})
         else:
             aliases.append(item)
@@ -1345,6 +1364,8 @@ async def _resolve_model(model_id: str, user, db: AsyncSession, allow_disabled=F
         raise HTTPException(404, 'Provider model not found')
     if not await legacy_model_access(connection, upstream_id, user, db):
         raise HTTPException(404, 'Provider model not found')
+    snapshot = await catalog_snapshot(connection, user.id, db)
+    vendor_record = _vendor_models_by_id(connection, snapshot).get(upstream_id)
     metadata = {
         **metadata,
         'object': 'model',
@@ -1354,11 +1375,7 @@ async def _resolve_model(model_id: str, user, db: AsyncSession, allow_disabled=F
         'connection_name': connection.name,
         'info': {
             'meta': {
-                'capabilities': {
-                    'vision': bool({'VU', 'Visual Understanding'} & set(metadata.get('capabilities') or [])),
-                    'file_upload': False,
-                    'web_search': True,
-                }
+                'capabilities': resolve_model_capabilities(connection, metadata, vendor_record)
             }
         },
     }

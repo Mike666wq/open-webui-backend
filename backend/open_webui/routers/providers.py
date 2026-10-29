@@ -4,7 +4,7 @@ import re
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -836,6 +836,10 @@ class ModelUpdate(BaseModel):
     display_name: str | None = Field(default=None, max_length=256)
     uses: dict[str, str] | None = None
     enabled: bool | None = None
+    # Left untyped so invalid shapes reach validate_model_capabilities and fail
+    # with 400 instead of a Pydantic 422, and so a top-level `null` (clear all
+    # declarations) is distinguishable from an omitted field via model_fields_set.
+    capabilities: Any = None
 
 
 @router.put('/connections/{connection_id}/models/{upstream_id}')
@@ -864,6 +868,13 @@ async def update_connection_model(
     ).first()
     if row is None:
         raise HTTPException(404, 'Model not found')
+    if 'capabilities' in form.model_fields_set:
+        # Three-state semantics: an explicit bool sets one declaration, a single
+        # key `null` deletes it, and a top-level `null` clears every declaration.
+        # Other model_info keys and the vendor capability labels are untouched.
+        from open_webui.utils.provider_capabilities import update_model_capability_declarations
+
+        row.model_info = update_model_capability_declarations(row.model_info, form.capabilities)
     if form.display_name is not None:
         row.display_name = form.display_name
     if form.uses is not None:
