@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import time
 import uuid
 import zipfile
 from typing import List, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -1401,6 +1402,10 @@ async def get_knowledge_files_by_id(
 class KnowledgeFileIdForm(BaseModel):
     file_id: str
     directory_id: Optional[str] = None
+    # When false the file is attached to the knowledge base (and directory) without
+    # being vectorized — used e.g. for image attachments that must stay searchable-
+    # by-path but never enter the retrieval index. Default true keeps legacy behavior.
+    process: bool = True
 
 
 @router.post('/{id}/file/add', response_model=KnowledgeFilesResponse | None)
@@ -1444,7 +1449,9 @@ async def add_file_to_knowledge_by_id(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
-    if not file.data:
+    # The extracted-content gate only guards vectorization; attach-only
+    # placement (process=false) never reads the extracted text.
+    if form_data.process and not file.data:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=ERROR_MESSAGES.FILE_NOT_PROCESSED,
@@ -1458,14 +1465,15 @@ async def add_file_to_knowledge_by_id(
                 detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
             )
 
-    # Add content to the vector database
     try:
-        await process_file(
-            request,
-            ProcessFileForm(file_id=form_data.file_id, collection_name=id),
-            user=user,
-            db=db,
-        )
+        # Add content to the vector database (skipped for attach-only placement)
+        if form_data.process:
+            await process_file(
+                request,
+                ProcessFileForm(file_id=form_data.file_id, collection_name=id),
+                user=user,
+                db=db,
+            )
 
         # Add file to knowledge base
         await Knowledges.add_file_to_knowledge_by_id(
@@ -2148,6 +2156,189 @@ async def _verify_knowledge_write_access(id: str, user, db: AsyncSession):
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
     return knowledge
+
+
+############################
+# BatchCreateKnowledgeDirectories
+############################
+
+
+# A single path segment that names a Windows drive (e.g. "C:" or "c:/").
+WINDOWS_DRIVE_SEGMENT_RE = re.compile(r'^[A-Za-z]:')
+
+
+def _normalize_directory_path(raw: str) -> str:
+    """Normalize one caller-supplied directory path for get-or-create.
+
+    Security rules (see docs/markdown-import.md):
+    - Percent-decoding happens BEFORE any '..' handling, so `%2e%2e` cannot
+      smuggle a traversal past validation, and `%2f` decodes into a real
+      separator (`a%2Fb` == `a/b`) — path boundaries are established after
+      decoding, never before.
+    - '..' segments, absolute paths, backslash separators, drive-letter
+      segments and NUL bytes are all rejected outright — no folding, no
+      clamping to root.
+    - Empty and '.' segments collapse; everything else (unicode, numeric
+      prefixes, dots like `19.Zabbix`) is preserved verbatim, no slugification.
+    """
+    if not isinstance(raw, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Directory path must be a string.',
+        )
+
+    decoded = unquote(raw)
+    if '\x00' in decoded:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Directory path contains a NUL byte.',
+        )
+
+    if decoded.startswith('/') or decoded.startswith('\\'):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Absolute directory paths are not allowed.',
+        )
+
+    parts: list[str] = []
+    for segment in decoded.replace('\\', '/').split('/'):
+        if segment in ('', '.'):
+            continue
+        if segment == '..':
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Directory path must not contain '..' segments.",
+            )
+        if WINDOWS_DRIVE_SEGMENT_RE.match(segment):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail='Drive-letter paths are not allowed.',
+            )
+        parts.append(segment)
+
+    if not parts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail='Directory path must not be empty.',
+        )
+    return '/'.join(parts)
+
+
+async def _index_directory_paths(
+    knowledge_id: str, db: AsyncSession
+) -> dict[str, KnowledgeDirectoryModel]:
+    """Map every existing directory's normalized path to its model in one query."""
+    directories = await Knowledges.get_all_directories(knowledge_id, db=db)
+    by_id = {directory.id: directory for directory in directories}
+    indexed: dict[str, KnowledgeDirectoryModel] = {}
+    for directory in directories:
+        segments = [directory.name]
+        parent_id = directory.parent_id
+        seen = set()
+        while parent_id and parent_id not in seen and parent_id in by_id:
+            seen.add(parent_id)
+            parent = by_id[parent_id]
+            segments.insert(0, parent.name)
+            parent_id = parent.parent_id
+        indexed['/'.join(segments)] = directory
+    return indexed
+
+
+class KnowledgeDirectoryBatchForm(BaseModel):
+    directories: List[str] = []
+
+
+@router.post('/{id}/directory/batch', response_model=dict[str, str])
+async def batch_create_knowledge_directories(
+    request: Request,
+    id: str,
+    form_data: KnowledgeDirectoryBatchForm,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """
+    Get-or-create a batch of directory trees from slash-joined paths.
+
+    Returns a mapping of every normalized path (including intermediate
+    levels) to its directory ID. Idempotent: existing same-name directories
+    at the same level are reused, never duplicated — enforced by the
+    (knowledge_id, parent_id, name) unique constraint.
+    """
+    await _verify_knowledge_write_access(id, user, db)
+
+    # Normalize and validate every path BEFORE any write so a single bad
+    # entry cannot leave partial directories behind.
+    requested_paths: list[str] = []
+    seen_paths: set[str] = set()
+    for raw in form_data.directories:
+        normalized = _normalize_directory_path(raw)
+        if normalized not in seen_paths:
+            seen_paths.add(normalized)
+            requested_paths.append(normalized)
+
+    # Every level of every requested tree, shallowest first.
+    required_paths: list[str] = []
+    for path in requested_paths:
+        segments = path.split('/')
+        for depth in range(1, len(segments) + 1):
+            level_path = '/'.join(segments[:depth])
+            if level_path not in seen_paths:
+                seen_paths.add(level_path)
+                required_paths.append(level_path)
+    required_paths.sort(key=lambda p: (p.count('/'), p))
+
+    indexed = await _index_directory_paths(id, db)
+    result: dict[str, str] = {path: directory.id for path, directory in indexed.items()}
+
+    created: list[KnowledgeDirectoryModel] = []
+    for path in required_paths:
+        if path in result:
+            continue
+        parent_path, _, name = path.rpartition('/')
+        parent_id = result.get(parent_path) if parent_path else None
+        directory = await Knowledges.create_directory(
+            knowledge_id=id,
+            name=name,
+            user_id=user.id,
+            parent_id=parent_id,
+            db=db,
+        )
+        if directory is None:
+            # The unique constraint rejected the insert — either a concurrent
+            # writer created it or the parent resolution went stale. Re-index
+            # once and retry this level from fresh state.
+            indexed = await _index_directory_paths(id, db)
+            result = {path: directory.id for path, directory in indexed.items()}
+            directory = indexed.get(path)
+            if directory is None:
+                parent_id = result.get(parent_path) if parent_path else None
+                directory = await Knowledges.create_directory(
+                    knowledge_id=id,
+                    name=name,
+                    user_id=user.id,
+                    parent_id=parent_id,
+                    db=db,
+                )
+            if directory is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f'Failed to create directory {path}.',
+                )
+        result[path] = directory.id
+        created.append(directory)
+
+    for directory in created:
+        await publish_event(
+            request,
+            EVENTS.KNOWLEDGE_DIRECTORY_CREATED,
+            actor=user,
+            subject_id=directory.id,
+            data={'knowledge_id': id, 'name': directory.name, 'parent_id': directory.parent_id},
+        )
+
+    # The response maps every level; callers reading only their requested
+    # paths find exactly those keys too.
+    return {path: result[path] for path in required_paths}
 
 
 @router.post('/{id}/dirs/create', response_model=KnowledgeDirectoryModel)
