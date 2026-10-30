@@ -2843,7 +2843,7 @@ class ChatTable:
         # Only link files the caller can read; blocks forging a chat_file row to another user's file.
         from open_webui.models.files import Files
         from open_webui.models.users import Users
-        from open_webui.utils.access_control.files import has_access_to_file
+        from open_webui.utils.access_control.files import can_access_file_row
 
         user = await Users.get_user_by_id(user_id, db=db)
         accessible_file_ids = []
@@ -2851,11 +2851,7 @@ class ChatTable:
             file = await Files.get_file_by_id(file_id, db=db)
             if not file:
                 continue
-            if (
-                file.user_id == user_id
-                or (user and user.role == 'admin')
-                or (user and await has_access_to_file(file_id, 'read', user, db=db))
-            ):
+            if user and await can_access_file_row(file, user, 'read', db=db):
                 accessible_file_ids.append(file_id)
         file_ids = accessible_file_ids
         if not file_ids:

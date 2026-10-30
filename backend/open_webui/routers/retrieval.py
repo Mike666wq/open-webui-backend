@@ -123,8 +123,9 @@ from open_webui.retrieval.web.ydc import search_youcom
 from open_webui.retrieval.web.linkup import search_linkup
 from open_webui.storage.provider import Storage
 from open_webui.utils.access_control import has_permission
-from open_webui.utils.access_control.files import has_access_to_file
+from open_webui.utils.access_control.files import can_access_file_row
 from open_webui.utils.auth import get_admin_user, get_verified_user
+from open_webui.utils.knowledge_import_lifecycle import validate_managed_file
 from open_webui.utils.misc import (
     calculate_sha256_string,
     sanitize_text_for_db,
@@ -1582,11 +1583,19 @@ async def process_file(
     """
     config = await Config.get_many(*RETRIEVAL_CONFIG_KEYS.values())
     file = await Files.get_file_by_id(form_data.file_id, db=db)
-    if file and file.user_id != user.id and user.role != 'admin':
-        if not await has_access_to_file(file.id, 'write', user, db=db):
-            file = None
+    if file and not await can_access_file_row(file, user, 'write', db=db):
+        file = None
 
     if file:
+        managed = validate_managed_file(file)
+        if managed and form_data.collection_name not in (
+            managed['knowledge_id'],
+            f'file-{file.id}',
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail='knowledge_import_scope_mismatch',
+            )
         try:
             collection_name = form_data.collection_name
             file_collection_name = f'file-{file.id}'
@@ -1763,13 +1772,17 @@ async def process_file(
                     if result:
                         # Fresh session for the final update.
                         async with get_async_db() as session:
-                            await Files.update_file_metadata_by_id(
-                                file.id,
-                                {
-                                    'collection_name': collection_name,
-                                },
-                                db=session,
-                            )
+                            # Import lease metadata is concurrently fenced by the
+                            # importer. A stale whole-meta merge could resurrect a
+                            # recovered lease, so never update it from retrieval.
+                            if not (file.meta or {}).get('knowledge_import_lifecycle'):
+                                await Files.update_file_metadata_by_id(
+                                    file.id,
+                                    {
+                                        'collection_name': collection_name,
+                                    },
+                                    db=session,
+                                )
 
                             await Files.update_file_data_by_id(
                                 file.id,
@@ -2891,7 +2904,7 @@ async def delete_entries_from_collection(
     try:
         if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=form_data.collection_name):
             file = await Files.get_file_by_id(form_data.file_id, db=db)
-            if not file:
+            if not file or not await can_access_file_row(file, user, 'write', db=db):
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=ERROR_MESSAGES.NOT_FOUND,
@@ -3010,7 +3023,6 @@ async def process_files_batch(
 
     for file in form_data.files:
         try:
-            # Ownership check: verify the requesting user owns the file or is an admin
             db_file = await Files.get_file_by_id(file.id, db=db)
             if not db_file:
                 file_errors.append(
@@ -3021,17 +3033,35 @@ async def process_files_batch(
                     )
                 )
                 continue
-            if db_file.user_id != user.id and user.role != 'admin':
+            if not await can_access_file_row(db_file, user, 'write', db=db):
                 file_errors.append(
                     BatchProcessFilesResult(
                         file_id=file.id,
                         status='failed',
-                        error='Permission denied: not file owner',
+                        error='Permission denied',
                     )
                 )
                 continue
 
-            text_content = file.data.get('content', '')
+            managed = validate_managed_file(db_file)
+            if managed and collection_name not in (
+                managed['knowledge_id'],
+                f'file-{db_file.id}',
+            ):
+                file_errors.append(
+                    BatchProcessFilesResult(
+                        file_id=file.id,
+                        status='failed',
+                        error='knowledge_import_scope_mismatch',
+                    )
+                )
+                continue
+
+            # Legacy batch callers carry the document body in the request. A v2
+            # import must instead use the body persisted by the server; otherwise
+            # file ownership plus target KB write access could inject new content.
+            source = db_file if managed else file
+            text_content = (source.data or {}).get('content', '')
             hash = calculate_sha256_string(text_content)
             if hash in seen_hashes or await run_in_threadpool(has_duplicate_content, collection_name, hash, file.id):
                 raise ValueError(ERROR_MESSAGES.DUPLICATE_CONTENT)
@@ -3041,11 +3071,11 @@ async def process_files_batch(
                 Document(
                     page_content=text_content.replace('<br/>', '\n'),
                     metadata={
-                        **filter_file_metadata(file.meta),
-                        'name': file.filename,
-                        'created_by': file.user_id,
-                        'file_id': file.id,
-                        'source': file.filename,
+                        **filter_file_metadata(source.meta),
+                        'name': source.filename,
+                        'created_by': source.user_id,
+                        'file_id': source.id,
+                        'source': source.filename,
                         'hash': hash,
                     },
                 )

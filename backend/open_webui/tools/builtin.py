@@ -111,17 +111,15 @@ async def _has_read_access_to_file(
     """Check if a user can read a file via ownership, admin role, model attachment, or access grants."""
     user_id = user.get('id')
     user_role = user.get('role', 'user')
-    if file.user_id == user_id or user_role == 'admin':
+    from open_webui.utils.access_control.files import can_access_file_row, check_knowledge_import_access
+    if await can_access_file_row(file, UserModel(**user), 'read'):
         return True
+    v2_verdict = await check_knowledge_import_access(file, UserModel(**user), 'read')
+    if v2_verdict is not None:
+        return v2_verdict
     if model_knowledge and any(item.get('type') == 'file' and item.get('id') == file.id for item in model_knowledge):
         return True
-    from open_webui.utils.access_control.files import has_access_to_file
-
-    return await has_access_to_file(
-        file_id=file.id,
-        access_type='read',
-        user=UserModel(**user),
-    )
+    return False
 
 
 # =============================================================================
@@ -2267,7 +2265,11 @@ async def search_knowledge_files(
                 query_lower = query.lower() if query else ''
                 for file_id in attached_file_ids:
                     file = await Files.get_file_by_id(file_id)
-                    if file and (not query_lower or query_lower in file.filename.lower()):
+                    if (
+                        file
+                        and await _has_read_access_to_file(file, __user__, __model_knowledge__)
+                        and (not query_lower or query_lower in file.filename.lower())
+                    ):
                         all_files.append(
                             {
                                 'id': file.id,
@@ -2692,7 +2694,7 @@ async def grep_knowledge_files(
                 item_id = item.get('id')
                 if item_type == 'file' and item_id not in seen_ids:
                     file = await Files.get_file_by_id(item_id)
-                    if file:
+                    if file and await _has_read_access_to_file(file, __user__, __model_knowledge__):
                         files_to_search.append(file)
                         seen_ids.add(item_id)
                 elif item_type == 'collection':
@@ -2715,7 +2717,7 @@ async def grep_knowledge_files(
                     kb_files = await Knowledges.get_files_by_id(item_id)
                     if kb_files:
                         for f in kb_files:
-                            if f.id not in seen_ids:
+                            if f.id not in seen_ids and await _has_read_access_to_file(f, __user__, __model_knowledge__):
                                 files_to_search.append(f)
                                 seen_ids.add(f.id)
         else:
@@ -2740,7 +2742,7 @@ async def grep_knowledge_files(
                 for fid in file_ids:
                     if fid not in seen_ids:
                         file = await Files.get_file_by_id(fid)
-                        if file:
+                        if file and await _has_read_access_to_file(file, __user__, __model_knowledge__):
                             files_to_search.append(file)
                             seen_ids.add(fid)
 
@@ -2921,6 +2923,8 @@ async def view_knowledge_file(
 
         file = await Files.get_file_by_id(file_id)
         if not file:
+            return JSONCodec.dumps({'error': 'File not found'})
+        if not await _has_read_access_to_file(file, __user__):
             return JSONCodec.dumps({'error': 'File not found'})
 
         # Check access via any KB containing this file
@@ -3114,7 +3118,7 @@ async def list_knowledge(
 
             elif item_type == 'file':
                 file = await Files.get_file_by_id(item_id)
-                if file:
+                if file and await _has_read_access_to_file(file, __user__, __model_knowledge__):
                     files.append(
                         {
                             'id': file.id,
@@ -3247,7 +3251,7 @@ async def query_knowledge_files(
                 elif item_type == 'file':
                     # Individual file - use file-{id} as collection name
                     file = await Files.get_file_by_id(item_id)
-                    if file:
+                    if file and await _has_read_access_to_file(file, __user__, __model_knowledge__):
                         collection_names.append(f'file-{item_id}')
 
                 elif item_type == 'note':

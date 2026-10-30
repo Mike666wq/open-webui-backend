@@ -52,7 +52,12 @@ from open_webui.retrieval.external import retrieve_external_knowledge
 from open_webui.retrieval.vector.factory import get_vector_db_client
 from open_webui.retrieval.vector.main import GetResult, SearchResult
 from open_webui.retrieval.web.utils import get_web_loader
-from open_webui.utils.access_control.files import get_owner_accessible_folder_files, has_access_to_file
+from open_webui.utils.access_control.files import (
+    can_access_file_row,
+    check_knowledge_import_access,
+    get_owner_accessible_folder_files,
+    has_access_to_file,
+)
 from open_webui.utils.access_control.folders import has_folder_access
 from open_webui.utils.headers import get_json_bearer_headers, include_user_info_headers
 from open_webui.utils.misc import get_content_from_message, get_message_list
@@ -1289,10 +1294,11 @@ async def filter_accessible_collections(
 ) -> set[str]:
     """
     Return only the collection names the user is allowed to access.
-    Admins bypass all checks.  For non-admins the policy is:
+    Admins keep their existing policy for non-file collections. The policy for
+    every caller is:
 
       - any name with characters outside [A-Za-z0-9_-] → rejected
-      - file-*          → validated via has_access_to_file
+      - file-*          → validated via has_access_to_file, including admins
       - user-memory-*   → must match user's own memory collection
       - web-search-*    → ephemeral per-query collections, owner-bound to web-search-{user.id}-*
       - knowledge-bases → always denied (system meta-collection)
@@ -1313,20 +1319,19 @@ async def filter_accessible_collections(
             getattr(user, 'id', '<unknown>'),
         )
 
-    if user.role == 'admin':
-        return safe_names
-
     validated = set()
     for name in safe_names:
         # Some vector stores fold case and _/- together, so authorize a name as the collection it can resolve to.
         canonical = name.lower().replace('_', '-')
-        if canonical == 'knowledge-bases':
-            # System meta-collection — never exposed to non-admins.
-            continue
-        elif canonical.startswith('file-'):
+        if canonical.startswith('file-'):
             file_id = canonical[len('file-') :]
             if await has_access_to_file(file_id=file_id, access_type=access_type, user=user):
                 validated.add(name)
+        elif user.role == 'admin':
+            validated.add(name)
+        elif canonical == 'knowledge-bases':
+            # System meta-collection — never exposed to non-admins.
+            continue
         elif canonical.startswith('user-memory-'):
             if canonical == f'user-memory-{user.id}':
                 validated.add(name)
@@ -1387,8 +1392,8 @@ async def get_sources_from_items(
         expanded_folders.add(folder_id)
 
         folder = await Folders.get_folder_by_id(folder_id)
-        if folder and (user.role == 'admin' or await has_folder_access(user.id, folder, 'read', db=None)):
-            files = await get_owner_accessible_folder_files(folder)
+        if folder and await has_folder_access(user.id, folder, 'read', db=None):
+            files = await get_owner_accessible_folder_files(folder, db=None)
             folder_items.update((entry.get('type'), entry.get('id')) for entry in files if isinstance(entry, dict))
             items.extend(files)
 
@@ -1493,65 +1498,46 @@ async def get_sources_from_items(
                     'metadatas': [[{'url': item.get('url'), 'name': item.get('url')}]],
                 }
         elif item.get('type') == 'file':
+            file_id = item.get('id')
+            file_object = await Files.get_file_by_id(file_id) if file_id else None
+            v2_verdict = (
+                await check_knowledge_import_access(file_object, user, 'read')
+                if file_object
+                else False
+            )
+            allowed = bool(
+                file_object
+                and (
+                    v2_verdict
+                    if v2_verdict is not None
+                    else (
+                        BYPASS_RETRIEVAL_ACCESS_CONTROL
+                        or await can_access_file_row(file_object, user, 'read')
+                        or ('file', file_id) in folder_items
+                    )
+                )
+            )
             if item.get('context') == 'full' or bypass_embedding_and_retrieval:
-                if item.get('file', {}).get('data', {}).get('content', ''):
-                    # Manual Full Mode Toggle
-                    # Used from chat file modal, we can assume that the file content will be available from item.get("file").get("data", {}).get("content")
+                if allowed:
                     query_result = {
-                        'documents': [[item.get('file', {}).get('data', {}).get('content', '')]],
+                        'documents': [[(file_object.data or {}).get('content', '')]],
                         'metadatas': [
                             [
                                 {
-                                    'file_id': item.get('id'),
-                                    'name': item.get('name'),
-                                    **item.get('file').get('data', {}).get('metadata', {}),
+                                    'file_id': file_id,
+                                    'name': file_object.filename,
+                                    'source': file_object.filename,
                                 }
                             ]
                         ],
                     }
-                elif item.get('id'):
-                    file_object = await Files.get_file_by_id(item.get('id'))
-                    if file_object and (
-                        user.role == 'admin'
-                        or file_object.user_id == user.id
-                        or await has_access_to_file(item.get('id'), 'read', user)
-                        or ('file', item.get('id')) in folder_items
-                    ):
-                        query_result = {
-                            'documents': [[file_object.data.get('content', '')]],
-                            'metadatas': [
-                                [
-                                    {
-                                        'file_id': item.get('id'),
-                                        'name': file_object.filename,
-                                        'source': file_object.filename,
-                                    }
-                                ]
-                            ],
-                        }
-            else:
-                # Chunked-retrieval fallback — verify read access before
-                # exposing the file's vector collection (same posture as the
-                # full-context branch above).
-                file_id = item.get('id')
-                if file_id:
-                    if BYPASS_RETRIEVAL_ACCESS_CONTROL:
-                        if item.get('legacy'):
-                            collection_names.append(f'{file_id}')
-                        else:
-                            collection_names.append(f'file-{file_id}')
-                    else:
-                        file_object = await Files.get_file_by_id(file_id)
-                        if file_object and (
-                            user.role == 'admin'
-                            or file_object.user_id == user.id
-                            or await has_access_to_file(file_id, 'read', user)
-                            or ('file', file_id) in folder_items
-                        ):
-                            if item.get('legacy'):
-                                collection_names.append(f'{file_id}')
-                            else:
-                                collection_names.append(f'file-{file_id}')
+            elif allowed:
+                # Chunked retrieval must not expose a v2 file's collection
+                # through a folder or bypass option when its source KB denies it.
+                if item.get('legacy'):
+                    collection_names.append(f'{file_id}')
+                else:
+                    collection_names.append(f'file-{file_id}')
 
         elif item.get('type') == 'collection':
             # Manual Full Mode Toggle for Collection

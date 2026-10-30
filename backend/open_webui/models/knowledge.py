@@ -14,6 +14,7 @@ from open_webui.models.files import (
 )
 from open_webui.models.groups import Groups
 from open_webui.models.users import User, UserModel, UserResponse, Users
+from open_webui.utils.knowledge_import_lifecycle import managed_file_visible_in_knowledge
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
     JSON,
@@ -416,37 +417,16 @@ class KnowledgeTable:
                             search_filter = File.filename.ilike(f'%{q}%')
                         stmt = stmt.filter(search_filter)
 
-                # Order by file changes
                 stmt = stmt.order_by(File.updated_at.desc(), File.id.asc())
-
-                # Lightweight count: avoid selecting File.data and ORDER BY
-                count_stmt = (
-                    select(func.count(File.id))
-                    .select_from(File)
-                    .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
-                    .join(Knowledge, KnowledgeFile.knowledge_id == Knowledge.id)
-                )
-                count_stmt = AccessGrants.has_permission_filter(
-                    db=db,
-                    query=count_stmt,
-                    DocumentModel=Knowledge,
-                    filter=filter,
-                    resource_type='knowledge',
-                    permission='read',
-                )
-                if search_filter is not None:
-                    count_stmt = count_stmt.filter(search_filter)
-                count_result = await db.execute(count_stmt)
-                total = count_result.scalar()
-
-                if skip:
-                    stmt = stmt.offset(skip)
-                if limit:
-                    stmt = stmt.limit(limit)
-
                 stmt = stmt.options(defer(File.data))
                 result = await db.execute(stmt)
-                rows = result.all()
+                rows = [
+                    row
+                    for row in result.all()
+                    if managed_file_visible_in_knowledge(row[0], row[2].id)
+                ]
+                total = len(rows)
+                rows = rows[skip : skip + limit] if limit else rows[skip:]
 
                 items = []
                 for file, user, knowledge in rows:
@@ -590,21 +570,17 @@ class KnowledgeTable:
                     elif order_by == 'updated_at':
                         primary_sort = File.updated_at.asc() if is_asc else File.updated_at.desc()
 
-                # Apply sort with secondary key for deterministic pagination
-                stmt = stmt.order_by(primary_sort, File.id.asc())
-
-                # Count BEFORE pagination
-                count_result = await db.execute(select(func.count()).select_from(stmt.subquery()))
-                total = count_result.scalar()
-
-                if skip:
-                    stmt = stmt.offset(skip)
-                if limit:
-                    stmt = stmt.limit(limit)
-
+                # Apply sort with secondary key for deterministic pagination.
                 stmt = stmt.options(defer(File.data))
+                stmt = stmt.order_by(primary_sort, File.id.asc())
                 result = await db.execute(stmt)
-                items = result.all()
+                items = [
+                    row
+                    for row in result.all()
+                    if managed_file_visible_in_knowledge(row[0], knowledge_id)
+                ]
+                total = len(items)
+                items = items[skip : skip + limit] if limit else items[skip:]
 
                 directories = {
                     directory.id: directory for directory in await self.get_all_directories(knowledge_id, db=db)
@@ -667,7 +643,11 @@ class KnowledgeTable:
                     .filter(KnowledgeFile.knowledge_id == knowledge_id)
                 )
                 files = result.scalars().all()
-                return [FileModel.model_validate(file) for file in files]
+                return [
+                    FileModel.model_validate(file)
+                    for file in files
+                    if managed_file_visible_in_knowledge(file, knowledge_id)
+                ]
         except Exception:
             return []
 
@@ -679,19 +659,20 @@ class KnowledgeTable:
         try:
             async with get_async_db_context(db) as db:
                 result = await db.execute(
-                    select(File.id, File.hash, File.meta, File.created_at, File.updated_at)
+                    select(File.id, File.user_id, File.path, File.hash, File.meta, File.created_at, File.updated_at)
                     .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
                     .filter(KnowledgeFile.knowledge_id == knowledge_id)
                 )
                 return [
                     FileMetadataResponse(
                         id=row.id,
-                        hash=row.hash,
-                        meta=row.meta,
-                        created_at=row.created_at,
-                        updated_at=row.updated_at,
+                        hash=row[3],
+                        meta=row[4],
+                        created_at=row[5],
+                        updated_at=row[6],
                     )
                     for row in result.all()
+                    if managed_file_visible_in_knowledge(row, knowledge_id)
                 ]
         except Exception:
             return []
@@ -918,7 +899,11 @@ class KnowledgeTable:
                     .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
                     .filter(KnowledgeFile.knowledge_id == knowledge_id)
                 )
-                return [(FileModel.model_validate(file), dir_id) for file, dir_id in result.all()]
+                return [
+                    (FileModel.model_validate(file), dir_id)
+                    for file, dir_id in result.all()
+                    if managed_file_visible_in_knowledge(file, knowledge_id)
+                ]
         except Exception:
             return []
 

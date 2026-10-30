@@ -23,7 +23,7 @@ from open_webui.models.chats import Chats
 from open_webui.models.files import Files
 from open_webui.retrieval.web.utils import get_ssrf_safe_session, validate_url
 from open_webui.routers.files import upload_file_handler
-from open_webui.utils.access_control.files import has_access_to_file
+from open_webui.utils.access_control.files import can_access_file_row, has_access_to_file
 from open_webui.routers.images import (
     get_image_data,
     upload_image,
@@ -218,7 +218,7 @@ async def get_image_base64_from_file_id(id: str, user=None) -> Optional[str]:
     # Owner, admin, and explicit read-grant holders are allowed.
     if user is None:
         return None
-    if file.user_id != user.id and user.role != 'admin' and not await has_access_to_file(file.id, 'read', user):
+    if not await can_access_file_row(file, user, 'read'):
         return None
 
     try:
