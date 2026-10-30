@@ -10,7 +10,7 @@ import zipfile
 from typing import List, Optional
 from urllib.parse import quote, unquote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, File as FastAPIFile, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from open_webui.config import (
     BYPASS_ADMIN_ACCESS_CONTROL,
@@ -22,7 +22,7 @@ from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.config import Config
-from open_webui.models.files import FileMetadataResponse, FileModel, FileModelResponse, Files
+from open_webui.models.files import File, FileMetadataResponse, FileModel, FileModelResponse, Files
 from open_webui.models.groups import Groups
 from open_webui.models.knowledge import (
     KNOWLEDGE_SORTABLE_FIELDS,
@@ -42,12 +42,14 @@ from open_webui.routers.retrieval import (
     ProcessFileForm,
     process_file,
     process_files_batch,
+    trusted_knowledge_import,
 )
 from open_webui.storage.provider import Storage
 from open_webui.utils.access_control import filter_allowed_access_grants, has_permission
-from open_webui.utils.access_control.files import has_access_to_file
+from open_webui.utils.access_control.files import can_access_file_row, has_access_to_file
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.json_codec import JSONCodec
+from open_webui.utils.knowledge_import_lifecycle import has_managed_marker, validate_managed_file
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1458,12 +1460,17 @@ async def add_file_to_knowledge_by_id(
         )
 
     # KB write-access alone is not enough — caller must also be able to read the file.
-    if file.user_id != user.id and user.role != 'admin':
-        if not await has_access_to_file(file.id, 'read', user, db=db):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-            )
+    if not await can_access_file_row(file, user, 'read', db=db):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+        )
+    managed = validate_managed_file(file)
+    if managed and (managed['knowledge_id'] != id or not await Knowledges.has_file(id, file.id, db=db)):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail='knowledge_import_scope_mismatch',
+        )
 
     try:
         # Add content to the vector database (skipped for attach-only placement)
@@ -1995,12 +2002,22 @@ async def add_files_to_knowledge_batch(
         )
 
     # Per-file read-access check — same gate as the single-file endpoint.
-    if user.role != 'admin':
-        for file in files:
-            if file.user_id != user.id and not await has_access_to_file(file.id, 'read', user, db=db):
+    for file in files:
+        if not await can_access_file_row(file, user, 'read', db=db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+            )
+        if has_managed_marker(file):
+            managed = validate_managed_file(file)
+            if (
+                not managed
+                or managed['knowledge_id'] != id
+                or not await Knowledges.has_file(id, file.id, db=db)
+            ):
                 raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail='knowledge_import_scope_mismatch',
                 )
 
     # Filter out files already linked to this knowledge base to prevent
@@ -2089,6 +2106,8 @@ async def export_knowledge_by_id(id: str, user=Depends(get_admin_user), db: Asyn
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
         for file in files:
+            if not await can_access_file_row(file, user, 'read', db=db):
+                continue
             content = file.data.get('content', '') if file.data else ''
             if content:
                 # Use original filename with .txt extension
@@ -2106,7 +2125,10 @@ async def export_knowledge_by_id(id: str, user=Depends(get_admin_user), db: Asyn
     return StreamingResponse(
         zip_buffer,
         media_type='application/zip',
-        headers={'Content-Disposition': f"attachment; filename*=UTF-8''{quote(zip_filename, safe='')}"},
+        headers={
+            'Cache-Control': 'private, no-store',
+            'Content-Disposition': f"attachment; filename*=UTF-8''{quote(zip_filename, safe='')}",
+        },
     )
 
 
@@ -2481,3 +2503,237 @@ async def move_file_in_knowledge(
         data={'knowledge_id': id, 'directory_id': form_data.directory_id},
     )
     return {'status': True}
+
+############################
+# Version 2 knowledge folder import
+############################
+
+
+@router.post('/{id}/import/file')
+async def import_knowledge_file(
+    request: Request,
+    id: str,
+    file: UploadFile = FastAPIFile(...),
+    directory_id: Optional[str] = Form(None),
+    source_path: str = Form(...),
+    source_hash: str = Form(...),
+    operation_id: str = Form(...),
+    kind: str = Form(...),
+    index_text: Optional[str] = Form(None),
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    from open_webui.models.files import File, FileForm
+    from open_webui.models.knowledge import KnowledgeFile
+    from open_webui.internal.db import get_async_db
+    from open_webui.utils.knowledge_import_lifecycle import (
+        LEASE_SECONDS, META_KEY, file_id_for, recover_expired, renew, validate_managed_file,
+    )
+    from sqlalchemy import update
+
+    def fail(code, stage, message, status_code=400, file_id=None, cleanup_status='not_needed'):
+        detail = {'code': code, 'stage': stage, 'message': message, 'operation_id': operation_id,
+                  'cleanup_status': cleanup_status}
+        if file_id:
+            detail['file_id'] = file_id
+        return HTTPException(status_code=status_code, detail=detail)
+
+    try:
+        await _verify_knowledge_write_access(id, user, db)
+        await _verify_directory_in_knowledge(id, directory_id, db)
+    except HTTPException as exc:
+        raise fail('access_denied', 'authorization', str(exc.detail), exc.status_code)
+    try:
+        if str(uuid.UUID(operation_id)) != operation_id:
+            raise ValueError()
+    except ValueError:
+        raise fail('invalid_operation', 'validation', 'Invalid operation ID', 422)
+    if not re.fullmatch(r'[a-f0-9]{64}', source_hash):
+        raise fail('invalid_hash', 'validation', 'Invalid source hash', 422)
+    try:
+        normalized = _normalize_directory_path(source_path)
+    except HTTPException:
+        raise fail('invalid_path', 'validation', 'Invalid source path', 422)
+    if normalized != source_path or not file.filename or '/' in file.filename or '\\' in file.filename:
+        raise fail('invalid_path', 'validation', 'Invalid source path or filename', 422)
+    extension = file.filename.rsplit('.', 1)[-1].lower() if '.' in file.filename else ''
+    image_exts = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'avif', 'ico', 'tiff', 'tif', 'heic', 'heif'}
+    content_type = (file.content_type or '').lower().split(';', 1)[0]
+    if kind == 'markdown':
+        if extension not in {'md', 'markdown', 'txt'} or content_type not in {'text/markdown', 'text/plain', 'application/octet-stream'}:
+            raise fail('invalid_type', 'validation', 'Expected a Markdown file', 422)
+        if index_text is None or not index_text.strip():
+            raise fail('empty_index_text', 'validation', 'Index text must not be empty', 422)
+    elif kind == 'image':
+        if extension not in image_exts or not (content_type.startswith('image/') or content_type == 'application/octet-stream') or index_text is not None:
+            raise fail('invalid_type', 'validation', 'Expected an image without index text', 422)
+    else:
+        raise fail('invalid_type', 'validation', 'Unsupported import kind', 422)
+    maximum = await Config.get('rag.file.max_size')
+    max_bytes = int(maximum) * 1024 * 1024 if maximum else None
+    contents = await file.read(max_bytes + 1 if max_bytes else -1)
+    if not contents:
+        raise fail('empty_file', 'validation', 'File is empty', 422)
+    if max_bytes and len(contents) > max_bytes:
+        raise fail('file_too_large', 'validation', 'File exceeds the configured size limit', 413)
+
+    file_id = file_id_for(user.id, id, operation_id)
+    identity = {'source_path': source_path, 'source_hash': source_hash, 'kind': kind,
+                'directory_id': directory_id or None, 'filename': file.filename}
+    existing = await Files.get_file_by_id(file_id, db=db)
+    if existing:
+        state = (existing.meta or {}).get(META_KEY) or {}
+        if state.get('identity') != identity or state.get('owner_id') != user.id or state.get('knowledge_id') != id:
+            raise fail('operation_conflict', 'confirmation', 'Operation inputs do not match', 409, file_id)
+        if state.get('state') == 'completed' and await Knowledges.has_file(id, file_id, db=db):
+            return {'file_id': file_id, 'directory_id': directory_id or None, 'source_path': source_path,
+                    'operation_id': operation_id, 'status': 'completed', 'indexed': kind == 'markdown'}
+        raise fail('operation_unconfirmed', 'confirmation', 'Operation is not confirmed; check its status', 409, file_id, 'pending')
+
+    try:
+        target = Storage.prepare_upload(f'{file_id}.{extension}')
+    except Exception:
+        raise fail('provider_unsupported', 'reservation', 'Storage does not support prepared imports', 503)
+    token = str(uuid.uuid4())
+    managed = {'version': 1, 'owner_id': user.id, 'knowledge_id': id, 'operation_id': operation_id,
+               'target': target, 'identity': identity, 'state': 'reserved', 'lease_until': int(time.time()) + LEASE_SECONDS,
+               'lease_token': token, 'generation': 1}
+    meta = {'name': file.filename, 'content_type': content_type, 'size': len(contents), 'file_hash': source_hash,
+            'data': {'markdown_import': {'version': 2, 'source_path': source_path, 'content_hash': source_hash,
+                                        'operation_id': operation_id, 'reference_format': 'file-url'}}, META_KEY: managed}
+    try:
+        reserved = await Files.insert_new_file(user.id, FileForm(id=file_id, filename=file.filename,
+                    path=target['primary_path'], data={'status': 'uploading'}, meta=meta), db=db)
+        if not reserved:
+            await db.rollback()
+            other = await Files.get_file_by_id(file_id, db=db)
+            if other:
+                raise fail('operation_unconfirmed', 'confirmation', 'Operation already exists; check its status', 409, file_id, 'pending')
+            raise fail('reservation_failed', 'reservation', 'Could not reserve import file', 503)
+        async with get_async_db() as confirm_db:
+            confirmed = await Files.get_file_by_id(file_id, db=confirm_db)
+        if not confirmed or (confirmed.meta or {}).get(META_KEY) != managed or confirmed.path != target['primary_path']:
+            raise fail('reservation_unconfirmed', 'reservation', 'Could not confirm import reservation', 503, file_id, 'pending')
+    except HTTPException:
+        raise
+    except Exception:
+        await db.rollback()
+        raise fail('reservation_failed', 'reservation', 'Could not reserve import file', 503)
+
+    stage = 'upload'
+    stop = asyncio.Event()
+
+    async def heartbeat():
+        while True:
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=30)
+                return
+            except asyncio.TimeoutError:
+                if not await renew(file_id, token, 1):
+                    return
+
+    pulse = asyncio.create_task(heartbeat())
+    try:
+        if not await renew(file_id, token, 1, state='uploading'):
+            raise RuntimeError('Import lease lost')
+        _, written_path = await asyncio.to_thread(Storage.upload_prepared, io.BytesIO(contents), target, {})
+        if written_path != target['primary_path'] or not await renew(file_id, token, 1, state='processing'):
+            raise RuntimeError('Upload target mismatch or import lease lost')
+        await _verify_knowledge_write_access(id, user, db)
+        await _verify_directory_in_knowledge(id, directory_id, db)
+        if kind == 'markdown':
+            stage = 'index'
+            with trusted_knowledge_import(
+                file_id=file_id,
+                owner_id=user.id,
+                knowledge_id=id,
+                collection_name=id,
+                lease_token=token,
+                generation=1,
+            ):
+                result = await process_file(
+                    request,
+                    ProcessFileForm(file_id=file_id, content=index_text, collection_name=id),
+                    user=user,
+                    db=db,
+                )
+            if not result or result.get('status') is not True or result.get('collection_name') != id:
+                raise RuntimeError('Indexing was not confirmed')
+        stage = 'attach'
+        # The fenced File update and relation insert commit together. Both the
+        # recovery claimant and this finalizer contend on the same File row.
+        async with get_async_db() as session:
+            await _verify_knowledge_write_access(id, user, session)
+            await _verify_directory_in_knowledge(id, directory_id, session)
+            row = await session.get(File, file_id)
+            current = validate_managed_file(row) if row else None
+            now = int(time.time())
+            if not current or current.get('state') != 'processing':
+                raise RuntimeError('Import lease lost')
+            finished = {**current, 'state': 'completed', 'lease_until': 0}
+            fenced = await session.execute(update(File).where(
+                File.id == file_id, File.meta[META_KEY]['lease_token'].as_string() == token,
+                File.meta[META_KEY]['generation'].as_integer() == 1,
+                File.meta[META_KEY]['state'].as_string() == 'processing',
+                File.meta[META_KEY]['lease_until'].as_integer() >= now,
+            ).values(meta={**row.meta, META_KEY: finished}, data={**(row.data or {}), 'status': 'completed'}, updated_at=now))
+            if fenced.rowcount != 1:
+                raise RuntimeError('Import lease lost')
+            session.add(KnowledgeFile(id=str(uuid.uuid4()), knowledge_id=id, file_id=file_id,
+                                     directory_id=directory_id or None, user_id=user.id, created_at=now, updated_at=now))
+            await session.commit()
+            if not await Knowledges.has_file(id, file_id, db=session):
+                raise RuntimeError('File association not confirmed')
+        return {'file_id': file_id, 'directory_id': directory_id or None, 'source_path': source_path,
+                'operation_id': operation_id, 'status': 'completed', 'indexed': kind == 'markdown'}
+    except Exception as exc:
+        log.warning('Import %s failed at %s: %s', operation_id, stage, exc)
+        async with get_async_db() as session:
+            row = await session.get(File, file_id)
+            current = validate_managed_file(row) if row else None
+            if current and current.get('state') in ('reserved', 'uploading', 'processing'):
+                failed = {**current, 'state': 'failed', 'lease_until': 0}
+                await session.execute(update(File).where(
+                    File.id == file_id, File.meta[META_KEY]['lease_token'].as_string() == token,
+                    File.meta[META_KEY]['generation'].as_integer() == 1,
+                    File.meta[META_KEY]['state'].as_string() == current['state'],
+                ).values(meta={**row.meta, META_KEY: failed}, data={**(row.data or {}), 'status': 'failed'}))
+                await session.commit()
+        try:
+            tasks = await recover_expired()
+            for task_id in tasks:
+                from open_webui.utils.resource_service import run_task
+                await run_task(task_id)
+        except Exception:
+            log.exception('Import cleanup deferred')
+        raise fail('import_failed', stage, 'Import failed; cleanup is pending', 502, file_id, 'pending')
+    finally:
+        stop.set()
+        await pulse
+
+
+@router.get('/{id}/import/operations/{operation_id}')
+async def get_knowledge_import_operation(
+    id: str, operation_id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session),
+):
+    from open_webui.utils.knowledge_import_lifecycle import META_KEY, file_id_for
+    from open_webui.utils.resource_visibility import including_recycled
+
+    try:
+        operation_id = str(uuid.UUID(operation_id))
+    except ValueError:
+        raise HTTPException(404, 'Import operation not found')
+    await _verify_knowledge_write_access(id, user, db)
+    file_id = file_id_for(user.id, id, operation_id)
+    with including_recycled():
+        file = await Files.get_file_by_id(file_id, db=db)
+        managed = (file.meta or {}).get(META_KEY) if file else None
+        if not managed or managed.get('owner_id') != user.id or managed.get('knowledge_id') != id:
+            raise HTTPException(404, 'Import operation not found')
+        identity = managed.get('identity') or {}
+        state = managed.get('state')
+        linked = state == 'completed' and await Knowledges.has_file(id, file_id, db=db)
+        return {'file_id': file_id, 'directory_id': identity.get('directory_id'),
+                'source_path': identity.get('source_path'), 'operation_id': operation_id,
+                'status': 'completed' if linked else 'unconfirmed',
+                'indexed': bool(linked and identity.get('kind') == 'markdown')}

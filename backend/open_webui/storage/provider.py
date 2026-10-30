@@ -1,4 +1,5 @@
 import logging
+import hashlib
 import os
 import re
 import shutil
@@ -42,7 +43,44 @@ if not USE_SLIM:
 log = logging.getLogger(__name__)
 
 
+def _prepared_target(provider: str, name: str, primary_path: str, **identity) -> dict:
+    """Create a JSON-serializable target without touching local or remote storage."""
+    if not name or name in ('.', '..') or os.path.basename(name) != name or not re.fullmatch(r'[A-Za-z0-9._-]{1,100}', name):
+        raise ValueError('Invalid prepared storage name')
+    return {
+        'version': 1, 'provider': provider, 'storage_name': name,
+        'primary_path': primary_path, 'local_path': os.path.join(UPLOAD_DIR, name), **identity,
+    }
+
+
+def _check_prepared(actual: dict, expected: dict) -> None:
+    # Includes the configured endpoint/bucket identity: never redirect deletion
+    # to a newly configured provider with a coincidentally identical name.
+    if not isinstance(actual, dict) or actual != expected:
+        raise ValueError('Prepared upload target does not match current storage configuration')
+
+
+def _endpoint_identity(endpoint: str | None) -> str:
+    return hashlib.sha256((endpoint or '').encode()).hexdigest()
+
+
+def _remove_prepared_cache(target: dict) -> None:
+    try:
+        os.remove(target['local_path'])
+    except FileNotFoundError:
+        pass
+
+
 class StorageProvider(ABC):
+    def prepare_upload(self, storage_name: str) -> dict:
+        raise NotImplementedError('Prepared uploads are not supported by this provider')
+
+    def upload_prepared(self, file: BinaryIO, target: dict, tags: Dict[str, str]) -> Tuple[bytes, str]:
+        raise NotImplementedError('Prepared uploads are not supported by this provider')
+
+    def delete_prepared(self, target: dict) -> None:
+        raise NotImplementedError('Prepared uploads are not supported by this provider')
+
     @abstractmethod
     def get_file(self, file_path: str) -> str:
         pass
@@ -61,6 +99,20 @@ class StorageProvider(ABC):
 
 
 class LocalStorageProvider(StorageProvider):
+    def prepare_upload(self, storage_name: str) -> dict:
+        return _prepared_target('local', storage_name, os.path.join(UPLOAD_DIR, storage_name))
+
+    def upload_prepared(self, file: BinaryIO, target: dict, tags: Dict[str, str]) -> Tuple[bytes, str]:
+        _check_prepared(target, self.prepare_upload(target['storage_name']))
+        contents, path = self.upload_file(file, target['storage_name'], tags)
+        if path != target['primary_path']:
+            raise RuntimeError('Prepared upload returned a different target')
+        return contents, path
+
+    def delete_prepared(self, target: dict) -> None:
+        _check_prepared(target, self.prepare_upload(target['storage_name']))
+        _remove_prepared_cache(target)
+
     @staticmethod
     def upload_file(file: BinaryIO, filename: str, tags: Dict[str, str]) -> Tuple[bytes, str]:
         contents = file.read()
@@ -137,6 +189,23 @@ class S3StorageProvider(StorageProvider):
 
         self.bucket_name = S3_BUCKET_NAME
         self.key_prefix = S3_KEY_PREFIX if S3_KEY_PREFIX else ''
+
+    def prepare_upload(self, storage_name: str) -> dict:
+        key = os.path.join(self.key_prefix, storage_name)
+        return _prepared_target('s3', storage_name, f's3://{self.bucket_name}/{key}',
+                                bucket=self.bucket_name, key=key, endpoint_identity=_endpoint_identity(S3_ENDPOINT_URL))
+
+    def upload_prepared(self, file: BinaryIO, target: dict, tags: Dict[str, str]) -> Tuple[bytes, str]:
+        _check_prepared(target, self.prepare_upload(target['storage_name']))
+        contents, path = self.upload_file(file, target['storage_name'], tags)
+        if path != target['primary_path']:
+            raise RuntimeError('Prepared upload returned a different target')
+        return contents, path
+
+    def delete_prepared(self, target: dict) -> None:
+        _check_prepared(target, self.prepare_upload(target['storage_name']))
+        self.s3_client.delete_object(Bucket=target['bucket'], Key=target['key'])
+        _remove_prepared_cache(target)
 
     @staticmethod
     def sanitize_tag_value(s: str) -> str:
@@ -227,6 +296,24 @@ class GCSStorageProvider(StorageProvider):
             self.gcs_client = storage.Client()
         self.bucket = self.gcs_client.bucket(GCS_BUCKET_NAME)
 
+    def prepare_upload(self, storage_name: str) -> dict:
+        return _prepared_target('gcs', storage_name, f'gs://{self.bucket_name}/{storage_name}', bucket=self.bucket_name)
+
+    def upload_prepared(self, file: BinaryIO, target: dict, tags: Dict[str, str]) -> Tuple[bytes, str]:
+        _check_prepared(target, self.prepare_upload(target['storage_name']))
+        contents, path = self.upload_file(file, target['storage_name'], tags)
+        if path != target['primary_path']:
+            raise RuntimeError('Prepared upload returned a different target')
+        return contents, path
+
+    def delete_prepared(self, target: dict) -> None:
+        _check_prepared(target, self.prepare_upload(target['storage_name']))
+        try:
+            self.bucket.blob(target['storage_name']).delete()
+        except NotFound:
+            pass
+        _remove_prepared_cache(target)
+
     def upload_file(self, file: BinaryIO, filename: str, tags: Dict[str, str]) -> Tuple[bytes, str]:
         """Handles uploading of the file to GCS storage."""
         contents, file_path = LocalStorageProvider.upload_file(file, filename, tags)
@@ -290,6 +377,29 @@ class AzureStorageProvider(StorageProvider):
             # If the key is not configured, then the DefaultAzureCredential will be used to support Managed Identity authentication
             self.blob_service_client = BlobServiceClient(account_url=self.endpoint, credential=DefaultAzureCredential())
         self.container_client = self.blob_service_client.get_container_client(self.container_name)
+
+    def prepare_upload(self, storage_name: str) -> dict:
+        from urllib.parse import urlsplit
+        endpoint = urlsplit(self.endpoint)
+        if endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
+            raise ValueError('Prepared Azure endpoint must not contain credentials')
+        return _prepared_target('azure', storage_name, f'{self.endpoint}/{self.container_name}/{storage_name}',
+                                container=self.container_name, endpoint_identity=_endpoint_identity(self.endpoint))
+
+    def upload_prepared(self, file: BinaryIO, target: dict, tags: Dict[str, str]) -> Tuple[bytes, str]:
+        _check_prepared(target, self.prepare_upload(target['storage_name']))
+        contents, path = self.upload_file(file, target['storage_name'], tags)
+        if path != target['primary_path']:
+            raise RuntimeError('Prepared upload returned a different target')
+        return contents, path
+
+    def delete_prepared(self, target: dict) -> None:
+        _check_prepared(target, self.prepare_upload(target['storage_name']))
+        try:
+            self.container_client.get_blob_client(target['storage_name']).delete_blob()
+        except ResourceNotFoundError:
+            pass
+        _remove_prepared_cache(target)
 
     def upload_file(self, file: BinaryIO, filename: str, tags: Dict[str, str]) -> Tuple[bytes, str]:
         """Handles uploading of the file to Azure Blob Storage."""

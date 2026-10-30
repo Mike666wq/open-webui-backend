@@ -412,6 +412,8 @@ async def _get_accessible_files(
     """Get all files the user can access, with KB metadata and directory_id (no path computation)."""
     from open_webui.models.files import Files
     from open_webui.models.knowledge import Knowledges
+    from open_webui.models.users import UserModel
+    from open_webui.utils.access_control.files import can_access_file_row
 
     kb_ids = await _get_accessible_kb_ids(user, model_knowledge, knowledge_id)
     files = []
@@ -440,7 +442,7 @@ async def _get_accessible_files(
                 attached_file_ids.add(item.get('id'))
         for fid in attached_file_ids:
             f = await Files.get_file_by_id(fid)
-            if f:
+            if f and await can_access_file_row(f, UserModel(**user), 'read'):
                 files.append(
                     {
                         'id': f.id,

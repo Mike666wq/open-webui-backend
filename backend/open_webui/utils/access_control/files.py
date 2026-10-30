@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 
 from open_webui.models.access_grants import AccessGrants
 from open_webui.models.channels import Channels
@@ -7,14 +8,85 @@ from open_webui.models.files import Files
 from open_webui.models.folders import FolderModel
 from open_webui.models.groups import Groups
 from open_webui.models.knowledge import Knowledges
+from open_webui.models.knowledge import KnowledgeFile
 from open_webui.models.models import Models
 from open_webui.models.notes import Notes
+from open_webui.models.resources import ResourceEntry
 from open_webui.models.users import UserModel, Users
+from open_webui.utils.knowledge_import_lifecycle import has_managed_marker, validate_managed_file
+from open_webui.utils.resource_visibility import BLOCKED
+from open_webui.internal.db import get_async_db_context
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
 
 FOLDER_FILE_TYPES = {'file', 'collection', 'note'}
+
+
+async def check_knowledge_import_access(
+    file: Any, user: UserModel, access_type: str, db: AsyncSession | None = None
+) -> bool | None:
+    """Return the final v2 verdict, or None for ordinary files.
+
+    v2 imports belong to their source knowledge base, not to the uploader.
+    Unknown or malformed managed metadata fails closed.
+    """
+    if file is None:
+        return False
+    if not has_managed_marker(file):
+        return None
+    valid = validate_managed_file(file)
+    if not valid:
+        return False
+    if valid.get('state') != 'completed':
+        return False
+    knowledge = await Knowledges.get_knowledge_by_id(valid['knowledge_id'], db=db)
+    if not knowledge:
+        return False
+    async with get_async_db_context(db) as session:
+        association = (await session.execute(
+            select(KnowledgeFile.id).where(
+                KnowledgeFile.knowledge_id == valid['knowledge_id'],
+                KnowledgeFile.file_id == file.id,
+            )
+        )).scalar_one_or_none()
+        hidden = (await session.execute(
+            select(ResourceEntry.id).where(
+                ResourceEntry.state.in_(BLOCKED),
+                (
+                    ((ResourceEntry.type == 'knowledge') & (ResourceEntry.resource_id == valid['knowledge_id']))
+                    | ((ResourceEntry.type == 'file') & (ResourceEntry.resource_id == file.id))
+                ),
+            ).limit(1)
+        )).scalar_one_or_none()
+    if not association:
+        return False
+    if hidden:
+        return False
+    if user.role == 'admin':
+        return True
+    if knowledge.user_id == user.id:
+        return True
+    user_group_ids = {g.id for g in await Groups.get_groups_by_member_id(user.id, db=db, include_inherited=True)}
+    allowed = await AccessGrants.has_access(
+        user_id=user.id,
+        resource_type='knowledge',
+        resource_id=knowledge.id,
+        permission='write',
+        user_group_ids=user_group_ids,
+        db=db,
+    )
+    if allowed or access_type != 'read':
+        return allowed
+    return await AccessGrants.has_access(
+        user_id=user.id,
+        resource_type='knowledge',
+        resource_id=knowledge.id,
+        permission='read',
+        user_group_ids=user_group_ids,
+        db=db,
+    )
 
 
 async def has_access_to_file(
@@ -40,6 +112,10 @@ async def has_access_to_file(
     if not file:
         return False
 
+    v2_verdict = await check_knowledge_import_access(file, user, access_type, db=db)
+    if v2_verdict is not None:
+        return v2_verdict
+
     # Direct ownership
     if file.user_id == user.id:
         return True
@@ -54,6 +130,13 @@ async def has_access_to_file(
             group.id for group in await Groups.get_groups_by_member_id(user.id, db=db, include_inherited=True)
         }
     for knowledge_base in knowledge_bases:
+        if user.role == 'admin':
+            # Admin access to knowledge files follows knowledge endpoints, not raw file ownership.
+            if await Knowledges.check_access_by_user_id(
+                knowledge_base.id, user.id, access_type, db=db, user_group_ids=user_group_ids
+            ):
+                return True
+            continue
         if (
             knowledge_base.user_id == user.id
             or await AccessGrants.has_access(
@@ -122,6 +205,29 @@ async def has_access_to_file(
     )
 
 
+async def can_access_file_row(
+    file: Any,
+    user: UserModel,
+    access_type: str,
+    db: AsyncSession | None = None,
+) -> bool:
+    """Authoritative row-level gate for callers that already hold the File row.
+
+    v2 imports are decided solely by their source knowledge base; ordinary
+    files keep the existing owner/admin/shared semantics.
+    """
+    if file is None:
+        return False
+    v2_verdict = await check_knowledge_import_access(file, user, access_type, db=db)
+    if v2_verdict is not None:
+        return v2_verdict
+    return bool(
+        file.user_id == user.id
+        or user.role == 'admin'
+        or await has_access_to_file(file.id, access_type, user, db=db)
+    )
+
+
 async def get_accessible_folder_files(
     entries: list[dict] | None,
     user: UserModel,
@@ -140,9 +246,6 @@ async def get_accessible_folder_files(
         for entry in entries
         if isinstance(entry, dict) and entry.get('type') in FOLDER_FILE_TYPES and entry.get('id')
     ]
-    if user.role == 'admin':
-        return entries
-
     if user_group_ids is None:
         user_group_ids = {
             group.id for group in await Groups.get_groups_by_member_id(user.id, db=db, include_inherited=True)

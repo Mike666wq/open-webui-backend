@@ -1,53 +1,41 @@
-# Markdown folder import (P-006, S4)
+# Markdown folder import (P-006 r5 contract)
 
-The markdown import lets the client push a local folder of notes (`.md` files plus their referenced images) into an existing knowledge base. This stage ships the backend groundwork: batch directory get-or-create, attach-only file placement for images, and the documented conflict/idempotency rules the frontend importer must follow. The import UI itself lands in a later stage.
+This contract applies to the version 2 knowledge-base folder importer. Existing notes import, generic uploads, and knowledge file APIs retain their previous behavior. Upgrade does not repair or re-import existing knowledge files.
 
-## Batch directory creation
+## Content and access
 
-`POST /api/v1/knowledge/{id}/directory/batch` with body `{"directories": ["19.Zabbix", "linux基础/sub"]}` (knowledge-base **write** permission required, same as `dirs/create`). Every path is get-or-created level by level, shallowest first. The response maps each **normalized** path — including intermediate levels that were not requested explicitly — to its directory ID:
+The stored original Markdown retains its text and Markdown image syntax. Only confirmed local images are rewritten to same-origin `/api/v1/files/{file_id}/content` references; external references remain unchanged and are not fetched. Images are attached to their target knowledge directory without vectorization. The separately generated index text preserves prose and replaces image syntax with a short marker or alt text, excluding image URLs, data URIs and long asset paths. Existing indexed-text APIs and edits operate on index text only; original-file preview uses the protected file-content API. Version 2 metadata under `file.meta.data.markdown_import` identifies version, source relative path, source-byte SHA-256, operation UUID and `reference_format: file-url`. Old documents are not guessed or automatically repaired.
 
-```json
-{ "19.Zabbix": "<id>", "linux基础": "<id>", "linux基础/sub": "<id>" }
-```
+## Write and recovery protocol
 
-The endpoint is idempotent: same-name directories at the same level are reused, never duplicated (enforced by the `(knowledge_id, parent_id, name)` unique constraint). A concurrent writer that wins the insert race is handled by re-indexing and retrying once. All paths are validated **before any write**, so one bad entry never leaves partial directories behind. `KNOWLEDGE_DIRECTORY_CREATED` events are published only for directories actually created.
+Before uploading, the client invokes `POST /api/v1/knowledge/{id}/directory/batch`, including an empty `directories` array for root-only imports, to preflight write permission. Each `POST /api/v1/knowledge/{id}/import/file` multipart request repeats authorization and target-directory validation before persistence and carries `file`, nullable `directory_id`, normalized `source_path`, source-byte `source_hash`, stable UUID `operation_id`, `kind` (`markdown` or `image`) and, for Markdown only, non-blank `index_text`. Existing generic upload and `file/add` remain unchanged; an unavailable import endpoint requires upgrading the backend.
 
-## Path normalization and security
+The server validates type, size, paths and access, obtains a side-effect-free, versioned provider target, then commits and reads back a managed File reservation before any storage I/O. That record owns the immutable target, operation identity, status, lease token, lease expiry and generation. Provider prepare, upload-prepared and delete-prepared operations preserve existing provider APIs; prepared deletion occurs only at the existing lifecycle purge stage and treats missing objects idempotently while retaining retryable errors. Never persist credentials in a target or expose its internal location to the client.
 
-Directory paths are slash-joined strings; segments are stored verbatim — unicode, numeric prefixes (`19.Zabbix`), spaces and dots are preserved, never slugified. Rules, applied by `_normalize_directory_path`:
+The operation identity converges to one File for a given owner, knowledge and operation UUID. Mismatched input returns 409. An uncertain response is reconciled against persisted operation state; it is not automatically replayed. A new explicit retry of a failed operation uses a fresh UUID and target. A live lease and token guard completion; expired or failed imports are recovered through a narrow scan and existing preview → task → recycle → seven-day retention → purge workflow, independent of the general temporary-upload setting. Successful or referenced files are protected. Cleanup status identifies recycle versus purge: a file in the recycle bin is not physically deleted yet.
 
-- Percent-decoding happens **first**: `%E7%AC%94%E8%AE%B0` → `笔记`, `x%20y` → `x y`, and `%2F` decodes into a real separator (`a%2Fb` == `a/b`). Path boundaries are established after decoding, never before.
-- Because decoding precedes validation, `%2e%2e` cannot smuggle a traversal: any `..` segment, absolute path (`/abs`, and after decoding `%2fetc` → `/etc`), backslash separator, Windows drive-letter segment (`C:/x`) or NUL byte is rejected with `400` — no folding, no clamping to root.
-- Empty and `.` segments collapse; `linux基础//sub/.` == `linux基础/sub`. A path that normalizes to nothing (`""`, `"."`) is rejected.
-- Decoding is single-pass: `%252e%252e` becomes the literal directory name `%2e%2e`. Directory names live in the database, not on a filesystem, so this is safe.
+Successful responses provide `file_id`, `directory_id`, `source_path`, `operation_id`, `status: completed` and `indexed` (false for images). Structured FastAPI `detail` errors contain `code`, `stage`, `message`, `operation_id`, optional `file_id` and `cleanup_status`, with optional cleanup task and phase. Missing/blank Markdown index text is rejected before storage with `422 empty_index_text`. Authorization, validation, reservation, upload, attach, index, confirmation, recovery and cleanup failures remain distinguishable.
 
-Same-name rule: `19.Zabbix.md` (file) and `19.Zabbix/` (directory) are independent first-class objects — files and directories never share a namespace constraint.
+## Ordering, conflicts and reports
 
-## Image handling: attach-only placement
+Resolve paths and conflicts first, process images before dependent Markdown regardless of selection order, and only reference images confirmed attached in the target directory. Skip-existing images must still enter the reference map. De-duplication is confined to the same account, knowledge base, target directory, filename, size and source hash; different directories require separate file records. Do not silently fall back to root when a directory mapping is missing. The default conflict strategy is skip; copy chooses a unique destination; overwrite keeps the old item until its replacement is confirmed and reports cleanup failures.
 
-`POST /api/v1/knowledge/{id}/file/add` accepts an optional `process` flag (default `true`, fully backward compatible). With `process: false` the file is attached to the knowledge base and its directory **without vectorization**: the extracted-content gate (`FILE_NOT_PROCESSED`) does not apply, and `process_file` is never invoked, so images never enter the retrieval index. Authorization is unchanged — knowledge write access plus file read access are still enforced.
+Reports distinguish completed, completed with errors, failed and cancelled, including unconfirmed requests. Each selected item has one final classification, and failures show relative path, stage, reason and cleanup state; pending and invalid paths remain visible. The most recent bounded report is isolated by account and knowledge base and contains no tokens, file content, binary data or absolute source paths; unavailable local storage is reported to the user.
 
-The importer uploads each image with `process=false`, then calls `file/add` with the `directory_id` from the batch-directory response. Images stay searchable by path through the knowledge tree but are excluded from RAG. When a note is vectorized, image references inside its content are replaced with `[图片 <文件名>]` placeholders; external `http(s)` image links are kept verbatim and never downloaded.
+## Existing data and verification
 
-## Reference forms in note content
+Upgrading never changes existing imported files. Existing placeholder text cannot reconstruct missing original Markdown, image alt text, position or context. If the user later chooses recovery using source files, preview and back up the existing content first, explicitly choose overwrite or copy, and independently verify images and retrieval. Never infer that a filename match reconstructs the original.
 
-Notes may reference files three ways, and the importer preserves each:
+Automated tests and CI do not establish real-cloud, production, isolated real-sample, accessibility or Android-device acceptance. Each requires separate evidence.
 
-1. **Note-attached files**: `data://<fileId>` URLs pointing at the note's own attachments (uploaded with `process=false` when they are images).
-2. **Knowledge-base files**: the file's knowledge-base access URL, used when the file already lives in the target knowledge base.
-3. **External links**: `http(s)` URLs are preserved as-is.
+## Version 2 source knowledge access (P-006 r4)
 
-## Idempotency and conflict strategy
+A server-registered v2 import is bound to its immutable source knowledge base. Public reads require a completed and visible file, an active source knowledge base, the original association, and current read permission on that source; uploader ownership and other shared containers do not override this check. Admin access follows the r4 active-resource exception. Writes require current source knowledge write permission. Invalid or incomplete bindings fail closed; ordinary uploads and legacy files retain their existing rules. Cross-knowledge attachment or indexing of a v2 file is rejected with 409 `knowledge_import_scope_mismatch`. Internal recovery is separately fenced and cannot be invoked through a client-controlled bypass. Protected responses use private, no-store caching. Operation confirmation is limited to the uploader with current source write access and exposes no content or storage target.
 
-- **Knowledge-base side**: the idempotency key is `(normalized directory path, filename)`. Re-importing the same folder into the same knowledge base reuses existing directories and updates existing files instead of creating duplicates.
-- **Note side**: notes carry `meta.markdown_import.content_hash` (plus the source title). A note whose hash matches the on-disk content is skipped entirely.
-- **Conflict strategy** when content changed: `skip` (default — keep the knowledge-base copy untouched), `overwrite` (call `POST /{id}/file/update`, which deletes the file's vectors from the knowledge collection and re-processes the new content), or `create copy` (import as a new file). The importer surfaces this choice; the backend already supports all three.
+## Trusted indexing and shared-chat filtering (P-006 r5)
 
-## Known limitations
+During a v2 Markdown import, the import route may let `process_file` index the still-`processing` reservation before the knowledge association exists. This exception is a server-created context containing the file, owner, immutable source knowledge, collection, lease token and generation. `process_file` re-reads the committed row and accepts the context only while every proof field matches, the state is `processing`, and the lease is unexpired. The context exits and is restored before the route continues. It is not a request parameter or public bypass; direct callers without the context still receive 404 for an inaccessible or incomplete v2 import.
 
-- `.md` notes are vectorized as plain text (`TextLoader`); Markdown structure is not chunked specially.
-- Image references inside vectorized note content become `[图片 <文件名>]` placeholders; images themselves are never vectorized.
-- External image links are stored verbatim; fetching them requires manual download.
-- Directory names are database records, not filesystem paths: no symlink/case-folding semantics, and double-encoded sequences stay literal.
+Every shared-chat response re-evaluates `files` references against the requester's current source-knowledge read permission before serialization. A ref is removed in full, including its nested `file.data.content` and URL, when it identifies an inaccessible v2 file. Removing a knowledge grant or group membership takes effect on the next response. Ordinary and legacy file references retain their existing shared-chat behavior.
 
-Automated coverage lives in `backend/runtime_tests/test_knowledge_import.py` (CI, `scripts/test_provider_runtime.py`). Import of a real folder, image placement in the UI, and overwrite behavior require manual acceptance after CI.
+The original Markdown preview keeps authenticated image replacements and their temporary data URLs only in memory. Closing the preview, changing items, opening a replacement request, an item load failure, or destroying the component aborts outstanding requests and clears the rendered Markdown and temporary image data; neither data URLs nor raw content are written back to the file, report, or persistent cache.

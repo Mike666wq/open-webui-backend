@@ -123,6 +123,14 @@ async def owned_row(db, user, kind, resource_id, *, global_channel=False, knowle
         # The management page deliberately does not add an administrator
         # backdoor for inspecting another person's private content.
         raise HTTPException(404, 'Resource not found')
+    if kind == 'file':
+        from open_webui.utils.knowledge_import_lifecycle import has_managed_marker, validate_managed_file
+        if has_managed_marker(row):
+            from open_webui.utils.resource_visibility import maintenance
+            trusted = maintenance.get()
+            managed = validate_managed_file(row)
+            if not trusted or not managed or managed['owner_id'] != row.user_id:
+                raise HTTPException(404, 'Resource not found')
     return row
 
 
@@ -202,6 +210,11 @@ async def protections(db, row, kind, options):
         if shared and not options.get('include_shared'):
             reasons.append('shared_confirmation_required')
     if kind == 'file':
+        from open_webui.utils.knowledge_import_lifecycle import has_managed_marker
+        if has_managed_marker(row):
+            from open_webui.utils.resource_visibility import maintenance
+            if maintenance.get():
+                return reasons
         state = (row.data or {}).get('status')
         if state in ('pending', 'processing', 'uploading'):
             reasons.append('active_upload_or_processing')
@@ -308,6 +321,8 @@ async def list_resources(db, user, filters=None, *, all_results=False):
     for kind in kinds:
         cls = models()[kind]
         query = select(cls)
+        if kind == 'file':
+            from open_webui.utils.knowledge_import_lifecycle import validate_managed_file
         if kind == 'channel':
             query = query.where(cls.id.in_(select(ChannelMember.channel_id).where(
                 ChannelMember.user_id == user.id, ChannelMember.left_at.is_(None),
@@ -340,6 +355,13 @@ async def list_resources(db, user, filters=None, *, all_results=False):
                 continue
             if filters.get('min_bytes', 0) > item['size_bytes']:
                 continue
+            if kind == 'file':
+                row = await db.get(cls, rid)
+                from open_webui.utils.knowledge_import_lifecycle import has_managed_marker
+                if has_managed_marker(row):
+                    from open_webui.utils.resource_visibility import maintenance
+                    if not maintenance.get():
+                        continue
             result.append(item)
     sort = filters.get('sort', 'updated_at')
     if sort not in ('title', 'size_bytes', 'updated_at'):
@@ -357,72 +379,84 @@ async def make_preview(db, user, action, items, options, filters=None, *, knowle
         raise HTTPException(400, 'Select 1 to 500 resources; narrow your filters for larger selections')
     results = []
     seen = set()
-    with including_recycled():
-        for item in items:
-            identity = (item['type'], item['id'])
-            if identity in seen:
-                continue
-            seen.add(identity)
-            try:
-                kind, rid = identity
-                if action in ('restore', 'purge'):
-                    entry = await db.get(ResourceEntry, rid)
-                    accepted = ('channel', 'channel_clear') if kind == 'channel' else (kind,)
-                    if not entry or entry.user_id != user.id or entry.type not in accepted:
-                        entry = await entry_for(db, 'channel_clear' if kind == 'channel' else kind, rid, user.id)
-                    if not entry:
-                        # Old metadata IDs are aliases, not original IDs.
-                        candidates = (await db.scalars(select(ResourceEntry).where(
-                            ResourceEntry.user_id == user.id, ResourceEntry.type == kind,
-                            ResourceEntry.state == 'legacy',
-                        ))).all()
-                        entry = next((e for e in candidates if rid in e.data.get('legacy_ids', [])), None)
-                    if not entry:
-                        raise HTTPException(404, 'Recycle item not found')
-                    if entry.state == 'legacy':
-                        raise HTTPException(409, 'legacy_body_unavailable')
-                    rid = entry.resource_id
-                else:
-                    entry = await entry_for(db, 'channel_clear' if kind == 'channel' and not options.get('global_channel') else kind, rid, user.id)
-                row = await owned_row(db, user, kind, rid, global_channel=bool(options.get('global_channel') or (entry and entry.type == 'channel')),
-                                      knowledge_write=knowledge_write or bool(entry and entry.user_id == user.id and entry.data.get('knowledge_write')))
-                reasons = await protections(db, row, kind, options) if action == 'recycle' else []
-                if action == 'restore':
-                    if not entry or entry.state not in ('recycled', 'paused') or entry.expires_at <= now():
-                        reasons.append('not_restorable_or_expired')
-                    elif kind == 'share' and entry.data.get('restored_private'):
-                        reasons.append('share_requires_republish')
-                if action == 'purge' and (not entry or entry.state not in ('recycled', 'purging', 'paused')):
-                    reasons.append('not_in_recycle_bin')
-                if action == 'recycle' and kind != 'channel' and entry and entry.state in ('recycled', 'purging', 'paused'):
-                    reasons.append('already_recycled')
-                item_result = {**describe(row, kind, entry), 'reasons': reasons, 'allowed': not reasons}
-                item_result['version'], attachments = await impact_version(db, row, kind, entry, user.id)
-                if attachments:
-                    item_result['recycled_files'] = sum(not f['reasons'] for f in attachments)
-                    item_result['retained_files'] = sum(bool(f['reasons']) for f in attachments)
-                    item_result['attachment_bytes'] = sum(f['size_bytes'] for f in attachments if not f['reasons'])
-                if kind == 'file':
-                    refs = await references(db, rid)
-                    item_result['retained_references'] = len(refs)
-                if kind == 'chat':
-                    item_result['pauses_share'] = bool(row.share_id)
-                if kind == 'channel':
-                    item_result['effect'] = 'recycle_channel_for_all' if options.get('global_channel') or (entry and entry.type == 'channel') else 'clear_only_for_me'
-                    item_result['scope'] = 'global' if item_result['effect'] == 'recycle_channel_for_all' else 'personal'
-                item_result['knowledge_write'] = knowledge_write or bool(entry and entry.user_id == user.id and entry.data.get('knowledge_write'))
-                if entry:
-                    item_result['entry_id'] = entry.id
-                results.append(item_result)
-            except HTTPException as exc:
-                results.append({**item, 'allowed': False, 'reasons': [str(exc.detail)]})
-        task = ResourceTask(
-            id=uid(), user_id=user.id, key=uid(), action=action, state='preview',
-            created_at=now(), updated_at=now(), lease_until=0, attempts=0, results=[],
-            payload={'items': results, 'options': options, 'expires_at': now() + 600, 'knowledge_write': knowledge_write},
-        )
-        db.add(task)
-        await db.commit()
+    from open_webui.utils.resource_visibility import maintenance as outer_maintenance
+    trusted_recovery = outer_maintenance.get()
+    outer_token = outer_maintenance.set(False)
+    try:
+        with including_recycled():
+            for item in items:
+                identity = (item['type'], item['id'])
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                try:
+                    kind, rid = identity
+                    if action in ('restore', 'purge'):
+                        entry = await db.get(ResourceEntry, rid)
+                        accepted = ('channel', 'channel_clear') if kind == 'channel' else (kind,)
+                        if not entry or entry.user_id != user.id or entry.type not in accepted:
+                            entry = await entry_for(db, 'channel_clear' if kind == 'channel' else kind, rid, user.id)
+                        if not entry:
+                            # Old metadata IDs are aliases, not original IDs.
+                            candidates = (await db.scalars(select(ResourceEntry).where(
+                                ResourceEntry.user_id == user.id, ResourceEntry.type == kind,
+                                ResourceEntry.state == 'legacy',
+                            ))).all()
+                            entry = next((e for e in candidates if rid in e.data.get('legacy_ids', [])), None)
+                        if not entry:
+                            raise HTTPException(404, 'Recycle item not found')
+                        if entry.state == 'legacy':
+                            raise HTTPException(409, 'legacy_body_unavailable')
+                        rid = entry.resource_id
+                    else:
+                        entry = await entry_for(db, 'channel_clear' if kind == 'channel' and not options.get('global_channel') else kind, rid, user.id)
+                    row = await owned_row(db, user, kind, rid, global_channel=bool(options.get('global_channel') or (entry and entry.type == 'channel')),
+                                          knowledge_write=knowledge_write or bool(entry and entry.user_id == user.id and entry.data.get('knowledge_write')))
+                    if kind == 'file':
+                        from open_webui.utils.knowledge_import_lifecycle import has_managed_marker
+
+                        if has_managed_marker(row) and not trusted_recovery:
+                            raise HTTPException(404, 'Resource not found')
+
+                    reasons = await protections(db, row, kind, options) if action == 'recycle' else []
+                    if action == 'restore':
+                        if not entry or entry.state not in ('recycled', 'paused') or entry.expires_at <= now():
+                            reasons.append('not_restorable_or_expired')
+                        elif kind == 'share' and entry.data.get('restored_private'):
+                            reasons.append('share_requires_republish')
+                    if action == 'purge' and (not entry or entry.state not in ('recycled', 'purging', 'paused')):
+                        reasons.append('not_in_recycle_bin')
+                    if action == 'recycle' and kind != 'channel' and entry and entry.state in ('recycled', 'purging', 'paused'):
+                        reasons.append('already_recycled')
+                    item_result = {**describe(row, kind, entry), 'reasons': reasons, 'allowed': not reasons}
+                    item_result['version'], attachments = await impact_version(db, row, kind, entry, user.id)
+                    if attachments:
+                        item_result['recycled_files'] = sum(not f['reasons'] for f in attachments)
+                        item_result['retained_files'] = sum(bool(f['reasons']) for f in attachments)
+                        item_result['attachment_bytes'] = sum(f['size_bytes'] for f in attachments if not f['reasons'])
+                    if kind == 'file':
+                        refs = await references(db, rid)
+                        item_result['retained_references'] = len(refs)
+                    if kind == 'chat':
+                        item_result['pauses_share'] = bool(row.share_id)
+                    if kind == 'channel':
+                        item_result['effect'] = 'recycle_channel_for_all' if options.get('global_channel') or (entry and entry.type == 'channel') else 'clear_only_for_me'
+                        item_result['scope'] = 'global' if item_result['effect'] == 'recycle_channel_for_all' else 'personal'
+                    item_result['knowledge_write'] = knowledge_write or bool(entry and entry.user_id == user.id and entry.data.get('knowledge_write'))
+                    if entry:
+                        item_result['entry_id'] = entry.id
+                    results.append(item_result)
+                except HTTPException as exc:
+                    results.append({**item, 'allowed': False, 'reasons': [str(exc.detail)]})
+            task = ResourceTask(
+                id=uid(), user_id=user.id, key=uid(), action=action, state='preview',
+                created_at=now(), updated_at=now(), lease_until=0, attempts=0, results=[],
+                payload={'items': results, 'options': options, 'expires_at': now() + 600, 'knowledge_write': knowledge_write},
+            )
+            db.add(task)
+            await db.commit()
+    finally:
+        outer_maintenance.reset(outer_token)
     return {'id': task.id, 'expires_at': task.payload['expires_at'], 'items': results,
             'allowed': sum(r['allowed'] for r in results),
             'estimated_bytes': sum(r.get('size_bytes', 0) + r.get('attachment_bytes', 0) for r in results if r['allowed'])}
@@ -614,6 +648,15 @@ async def purge(db, row, kind, entry, checkpoint):
             raise HTTPException(409, 'referenced')
         from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
         from open_webui.storage.provider import Storage
+        from open_webui.utils.knowledge_import_lifecycle import META_KEY, validate_managed_file
+        managed = validate_managed_file(row)
+        if (row.meta or {}).get(META_KEY) and not managed:
+            raise HTTPException(409, 'invalid_import_storage_target')
+        if managed and not steps.get('knowledge_vector'):
+            if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=managed['knowledge_id']):
+                await ASYNC_VECTOR_DB_CLIENT.delete(collection_name=managed['knowledge_id'], filter={'file_id': row.id})
+            steps['knowledge_vector'] = True
+            await checkpoint(steps)
         if not steps.get('vector'):
             # Delete the collection, not a backend-specific delete-with-no-IDs.
             if await ASYNC_VECTOR_DB_CLIENT.has_collection(collection_name=f'file-{row.id}'):
@@ -621,7 +664,9 @@ async def purge(db, row, kind, entry, checkpoint):
             steps['vector'] = True
             await checkpoint(steps)
         if not steps.get('object'):
-            if row.path:
+            if managed:
+                await asyncio.to_thread(Storage.delete_prepared, managed['target'])
+            elif row.path:
                 await asyncio.to_thread(Storage.delete_file, row.path)
             steps['object'] = True
             await checkpoint(steps)
@@ -942,11 +987,13 @@ async def knowledge_cleanup(user, knowledge_id, *, file_ids=(), directory_ids=()
 
 
 async def maintenance_tick():
+    from open_webui.utils.knowledge_import_lifecycle import recover_expired
+    task_ids = await recover_expired()
     async with get_async_db() as db:
-        task_ids = list((await db.scalars(select(ResourceTask.id).where(
+        task_ids.extend(list((await db.scalars(select(ResourceTask.id).where(
             or_(ResourceTask.state == 'pending',
                 and_(ResourceTask.state == 'running', ResourceTask.lease_until < now())),
-        ).limit(20))).all())
+        ).limit(20))).all()))
         # Purges that lost an external service remain durable even though the
         # item is already in 'purging', rather than silently getting stranded.
         failed_purges = (await db.scalars(select(ResourceTask).where(

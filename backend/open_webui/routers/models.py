@@ -46,7 +46,7 @@ from open_webui.models.models import (
 )
 from open_webui.storage.provider import Storage
 from open_webui.utils.access_control import filter_allowed_access_grants, has_access, has_permission
-from open_webui.utils.access_control.files import has_access_to_file
+from open_webui.utils.access_control.files import can_access_file_row, has_access_to_file
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.chat_variables import get_chat_variables_schema
 from open_webui.utils.models import get_all_models
@@ -135,7 +135,7 @@ async def _verify_background_image(url: str | None, user, db, previous_url: str 
     file_id = url.split('/')[-2]
     file = await Files.get_file_by_id(file_id, db=db)
     if not file or not (
-        user.role == 'admin' or file.user_id == user.id or await has_access_to_file(file_id, 'read', user, db=db)
+        await can_access_file_row(file, user, 'read', db=db)
     ):
         raise HTTPException(status_code=403, detail='Background image is not accessible.')
     try:
@@ -171,7 +171,7 @@ async def _verify_voice_avatar(avatar, user, db, previous=None) -> None:
             continue
         file = await Files.get_file_by_id(file_id, db=db)
         if not file or not (
-            user.role == 'admin' or file.user_id == user.id or await has_access_to_file(file_id, 'read', user, db=db)
+            await can_access_file_row(file, user, 'read', db=db)
         ):
             raise HTTPException(status_code=403, detail='Avatar or animation file is not accessible. Upload it again.')
         try:
@@ -189,7 +189,7 @@ async def _verify_knowledge_file_access(
     db: AsyncSession,
 ) -> None:
     """Raise 403 if any knowledge item references a file the caller cannot read."""
-    if not knowledge_items or user.role == 'admin':
+    if not knowledge_items:
         return
     for item in knowledge_items:
         if not isinstance(item, dict) or item.get('type') != 'file':
@@ -197,7 +197,8 @@ async def _verify_knowledge_file_access(
         file_id = item.get('id')
         if not file_id:
             continue
-        if not await has_access_to_file(file_id, 'read', user, db=db):
+        file = await Files.get_file_by_id(file_id, db=db)
+        if not file or not await can_access_file_row(file, user, 'read', db=db):
             log.warning(
                 'knowledge file access denied: user %s cannot read file %s',
                 user.id,
@@ -473,7 +474,7 @@ async def export_models(
         if url:
             try:
                 file = await Files.get_file_by_id(url.split('/')[-2], db=db)
-                if not file:
+                if not file or not await can_access_file_row(file, user, 'read', db=db):
                     raise ValueError('Image file is missing')
                 path = await asyncio.to_thread(Storage.get_file, file.path)
                 with open(path, 'rb') as image:
@@ -929,7 +930,7 @@ async def _verify_version_dependencies(request, form, user, db):
             continue
         if item.get('type') == 'file':
             file = await Files.get_file_by_id(item['id'], db=db)
-            if not file or not (user.role == 'admin' or await has_access_to_file(file.id, 'read', user, db=db)):
+            if not file or not await can_access_file_row(file, user, 'read', db=db):
                 raise HTTPException(400, 'A referenced knowledge file is missing or inaccessible.')
         elif item.get('type') == 'note':
             await require_resource('note', item['id'], await Notes.get_note_by_id(item['id'], db=db))

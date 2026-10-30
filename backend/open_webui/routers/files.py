@@ -17,6 +17,7 @@ from fastapi import (
     HTTPException,
     Query,
     Request,
+    Response,
     UploadFile,
     status,
 )
@@ -53,8 +54,37 @@ log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-from open_webui.utils.access_control.files import has_access_to_file
+from open_webui.utils.access_control.files import check_knowledge_import_access, has_access_to_file
+from open_webui.utils.knowledge_import_lifecycle import has_managed_marker
 from open_webui.utils.json_codec import JSONCodec
+
+
+def _private_cache_headers(file) -> dict[str, str]:
+    if has_managed_marker(file):
+        return {'Cache-Control': 'private, no-store'}
+    return {}
+
+
+def _mark_private_response(response: Response, file) -> None:
+    response.headers.update(_private_cache_headers(file))
+
+
+async def _can_access_file(
+    file,
+    user,
+    access_type: str,
+    id: str,
+    db: AsyncSession | None = None,
+) -> bool:
+    """Route-level access gate that never lets file ownership bypass a v2 import."""
+    v2_verdict = await check_knowledge_import_access(file, user, access_type, db=db)
+    if v2_verdict is not None:
+        return v2_verdict
+    return bool(
+        file.user_id == user.id
+        or user.role == 'admin'
+        or await has_access_to_file(id, access_type, user, db=db)
+    )
 
 ############################
 # Upload File
@@ -588,8 +618,13 @@ async def delete_all_files(
 ############################
 
 
-@router.get('/{id}', response_model=Optional[FileModel])
-async def get_file_by_id(id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
+@router.get('/{id}', response_model=Optional[FileModel], response_model_exclude_none=True)
+async def get_file_by_id(
+    id: str,
+    response: Response,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
     file = await Files.get_file_by_id(id, db=db)
 
     if not file:
@@ -598,7 +633,10 @@ async def get_file_by_id(id: str, user=Depends(get_verified_user), db: AsyncSess
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'read', user, db=db):
+    if await _can_access_file(file, user, 'read', id, db=db):
+        _mark_private_response(response, file)
+        if (file.meta or {}).get('knowledge_import_lifecycle'):
+            file = file.model_copy(update={'path': None, 'meta': {k: v for k, v in file.meta.items() if k != 'knowledge_import_lifecycle'}})
         return file
     else:
         raise HTTPException(
@@ -610,6 +648,7 @@ async def get_file_by_id(id: str, user=Depends(get_verified_user), db: AsyncSess
 @router.get('/{id}/process/status')
 async def get_file_process_status(
     id: str,
+    response: Response,
     stream: bool = Query(False),
     user=Depends(get_verified_user),
 ):
@@ -625,7 +664,8 @@ async def get_file_process_status(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'read', user):
+    if await _can_access_file(file, user, 'read', id):
+        _mark_private_response(response, file)
         if stream:
             MAX_FILE_PROCESSING_DURATION = 3600 * 2
 
@@ -633,6 +673,9 @@ async def get_file_process_status(
                 for _ in range(MAX_FILE_PROCESSING_DURATION):
                     file_item = await Files.get_file_by_id(file_id)
                     if file_item:
+                        if not await _can_access_file(file_item, user, 'read', file_id):
+                            yield f'data: {JSONCodec.dumps({"status": "error", "error": "access_denied"})}\n\n'
+                            break
                         data = file_item.model_dump().get('data', {})
                         status = data.get('status')
 
@@ -656,6 +699,7 @@ async def get_file_process_status(
             return StreamingResponse(
                 event_stream(file.id),
                 media_type='text/event-stream',
+                headers=_private_cache_headers(file),
             )
         else:
             return {'status': file.data.get('status', 'pending')}
@@ -673,7 +717,10 @@ async def get_file_process_status(
 
 @router.get('/{id}/data/content')
 async def get_file_data_content_by_id(
-    id: str, user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)
+    id: str,
+    response: Response,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
 ):
     file = await Files.get_file_by_id(id, db=db)
 
@@ -683,7 +730,8 @@ async def get_file_data_content_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'read', user, db=db):
+    if await _can_access_file(file, user, 'read', id, db=db):
+        _mark_private_response(response, file)
         return {'content': file.data.get('content', '')}
     else:
         raise HTTPException(
@@ -706,6 +754,7 @@ async def update_file_data_content_by_id(
     request: Request,
     id: str,
     form_data: ContentForm,
+    response: Response,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
 ):
@@ -717,7 +766,8 @@ async def update_file_data_content_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'write', user, db=db):
+    if await _can_access_file(file, user, 'write', id, db=db):
+        _mark_private_response(response, file)
         max_size = await Config.get('rag.file.max_size')
         if max_size and len(form_data.content.encode('utf-8')) > int(max_size) * 1024 * 1024:
             raise HTTPException(
@@ -803,7 +853,7 @@ async def get_file_content_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'read', user, db=db):
+    if await _can_access_file(file, user, 'read', id, db=db):
         try:
             if not file.path:
                 raise HTTPException(status_code=404, detail='Original file is unavailable.')
@@ -830,6 +880,7 @@ async def get_file_content_by_id(
                     elif content_type != 'text/plain':
                         headers['Content-Disposition'] = f"attachment; filename*=UTF-8''{encoded_filename}"
 
+                headers.update(_private_cache_headers(file))
                 return FileResponse(file_path, headers=headers, media_type=content_type)
 
             else:
@@ -872,7 +923,7 @@ async def get_html_file_content_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'read', user, db=db):
+    if await _can_access_file(file, user, 'read', id, db=db):
         try:
             file_path = await asyncio.to_thread(Storage.get_file, file.path)
             file_path = Path(file_path)
@@ -880,7 +931,7 @@ async def get_html_file_content_by_id(
             # Check if the file already exists in the cache
             if file_path.is_file():
                 log.info('file_path: %s', file_path)
-                return FileResponse(file_path)
+                return FileResponse(file_path, headers=_private_cache_headers(file))
             else:
                 raise HTTPException(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -914,13 +965,14 @@ async def get_file_content_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'read', user, db=db):
+    if await _can_access_file(file, user, 'read', id, db=db):
         file_path = file.path
 
         # Handle Unicode filenames
         filename = file.meta.get('name', file.filename)
         encoded_filename = quote(filename)  # RFC5987 encoding
         headers = {'Content-Disposition': f"attachment; filename*=UTF-8''{encoded_filename}"}
+        headers.update(_private_cache_headers(file))
 
         if file_path:
             file_path = await asyncio.to_thread(Storage.get_file, file_path)
@@ -978,7 +1030,7 @@ async def rename_file_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'write', user, db=db):
+    if await _can_access_file(file, user, 'write', id, db=db):
         result = await Files.update_file_name_by_id(id, form_data.filename, db=db)
         if result:
             await publish_event(
@@ -1018,7 +1070,7 @@ async def delete_file_by_id(
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
 
-    if file.user_id == user.id or user.role == 'admin' or await has_access_to_file(id, 'write', user, db=db):
+    if await _can_access_file(file, user, 'write', id, db=db):
         from open_webui.utils.resource_service import legacy_delete
         await legacy_delete(user, 'file', id)
         return {'message': 'File moved to recycle bin'}

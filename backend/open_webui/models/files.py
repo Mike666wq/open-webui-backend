@@ -7,9 +7,10 @@ import time
 
 # local imports
 from open_webui.internal.db import Base, JSONField, get_async_db_context
+from open_webui.utils.knowledge_import_lifecycle import exclude_imported_files
 from open_webui.utils.misc import sanitize_metadata
-from pydantic import BaseModel, ConfigDict, model_validator
-from sqlalchemy import JSON, BigInteger, Column, String, Text, delete, func, select
+from pydantic import BaseModel, ConfigDict, field_serializer, model_validator
+from sqlalchemy import JSON, BigInteger, Column, String, Text, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
@@ -74,6 +75,12 @@ class FileMeta(BaseModel):
         return data
 
 
+def public_file_meta(value):
+    if not isinstance(value, dict):
+        return value
+    return {key: item for key, item in value.items() if key != 'knowledge_import_lifecycle'}
+
+
 class FileModelResponse(BaseModel):
     id: str
     user_id: str
@@ -88,6 +95,10 @@ class FileModelResponse(BaseModel):
 
     model_config = ConfigDict(extra='allow')
 
+    @field_serializer('meta')
+    def public_meta(self, value):
+        return public_file_meta(value.model_dump() if value else None)
+
 
 class FileMetadataResponse(BaseModel):
     id: str
@@ -95,6 +106,10 @@ class FileMetadataResponse(BaseModel):
     meta: dict | None = None
     created_at: int  # timestamp in epoch
     updated_at: int  # timestamp in epoch
+
+    @field_serializer('meta')
+    def public_meta(self, value):
+        return public_file_meta(value)
 
 
 class FileListResponse(BaseModel):
@@ -208,7 +223,7 @@ class FilesTable:
         async with get_async_db_context(db) as db:
             stmt = select(func.count(File.id))
             if user_id:
-                stmt = stmt.filter_by(user_id=user_id)
+                stmt = stmt.filter_by(user_id=user_id).filter(exclude_imported_files(File))
             result = await db.execute(stmt)
             return result.scalar() or 0
 
@@ -248,7 +263,7 @@ class FilesTable:
 
     async def get_files_by_user_id(self, user_id: str, db: AsyncSession | None = None) -> list[FileModel]:
         async with get_async_db_context(db) as db:
-            result = await db.execute(select(File).filter_by(user_id=user_id))
+            result = await db.execute(select(File).filter_by(user_id=user_id).filter(exclude_imported_files(File)))
             return [FileModel.model_validate(file) for file in result.scalars().all()]
 
     async def get_file_list(
@@ -261,7 +276,7 @@ class FilesTable:
         async with get_async_db_context(db) as db:
             stmt = select(File)
             if user_id:
-                stmt = stmt.filter_by(user_id=user_id)
+                stmt = stmt.filter_by(user_id=user_id).filter(exclude_imported_files(File))
 
             count_result = await db.execute(select(func.count()).select_from(stmt.subquery()))
             total = count_result.scalar()
@@ -319,7 +334,7 @@ class FilesTable:
             stmt = select(File)
 
             if user_id:
-                stmt = stmt.filter_by(user_id=user_id)
+                stmt = stmt.filter_by(user_id=user_id).filter(exclude_imported_files(File))
 
             pattern = self._glob_to_like_pattern(filename)
             if pattern != '%':
@@ -372,6 +387,28 @@ class FilesTable:
             try:
                 result = await db.execute(select(File).filter_by(id=id))
                 file = result.scalars().first()
+                # Only a live import lease may write intermediate index data.
+                # Use a SQL fence so recovery cannot be overwritten by a stale
+                # model read between select and commit.
+                managed = (file.meta or {}).get('knowledge_import_lifecycle') or {}
+                if managed and managed.get('state') != 'completed':
+                    now = int(time.time())
+                    if managed.get('state') not in ('reserved', 'uploading', 'processing') or managed.get('lease_until', 0) < now:
+                        return None
+                    if 'status' in data:
+                        data = {**data, 'status': (file.data or {}).get('status', 'processing')}
+                    result = await db.execute(update(File).where(
+                        File.id == id,
+                        File.meta['knowledge_import_lifecycle']['lease_token'].as_string() == managed['lease_token'],
+                        File.meta['knowledge_import_lifecycle']['generation'].as_integer() == managed['generation'],
+                        File.meta['knowledge_import_lifecycle']['state'].as_string() == managed['state'],
+                        File.meta['knowledge_import_lifecycle']['lease_until'].as_integer() >= now,
+                    ).values(data={**(file.data or {}), **data}, updated_at=now))
+                    await db.commit()
+                    if result.rowcount != 1:
+                        return None
+                    file = await db.get(File, id, populate_existing=True)
+                    return FileModel.model_validate(file)
                 file.data = {**(file.data if file.data else {}), **data}
                 file.updated_at = int(time.time())
                 await db.commit()
