@@ -42,6 +42,7 @@ from open_webui.routers.retrieval import (
     ProcessFileForm,
     process_file,
     process_files_batch,
+    trusted_knowledge_import,
 )
 from open_webui.storage.provider import Storage
 from open_webui.utils.access_control import filter_allowed_access_grants, has_permission
@@ -2642,7 +2643,20 @@ async def import_knowledge_file(
         await _verify_directory_in_knowledge(id, directory_id, db)
         if kind == 'markdown':
             stage = 'index'
-            result = await process_file(request, ProcessFileForm(file_id=file_id, content=index_text, collection_name=id), user=user, db=db)
+            with trusted_knowledge_import(
+                file_id=file_id,
+                owner_id=user.id,
+                knowledge_id=id,
+                collection_name=id,
+                lease_token=token,
+                generation=1,
+            ):
+                result = await process_file(
+                    request,
+                    ProcessFileForm(file_id=file_id, content=index_text, collection_name=id),
+                    user=user,
+                    db=db,
+                )
             if not result or result.get('status') is not True or result.get('collection_name') != id:
                 raise RuntimeError('Indexing was not confirmed')
         stage = 'attach'

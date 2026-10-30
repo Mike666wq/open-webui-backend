@@ -11,13 +11,16 @@ from open_webui.models.access_grants import AccessGrants
 from fastapi import FastAPI, HTTPException
 from sqlalchemy import delete, select
 from open_webui.internal.db import get_async_db_context
+from open_webui.models.chats import Chat, ChatFile, ChatForm, ChatMessage, Chats
 from open_webui.models.files import File, FileForm, Files
 from open_webui.models.knowledge import Knowledge, KnowledgeFile, KnowledgeForm, Knowledges
 from open_webui.models.groups import GroupForm, Groups
 from open_webui.models.resources import ResourceEntry
+from open_webui.models.shared_chats import SharedChat, SharedChats
 from open_webui.models.users import User, Users
 from open_webui.retrieval.utils import filter_accessible_collections, get_sources_from_items
 from open_webui.routers import files as files_api
+from open_webui.routers import chats as chats_api
 from open_webui.routers import knowledge as knowledge_api
 from open_webui.routers import models as models_api
 from open_webui.routers import retrieval as retrieval_api
@@ -912,3 +915,169 @@ class ImportImagePermissionTests(unittest.IsolatedAsyncioTestCase):
                 await db.execute(delete(Knowledge).where(Knowledge.id == kb.id))
                 await db.execute(delete(User).where(User.id.in_([owner.id, writer.id])))
                 await db.commit()
+
+    async def test_shared_chat_filters_revoked_v2_file_refs_on_every_read(self):
+        owner = await Users.insert_new_user(
+            str(uuid.uuid4()),
+            'Shared chat owner',
+            f'{uuid.uuid4()}@example.test',
+            role='user',
+        )
+        outsider = await Users.insert_new_user(
+            str(uuid.uuid4()),
+            'Shared chat outsider',
+            f'{uuid.uuid4()}@example.test',
+            role='user',
+        )
+        kb = await Knowledges.insert_new_knowledge(
+            owner.id,
+            KnowledgeForm(name='Shared chat source', description=''),
+        )
+        app = FastAPI()
+        app.include_router(knowledge_api.router, prefix='/api/v1/knowledge')
+        app.include_router(chats_api.router, prefix='/api/v1/chats')
+        app.dependency_overrides[get_verified_user] = lambda: owner
+        app.dependency_overrides[chats_api.get_optional_verified_user] = lambda: outsider
+        chat_id = str(uuid.uuid4())
+        shared = None
+        file_id = None
+        legacy_file_id = str(uuid.uuid4())
+        target = None
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url='http://test',
+            ) as client:
+                imported = await client.post(
+                    f'/api/v1/knowledge/{kb.id}/import/file',
+                    data={
+                        'source_path': 'secret.png',
+                        'source_hash': 'e' * 64,
+                        'operation_id': str(uuid.uuid4()),
+                        'kind': 'image',
+                    },
+                    files={'file': ('secret.png', b'SERVER_SECRET', 'image/png')},
+                )
+                self.assertEqual(imported.status_code, 200, imported.text)
+                file_id = imported.json()['file_id']
+                stored = await Files.get_file_by_id(file_id)
+                target = stored.meta['knowledge_import_lifecycle']['target']
+                self.assertIsNotNone(
+                    await Files.insert_new_file(
+                        owner.id,
+                        FileForm(
+                            id=legacy_file_id,
+                            filename='legacy.txt',
+                            path='/tmp/legacy.txt',
+                            data={'status': 'completed'},
+                            meta={'name': 'legacy.txt', 'content_type': 'text/plain'},
+                        ),
+                    )
+                )
+
+                chat = await Chats.insert_new_chat(
+                    chat_id,
+                    owner.id,
+                    ChatForm(
+                        chat={
+                            'title': 'Shared v2 file',
+                            'history': {
+                                'currentId': 'm1',
+                                'messages': {
+                                    'm1': {
+                                        'id': 'm1',
+                                        'role': 'user',
+                                        'content': 'attached',
+                                        'user_id': owner.id,
+                                        'files': [
+                                            {
+                                                'type': 'file',
+                                                'id': file_id,
+                                                'name': 'secret.md',
+                                                'url': f'/api/v1/files/{file_id}/content',
+                                                'file': {
+                                                    'id': file_id,
+                                                    'data': {'content': 'SERVER_SECRET'},
+                                                },
+                                            },
+                                            {
+                                                'type': 'file',
+                                                'id': legacy_file_id,
+                                                'name': 'legacy.txt',
+                                                'url': f'/api/v1/files/{legacy_file_id}/content',
+                                                'file': {
+                                                    'id': legacy_file_id,
+                                                    'data': {'content': 'ORDINARY_FILE_CONTENT'},
+                                                },
+                                            },
+                                        ],
+                                    }
+                                },
+                            },
+                        }
+                    ),
+                )
+                self.assertIsNotNone(chat)
+                shared = await SharedChats.create(chat_id, owner.id, share_mode=None)
+                self.assertIsNotNone(shared)
+                await AccessGrants.grant_access(
+                    'shared_chat',
+                    chat_id,
+                    'user',
+                    outsider.id,
+                    'read',
+                )
+
+                denied = await client.get(f'/api/v1/chats/share/{shared.id}')
+                self.assertEqual(denied.status_code, 200, denied.text)
+                self.assertNotIn(file_id, denied.text)
+                self.assertNotIn(f'/api/v1/files/{file_id}', denied.text)
+                self.assertNotIn('SERVER_SECRET', denied.text)
+                self.assertIn(legacy_file_id, denied.text)
+                self.assertIn(f'/api/v1/files/{legacy_file_id}', denied.text)
+                self.assertIn('ORDINARY_FILE_CONTENT', denied.text)
+
+                await AccessGrants.grant_access(
+                    'knowledge',
+                    kb.id,
+                    'user',
+                    outsider.id,
+                    'read',
+                )
+                allowed = await client.get(f'/api/v1/chats/share/{shared.id}')
+                self.assertEqual(allowed.status_code, 200, allowed.text)
+                self.assertIn(file_id, allowed.text)
+                self.assertIn(legacy_file_id, allowed.text)
+
+                await AccessGrants.revoke_access(
+                    'knowledge',
+                    kb.id,
+                    'user',
+                    outsider.id,
+                    'read',
+                )
+                revoked = await client.get(f'/api/v1/chats/share/{shared.id}')
+                self.assertEqual(revoked.status_code, 200, revoked.text)
+                self.assertNotIn(file_id, revoked.text)
+                self.assertNotIn(f'/api/v1/files/{file_id}', revoked.text)
+                self.assertNotIn('SERVER_SECRET', revoked.text)
+                self.assertIn(legacy_file_id, revoked.text)
+                self.assertIn(f'/api/v1/files/{legacy_file_id}', revoked.text)
+                self.assertIn('ORDINARY_FILE_CONTENT', revoked.text)
+        finally:
+            await AccessGrants.revoke_all_access('knowledge', kb.id)
+            await AccessGrants.revoke_all_access('shared_chat', chat_id)
+            async with get_async_db_context() as db:
+                await db.execute(delete(SharedChat).where(SharedChat.chat_id == chat_id))
+                await db.execute(delete(ChatFile).where(ChatFile.chat_id == chat_id))
+                await db.execute(delete(ChatMessage).where(ChatMessage.chat_id == chat_id))
+                await db.execute(delete(Chat).where(Chat.id == chat_id))
+                await db.execute(delete(KnowledgeFile).where(KnowledgeFile.knowledge_id == kb.id))
+                if file_id:
+                    await db.execute(delete(File).where(File.id == file_id))
+                await db.execute(delete(File).where(File.id == legacy_file_id))
+                await db.execute(delete(Knowledge).where(Knowledge.id == kb.id))
+                await db.execute(delete(User).where(User.id.in_([owner.id, outsider.id])))
+                await db.commit()
+            if target:
+                Storage.delete_prepared(target)

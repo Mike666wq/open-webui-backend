@@ -9,16 +9,32 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from sqlalchemy import delete, select
 from open_webui.internal.db import get_async_db_context
+from open_webui.models.config import Config
 from open_webui.models.knowledge import Knowledge, KnowledgeForm, Knowledges
 from open_webui.models.files import File, FileForm, Files
 from open_webui.models.resources import ResourceEntry, ResourceTask
 from open_webui.models.users import User, Users
+from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from open_webui.storage.provider import Storage
 from open_webui.routers import knowledge as api
+from open_webui.routers import retrieval as retrieval_api
 from open_webui.utils.auth import get_verified_user
+
+
+class _VectorRows:
+    def __init__(self, count: int):
+        self.count = count
+
+    def tolist(self):
+        return [[1.0, 0.0, 0.0, 0.0] for _ in range(self.count)]
+
+
+class _SyntheticEmbeddingModel:
+    def encode(self, query, **_kwargs):
+        return _VectorRows(len(query))
 
 
 class ImportReservationTests(unittest.IsolatedAsyncioTestCase):
@@ -122,6 +138,115 @@ class ImportReservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(form.content, 'chapter [image]')
         self.assertEqual(form.collection_name, self.kb.id)
         self.assertTrue(await Knowledges.has_file(self.kb.id, response.json()['file_id']))
+
+    async def test_markdown_import_reaches_real_chroma_through_trusted_lease(self):
+        self.app.state.main_loop = asyncio.get_running_loop()
+        self.app.state.ef = _SyntheticEmbeddingModel()
+        config = await Config.get_many(*retrieval_api.RETRIEVAL_CONFIG_KEYS.values())
+        config.update({
+            'rag.bypass_embedding_and_retrieval': False,
+            'rag.embedding_engine': '',
+            'rag.embedding_model': '',
+            'rag.text_splitter': 'character',
+        })
+        operation_id = str(uuid.uuid4())
+        file_id = None
+        target = None
+        try:
+            with patch.object(
+                retrieval_api.Config,
+                'get_many',
+                new=AsyncMock(return_value=config),
+            ):
+                response = await self.client.post(
+                    f'/api/v1/knowledge/{self.kb.id}/import/file',
+                    data={
+                        'source_path': 'real-chroma.md',
+                        'source_hash': 'f' * 64,
+                        'operation_id': operation_id,
+                        'kind': 'markdown',
+                        'index_text': 'REALCHROMA chapter text without image URLs',
+                    },
+                    files={
+                        'file': (
+                            'real-chroma.md',
+                            b'# REALCHROMA\n\n![diagram](/api/v1/files/example/content)',
+                            'text/markdown',
+                        )
+                    },
+                )
+            self.assertEqual(response.status_code, 200, response.text)
+            file_id = response.json()['file_id']
+            stored = await Files.get_file_by_id(file_id)
+            self.assertIsNotNone(stored)
+            target = stored.meta['knowledge_import_lifecycle']['target']
+            self.assertTrue(await Knowledges.has_file(self.kb.id, file_id))
+            rows = await ASYNC_VECTOR_DB_CLIENT.query(
+                collection_name=self.kb.id,
+                filter={'file_id': file_id},
+            )
+            self.assertTrue(rows.ids[0], rows)
+            self.assertTrue(
+                any('REALCHROMA' in document for document in rows.documents[0]),
+                rows.documents,
+            )
+            self.assertFalse(
+                any('/api/v1/files/' in document for document in rows.documents[0]),
+                rows.documents,
+            )
+        finally:
+            try:
+                await ASYNC_VECTOR_DB_CLIENT.delete_collection(self.kb.id)
+            except Exception:
+                pass
+            if target:
+                Storage.delete_prepared(target)
+
+    async def test_public_process_file_cannot_reuse_a_processing_import_lease(self):
+        from open_webui.utils.knowledge_import_lifecycle import file_id_for
+
+        operation_id = str(uuid.uuid4())
+        file_id = file_id_for(self.user.id, self.kb.id, operation_id)
+        target = Storage.prepare_upload(file_id + '.md')
+        stored = await Files.insert_new_file(
+            self.user.id,
+            FileForm(
+                id=file_id,
+                filename='processing.md',
+                path=target['primary_path'],
+                data={'status': 'processing'},
+                meta={
+                    'markdown_import': {'version': 2, 'operation_id': operation_id},
+                    'knowledge_import_lifecycle': {
+                        'version': 1,
+                        'owner_id': self.user.id,
+                        'knowledge_id': self.kb.id,
+                        'operation_id': operation_id,
+                        'target': target,
+                        'state': 'processing',
+                        'lease_until': int(time.time()) + 300,
+                        'lease_token': 'active-server-lease',
+                        'generation': 1,
+                    },
+                },
+            ),
+        )
+        self.assertIsNotNone(stored)
+
+        async with get_async_db_context() as db:
+            with self.assertRaises(HTTPException) as raised:
+                await retrieval_api.process_file(
+                    SimpleNamespace(),
+                    retrieval_api.ProcessFileForm(
+                        file_id=file_id,
+                        content='client supplied content',
+                        collection_name=self.kb.id,
+                    ),
+                    user=self.user,
+                    db=db,
+                )
+        self.assertEqual(raised.exception.status_code, 404)
+        self.assertIsNone(retrieval_api._TRUSTED_KNOWLEDGE_IMPORT.get())
 
     async def test_empty_index_text_is_rejected_before_reservation(self):
         with patch.object(api.Files, 'insert_new_file', new=AsyncMock()) as insert, patch.object(Storage, 'upload_prepared') as upload:

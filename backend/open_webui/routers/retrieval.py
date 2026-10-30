@@ -7,7 +7,10 @@ import mimetypes
 import os
 import re
 import shutil
+import time
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence, Union
@@ -1565,6 +1568,56 @@ class ProcessFileForm(BaseModel):
     collection_name: str | None = None
 
 
+_TRUSTED_KNOWLEDGE_IMPORT: ContextVar[dict | None] = ContextVar(
+    'trusted_knowledge_import',
+    default=None,
+)
+
+
+@contextmanager
+def trusted_knowledge_import(
+    *,
+    file_id: str,
+    owner_id: str,
+    knowledge_id: str,
+    collection_name: str,
+    lease_token: str,
+    generation: int,
+):
+    """Expose a server-created import lease only inside the current async task."""
+    proof = {
+        'file_id': file_id,
+        'owner_id': owner_id,
+        'knowledge_id': knowledge_id,
+        'collection_name': collection_name,
+        'lease_token': lease_token,
+        'generation': generation,
+    }
+    reset_token = _TRUSTED_KNOWLEDGE_IMPORT.set(proof)
+    try:
+        yield
+    finally:
+        _TRUSTED_KNOWLEDGE_IMPORT.reset(reset_token)
+
+
+def _trusted_import_authorizes(file, form_data: ProcessFileForm) -> bool:
+    proof = _TRUSTED_KNOWLEDGE_IMPORT.get()
+    if not proof:
+        return False
+    managed = validate_managed_file(file)
+    return bool(
+        managed
+        and proof['file_id'] == file.id
+        and proof['owner_id'] == file.user_id
+        and proof['knowledge_id'] == managed.get('knowledge_id')
+        and proof['collection_name'] == form_data.collection_name
+        and proof['lease_token'] == managed.get('lease_token')
+        and proof['generation'] == managed.get('generation')
+        and managed.get('state') == 'processing'
+        and managed.get('lease_until', 0) >= int(time.time())
+    )
+
+
 def has_vector_results(result) -> bool:
     return bool(result and result.ids and result.ids[0])
 
@@ -1582,9 +1635,18 @@ async def process_file(
     The session is committed before external API calls, and updates use a fresh session.
     """
     config = await Config.get_many(*RETRIEVAL_CONFIG_KEYS.values())
-    file = await Files.get_file_by_id(form_data.file_id, db=db)
-    if file and not await can_access_file_row(file, user, 'write', db=db):
-        file = None
+    if _TRUSTED_KNOWLEDGE_IMPORT.get():
+        # The import route's request session still has the reservation in its
+        # identity map while renew() commits the processing lease elsewhere.
+        # Validate the proof against the fresh committed row.
+        async with get_async_db() as trusted_db:
+            file = await Files.get_file_by_id(form_data.file_id, db=trusted_db)
+        if not file or not _trusted_import_authorizes(file, form_data):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+    else:
+        file = await Files.get_file_by_id(form_data.file_id, db=db)
+        if file and not await can_access_file_row(file, user, 'write', db=db):
+            file = None
 
     if file:
         managed = validate_managed_file(file)

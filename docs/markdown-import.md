@@ -1,4 +1,4 @@
-# Markdown folder import (P-006 r3 contract)
+# Markdown folder import (P-006 r5 contract)
 
 This contract applies to the version 2 knowledge-base folder importer. Existing notes import, generic uploads, and knowledge file APIs retain their previous behavior. Upgrade does not repair or re-import existing knowledge files.
 
@@ -31,3 +31,11 @@ Automated tests and CI do not establish real-cloud, production, isolated real-sa
 ## Version 2 source knowledge access (P-006 r4)
 
 A server-registered v2 import is bound to its immutable source knowledge base. Public reads require a completed and visible file, an active source knowledge base, the original association, and current read permission on that source; uploader ownership and other shared containers do not override this check. Admin access follows the r4 active-resource exception. Writes require current source knowledge write permission. Invalid or incomplete bindings fail closed; ordinary uploads and legacy files retain their existing rules. Cross-knowledge attachment or indexing of a v2 file is rejected with 409 `knowledge_import_scope_mismatch`. Internal recovery is separately fenced and cannot be invoked through a client-controlled bypass. Protected responses use private, no-store caching. Operation confirmation is limited to the uploader with current source write access and exposes no content or storage target.
+
+## Trusted indexing and shared-chat filtering (P-006 r5)
+
+During a v2 Markdown import, the import route may let `process_file` index the still-`processing` reservation before the knowledge association exists. This exception is a server-created context containing the file, owner, immutable source knowledge, collection, lease token and generation. `process_file` re-reads the committed row and accepts the context only while every proof field matches, the state is `processing`, and the lease is unexpired. The context exits and is restored before the route continues. It is not a request parameter or public bypass; direct callers without the context still receive 404 for an inaccessible or incomplete v2 import.
+
+Every shared-chat response re-evaluates `files` references against the requester's current source-knowledge read permission before serialization. A ref is removed in full, including its nested `file.data.content` and URL, when it identifies an inaccessible v2 file. Removing a knowledge grant or group membership takes effect on the next response. Ordinary and legacy file references retain their existing shared-chat behavior.
+
+The original Markdown preview keeps authenticated image replacements and their temporary data URLs only in memory. Closing the preview, changing items, opening a replacement request, an item load failure, or destroying the component aborts outstanding requests and clears the rendered Markdown and temporary image data; neither data URLs nor raw content are written back to the file, report, or persistent cache.

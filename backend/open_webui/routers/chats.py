@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
@@ -34,17 +35,20 @@ from open_webui.models.chats import (
     chat_search_terms,
 )
 from open_webui.models.config import Config
+from open_webui.models.files import Files
 from open_webui.models.folders import Folders
 from open_webui.models.shared_chats import ChatShareMode, ShareChatForm, SharedChatResponse, SharedChats
 from open_webui.models.tags import TagModel, Tags
 from open_webui.socket.main import get_event_emitter
 from open_webui.tasks import get_response_streams_by_chat_id, has_active_tasks, stop_item_tasks
 from open_webui.utils.access_control import filter_allowed_access_grants, has_permission
+from open_webui.utils.access_control.files import check_knowledge_import_access
 from open_webui.utils.access_control.folders import has_folder_write_access
 from open_webui.utils.auth import bearer_security, get_admin_user, get_current_user, get_verified_user
 from open_webui.utils.chat_fork import build_fork_history
 from open_webui.utils.context_compaction import compact_chat_branch, get_chat_context_usage
 from open_webui.utils.json_codec import JSONCodec
+from open_webui.utils.knowledge_import_lifecycle import has_managed_marker
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import get_all_models
 from pydantic import BaseModel
@@ -54,6 +58,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+_SHARED_CHAT_FILE_URL_RE = re.compile(r'^/api/v1/files/([^/?#]+)(?:/content)?(?:[?#].*)?$')
+_UUID_RE = re.compile(r'^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$', re.IGNORECASE)
 
 CHAT_CONFIG_KEYS = {
     'CONTEXT_COMPACTION_MODEL': 'chat.context_compaction.model',
@@ -137,6 +144,64 @@ async def can_read_shared_chat(user, shared, db: AsyncSession) -> bool:
     )
 
 
+def _shared_chat_file_ids(file_ref) -> set[str]:
+    if not isinstance(file_ref, dict):
+        return set()
+    candidates = {file_ref.get('id')}
+    nested = file_ref.get('file')
+    if isinstance(nested, dict):
+        candidates.add(nested.get('id'))
+    url = file_ref.get('url')
+    if isinstance(url, str):
+        match = _SHARED_CHAT_FILE_URL_RE.match(url)
+        candidates.add(match.group(1) if match else url)
+    return {
+        candidate
+        for candidate in candidates
+        if isinstance(candidate, str) and _UUID_RE.fullmatch(candidate)
+    }
+
+
+async def _shared_chat_file_allowed(file_id: str, user, db, cache: dict[str, bool]) -> bool:
+    if file_id in cache:
+        return cache[file_id]
+    file = await Files.get_file_by_id(file_id, db=db)
+    if not file or not has_managed_marker(file):
+        cache[file_id] = True
+        return True
+    if user is None:
+        cache[file_id] = False
+        return False
+    verdict = await check_knowledge_import_access(file, user, 'read', db=db)
+    cache[file_id] = verdict is True
+    return cache[file_id]
+
+
+async def _filter_shared_chat_files(messages: list[dict], user, db) -> None:
+    """Drop inaccessible v2 import refs before a shared chat is serialized."""
+    cache: dict[str, bool] = {}
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        refs = message.get('files')
+        if not isinstance(refs, list):
+            continue
+        filtered = []
+        for ref in refs:
+            file_ids = _shared_chat_file_ids(ref)
+            allowed = True
+            for file_id in file_ids:
+                if not await _shared_chat_file_allowed(file_id, user, db, cache):
+                    allowed = False
+                    break
+            if allowed:
+                filtered.append(ref)
+        if filtered:
+            message['files'] = filtered
+        else:
+            message.pop('files', None)
+
+
 async def shared_chat_response(chat, user=None, db=None):
     from open_webui.models.users import Users
 
@@ -147,6 +212,7 @@ async def shared_chat_response(chat, user=None, db=None):
             data['chat'].pop(key, None)
     messages = list((data['chat'].get('history', {}).get('messages') or {}).values())
     messages.extend(data['chat'].get('messages') or [])
+    await _filter_shared_chat_files(messages, user, db)
     authors = {}
     for message in messages:
         if message.get('role') == 'user':
