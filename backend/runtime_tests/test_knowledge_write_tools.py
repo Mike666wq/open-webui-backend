@@ -79,7 +79,10 @@ class KnowledgeWriteTests(unittest.IsolatedAsyncioTestCase):
         await Users.insert_new_user(id=PLAIN_ID, name='Plain', email=PLAIN_EMAIL, role='user')
 
         # Skip the embedding backend so the async write path is exercisable here;
-        # the tool must still report `accepted`, never `success`.
+        # the tool must still report `accepted`, never `success`. Capture the
+        # previous value and restore it so this module never leaks global config
+        # into whatever runs after it.
+        self._previous_bypass = await Config.get('rag.bypass_embedding_and_retrieval')
         await Config.upsert({'rag.bypass_embedding_and_retrieval': True})
 
         self.owner = user_dict(OWNER_ID)
@@ -88,6 +91,9 @@ class KnowledgeWriteTests(unittest.IsolatedAsyncioTestCase):
         self.created_knowledge_ids: list[str] = []
 
     async def asyncTearDown(self):
+        await Config.upsert(
+            {'rag.bypass_embedding_and_retrieval': self._previous_bypass}
+        )
         for knowledge_id in self.created_knowledge_ids:
             try:
                 await Knowledges.delete_knowledge_by_id(knowledge_id)
