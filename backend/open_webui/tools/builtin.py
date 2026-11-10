@@ -9,10 +9,12 @@ IMPORTANT: DO NOT IMPORT THIS MODULE DIRECTLY IN OTHER PARTS OF THE CODEBASE.
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Literal, Optional
 from urllib.parse import unquote
 
 from fastapi import HTTPException, Request
+from fastapi import status as http_status
 
 from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX
 from open_webui.env import (
@@ -64,6 +66,7 @@ from open_webui.routers.memories import (
 from open_webui.routers.retrieval import search_web as _search_web
 from open_webui.socket.main import sio
 from open_webui.tasks import stop_item_tasks
+from open_webui.tools.deletion_guard import consume_token, issue_token, make_resource_key
 from open_webui.tools.knowledge_fs import kb_exec  # noqa: F401 — re-exported
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.json_codec import JSONCodec
@@ -1507,6 +1510,342 @@ async def replace_note_content(
     except Exception as e:
         log.exception(f'replace_note_content error: {e}')
         return JSONCodec.dumps({'error': str(e), 'code': 'unexpected_error'})
+
+
+# =============================================================================
+# DELETION GUARD TOOLS
+# =============================================================================
+#
+# Agent tools never delete user content on a model's word alone. Every
+# destructive tool below requires a single-use token issued by preview_delete
+# for the same user and the same resource. See docs/AGENT_TOOL_CONTRACT.md §7-8.
+
+
+def _tool_result(status: str, code: str = 'OK', message: str = '', data: Optional[dict] = None) -> str:
+    """Uniform envelope for agent write tools. See docs/AGENT_TOOL_CONTRACT.md §5."""
+    return JSONCodec.dumps(
+        {'status': status, 'code': code, 'message': message, 'data': data},
+        ensure_ascii=False,
+    )
+
+
+def _iso_utc(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _recycle_expires_at() -> str:
+    from open_webui.utils.resource_service import RETENTION
+
+    return _iso_utc(time.time() + RETENTION)
+
+
+def _is_admin_user(user: dict) -> bool:
+    return bool(user) and user.get('role') == 'admin'
+
+
+async def _can_delete_note(note, user: dict) -> bool:
+    """Only the owner may delete a note.
+
+    `utils/resource_service.owned_row` deliberately does not grant an
+    administrator backdoor over somebody else's private note, and it also
+    rejects a plain write grantee. Promising otherwise here would issue a
+    confirmation token for a delete that is guaranteed to fail.
+    """
+    if note is None or not user:
+        return False
+    return note.user_id == user.get('id')
+
+
+async def _knowledge_has_write_access(knowledge, user: dict) -> bool:
+    """Same rule as routers/knowledge.py `_verify_knowledge_write_access`."""
+    if knowledge is None or not user:
+        return False
+
+    from open_webui.models.access_grants import AccessGrants
+
+    user_id = user.get('id')
+    if knowledge.user_id == user_id or _is_admin_user(user):
+        return True
+
+    user_group_ids = [group.id for group in await Groups.get_groups_by_member_id(user_id, include_inherited=True)]
+    return await AccessGrants.has_access(
+        user_id=user_id,
+        resource_type='knowledge',
+        resource_id=knowledge.id,
+        permission='write',
+        user_group_ids=set(user_group_ids),
+    )
+
+
+async def _build_delete_impact(
+    resource_type: str,
+    resource_id: str,
+    knowledge_id: Optional[str],
+    user: dict,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Return (impact, None) or (None, error_envelope). Never mutates anything."""
+    from open_webui.models.access_grants import AccessGrants
+    from open_webui.models.knowledge import Knowledges
+
+    if resource_type == 'note':
+        note = await Notes.get_note_by_id(resource_id)
+        if note is None:
+            return None, _tool_result('failed', 'NOT_FOUND', '没有找到这篇笔记，它可能已被删除。')
+        if not await _can_delete_note(note, user):
+            return None, _tool_result(
+                'failed',
+                'PERMISSION_DENIED',
+                '只有笔记的所有者可以删除这篇笔记。请你复制内容后自行删除，或联系所有者处理。',
+            )
+
+        grants = await AccessGrants.get_grants_by_resource('note', note.id)
+        warnings = ['这篇笔记已共享给其他用户，删除后他们将无法访问。'] if grants else []
+        return (
+            {
+                'resource_type': 'note',
+                'resource_id': note.id,
+                'note_id': note.id,
+                'knowledge_id': None,
+                'title': note.title,
+                'name': note.title,
+                'file_count': None,
+                'directory_count': None,
+                'is_shared': bool(grants),
+                'recoverable_until': _recycle_expires_at(),
+                'warnings': warnings,
+            },
+            None,
+        )
+
+    if resource_type == 'knowledge':
+        knowledge = await Knowledges.get_knowledge_by_id(resource_id)
+        if knowledge is None:
+            return None, _tool_result('failed', 'NOT_FOUND', '没有找到这个知识库，它可能已被删除。')
+        if not await _knowledge_has_write_access(knowledge, user):
+            return None, _tool_result('failed', 'PERMISSION_DENIED', '你没有删除这个知识库的权限。')
+
+        files = await Knowledges.get_files_by_id(knowledge.id)
+        directories = await Knowledges.get_all_directories(knowledge.id)
+        grants = await AccessGrants.get_grants_by_resource('knowledge', knowledge.id)
+
+        warnings = []
+        if grants:
+            warnings.append('该知识库已共享给其他用户或所有人，删除后他们将无法访问。')
+        if files:
+            warnings.append(f'其中 {len(files)} 个文件会一起移入回收站。')
+
+        return (
+            {
+                'resource_type': 'knowledge',
+                'resource_id': knowledge.id,
+                'note_id': None,
+                'knowledge_id': knowledge.id,
+                'title': knowledge.name,
+                'name': knowledge.name,
+                'file_count': len(files),
+                'directory_count': len(directories),
+                'is_shared': bool(grants),
+                'recoverable_until': _recycle_expires_at(),
+                'warnings': warnings,
+            },
+            None,
+        )
+
+    # resource_type == 'knowledge_file'
+    knowledge = await Knowledges.get_knowledge_by_id(knowledge_id)
+    if knowledge is None:
+        return None, _tool_result('failed', 'NOT_FOUND', '没有找到这个知识库，它可能已被删除。')
+    if not await _knowledge_has_write_access(knowledge, user):
+        return None, _tool_result('failed', 'PERMISSION_DENIED', '你没有修改这个知识库的权限。')
+    if not await Knowledges.has_file(knowledge.id, resource_id):
+        return None, _tool_result('failed', 'NOT_FOUND', '这个文件不在该知识库中，或已被移除。')
+
+    from open_webui.models.files import Files
+
+    file = await Files.get_file_by_id(resource_id)
+    grants = await AccessGrants.get_grants_by_resource('knowledge', knowledge.id)
+    warnings = ['该知识库已共享给其他用户，移除后他们将无法检索到这个文件。'] if grants else []
+
+    return (
+        {
+            'resource_type': 'knowledge_file',
+            'resource_id': resource_id,
+            'note_id': None,
+            'knowledge_id': knowledge.id,
+            'title': getattr(file, 'filename', None),
+            'name': getattr(file, 'filename', None),
+            'file_count': 1,
+            'directory_count': None,
+            'is_shared': bool(grants),
+            'recoverable_until': _recycle_expires_at(),
+            'warnings': warnings,
+        },
+        None,
+    )
+
+
+async def preview_delete(
+    resource_type: str,
+    resource_id: str,
+    knowledge_id: Optional[str] = None,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Show what deleting a note or knowledge base would affect, and get the one-time
+    token required to actually delete it.
+
+    This tool NEVER deletes anything. Always call it before delete_note,
+    delete_knowledge_base or remove_file_from_knowledge: present the impact to the
+    user, wait for their explicit agreement, then call the delete tool with the
+    returned confirmation_token.
+
+    :param resource_type: One of "note", "knowledge", "knowledge_file".
+    :param resource_id: The note id, knowledge base id, or knowledge file id.
+    :param knowledge_id: Required when resource_type is "knowledge_file": the
+        knowledge base that file belongs to.
+    :return: JSON with status, data.impact and data.confirmation_token
+    """
+    user = __user__ or {}
+    user_id = user.get('id')
+
+    if __request__ is None or not user_id:
+        return _tool_result('failed', 'INTERNAL', '请求上下文不可用，请重试。')
+
+    resource_type = (resource_type or '').strip()
+    resource_id = (resource_id or '').strip()
+    knowledge_id = (knowledge_id or '').strip() or None
+
+    if resource_type not in ('note', 'knowledge', 'knowledge_file'):
+        return _tool_result(
+            'failed', 'INVALID_ARGUMENT', 'resource_type 必须是 note、knowledge 或 knowledge_file。'
+        )
+    if not resource_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', 'resource_id 不能为空。')
+    if resource_type == 'knowledge_file' and not knowledge_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', '删除知识库文件时必须提供 knowledge_id。')
+
+    try:
+        impact, error = await _build_delete_impact(resource_type, resource_id, knowledge_id, user)
+    except Exception as e:
+        log.exception(f'preview_delete error: {e}')
+        return _tool_result('failed', 'INTERNAL', '生成删除预览失败，请稍后重试。')
+
+    if error is not None:
+        return error
+
+    token = issue_token(user_id, make_resource_key(resource_type, resource_id, knowledge_id))
+
+    label = {'note': '笔记', 'knowledge': '知识库', 'knowledge_file': '知识库文件'}[resource_type]
+    name = impact.get('name') or impact.get('title') or resource_id
+    message = (
+        f'即将删除{label}「{name}」。请在用户明确同意后，带上 confirmation_token 调用对应的删除工具。'
+        f'删除会移入回收站，可恢复至 {impact["recoverable_until"]}。'
+    )
+    if impact.get('warnings'):
+        message = f'{message} 注意：{" ".join(impact["warnings"])}'
+
+    return _tool_result(
+        'confirmation_required',
+        'CONFIRMATION_REQUIRED',
+        message,
+        {'confirmation_token': token, 'impact': impact},
+    )
+
+
+async def delete_note(
+    note_id: str,
+    confirmation_token: str,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Move a note to the recycle bin.
+
+    Requires a confirmation_token from preview_delete with resource_type "note".
+    Call preview_delete first, show the impact to the user, and only then call this
+    tool. Deletion is reversible for seven days.
+
+    :param note_id: The id of the note to delete.
+    :param confirmation_token: The token returned by preview_delete.
+    :return: JSON with status and recovery deadline
+    """
+    user = __user__ or {}
+    user_id = user.get('id')
+
+    if __request__ is None or not user_id:
+        return _tool_result('failed', 'INTERNAL', '请求上下文不可用，请重试。')
+
+    note_id = (note_id or '').strip()
+    if not note_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', 'note_id 不能为空。')
+
+    try:
+        note = await Notes.get_note_by_id(note_id)
+    except Exception as e:
+        log.exception(f'delete_note lookup error: {e}')
+        return _tool_result('failed', 'INTERNAL', '读取笔记失败，请稍后重试。')
+
+    if note is None:
+        return _tool_result('failed', 'NOT_FOUND', '没有找到这篇笔记，它可能已被删除。')
+
+    if not await _can_delete_note(note, user):
+        return _tool_result(
+            'failed',
+            'PERMISSION_DENIED',
+            '只有笔记的所有者可以删除这篇笔记。请你复制内容后自行删除，或联系所有者处理。',
+        )
+
+    resource_key = make_resource_key('note', note.id)
+    if not consume_token(confirmation_token, user_id, resource_key):
+        return _tool_result(
+            'confirmation_required',
+            'CONFIRMATION_REQUIRED',
+            '确认令牌无效或已过期。请先调用 preview_delete 重新获取，并向用户确认后再删除。',
+        )
+
+    # `legacy_delete` expects an attribute-style user (UserModel), not the raw dict.
+    try:
+        actor = UserModel(**user)
+    except Exception:
+        return _tool_result('failed', 'INTERNAL', '用户上下文不可用，请重试。')
+
+    from open_webui.utils.resource_service import legacy_delete
+
+    try:
+        await legacy_delete(actor, 'note', note.id)
+    except HTTPException as e:
+        detail = e.detail
+        reason = detail.get('reason') if isinstance(detail, dict) else None
+        if reason == 'protected_resource':
+            return _tool_result(
+                'failed',
+                'PROTECTED_RESOURCE',
+                '这篇笔记正被共享或受保护，暂时不能删除。请先在笔记的访问设置中解除共享，再试一次。',
+            )
+        if reason == 'resource_operation_failed':
+            return _tool_result('failed', 'PROCESSING_FAILED', '回收操作没有完成，笔记仍然存在，请稍后重试。')
+        if e.status_code == http_status.HTTP_404_NOT_FOUND:
+            return _tool_result('failed', 'NOT_FOUND', '没有找到这篇笔记，它可能已经被回收了。')
+        if e.status_code in (http_status.HTTP_403_FORBIDDEN, http_status.HTTP_401_UNAUTHORIZED):
+            return _tool_result('failed', 'PERMISSION_DENIED', '你没有删除这篇笔记的权限。')
+        log.warning(f'delete_note rejected by resource service: status={e.status_code} detail={detail}')
+        return _tool_result('failed', 'PROTECTED_RESOURCE', '这篇笔记当前不允许删除。')
+    except Exception as e:
+        log.exception(f'delete_note error: {e}')
+        return _tool_result('failed', 'INTERNAL', '删除失败，笔记仍然存在，请稍后重试。')
+
+    expires_at = _recycle_expires_at()
+    return _tool_result(
+        'success',
+        'OK',
+        f'笔记「{note.title or note.id}」已移入回收站，可在 {expires_at} 前恢复。',
+        {
+            'note_id': note.id,
+            'title': note.title,
+            'recycle_expires_at': expires_at,
+        },
+    )
 
 
 # =============================================================================

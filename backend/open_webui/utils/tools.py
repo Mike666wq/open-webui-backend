@@ -56,6 +56,7 @@ from open_webui.tools.builtin import (
     delete_automation,
     delete_calendar_event,
     delete_memory,
+    delete_note,
     edit_image,
     execute_code,
     fetch_url,
@@ -71,6 +72,7 @@ from open_webui.tools.builtin import (
     list_memories,
     list_memory_paths,
     notify,
+    preview_delete,
     query_chat_files,
     query_knowledge_bases,
     query_knowledge_files,
@@ -836,6 +838,11 @@ async def get_builtin_tools(
         is_builtin_tool_enabled('notes') and config.get('notes.enable') and await has_user_permission('notes')
     ):
         builtin_functions.extend([search_notes, view_note, write_note, replace_note_content])
+
+        # Deletion is never offered inside a note-attached chat: the user is
+        # editing there, not managing. See docs/AGENT_TOOL_CONTRACT.md §10.3.
+        if not is_note_chat:
+            builtin_functions.extend([preview_delete, delete_note])
 
     # Channels tools - search channels and messages
     if is_builtin_tool_enabled('channels') and config.get('channels.enable') and await has_user_permission('channels'):
