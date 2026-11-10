@@ -287,12 +287,15 @@ async def preview_delete(
 ### 10.2 写工具
 
 ```
-当 builtinTools.knowledge_manage 开启
+当 builtinTools.knowledge 开启        ← 写操作以可读为前提
+且 builtinTools.knowledge_manage 开启
 且 user 具备对应权限（第 9 节，逐工具在调用时再判一次）
-且 is_note_chat == False          ← 笔记内嵌聊天永不注入写工具
+且 is_note_chat == False             ← 笔记内嵌聊天永不注入写工具
 则注入：create_knowledge_base, update_knowledge_base, add_text_to_knowledge,
         create_knowledge_directory, remove_file_from_knowledge, delete_knowledge_base
 ```
+
+**写依赖读**：管理员把 `knowledge`（只读）关掉时，写工具**一并**不注入。否则会留下「能写不能读」的怪状态——agent 写完无法确认结果，且这等同于绕过管理员的关闭意图。反过来「只读不写」由 `knowledge_manage=false` 表达，两者职责不重叠。
 
 `preview_delete` 随「被其服务的删除工具」一同注入：
 - `notes` 类别 → `preview_delete`（覆盖 `note`）+ `delete_note`
