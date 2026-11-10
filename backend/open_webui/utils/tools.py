@@ -48,14 +48,19 @@ from open_webui.models.users import UserModel
 from open_webui.tools.builtin import (
     add_memory,
     ask_user,
+    add_text_to_knowledge,
     calculate_timestamp,
     create_automation,
     create_calendar_event,
+    create_knowledge_base,
+    create_knowledge_directory,
     create_tasks,
     delegate_task,
     delete_automation,
     delete_calendar_event,
+    delete_knowledge_base,
     delete_memory,
+    delete_note,
     edit_image,
     execute_code,
     fetch_url,
@@ -71,6 +76,8 @@ from open_webui.tools.builtin import (
     list_memories,
     list_memory_paths,
     notify,
+    preview_delete,
+    remove_file_from_knowledge,
     query_chat_files,
     query_knowledge_bases,
     query_knowledge_files,
@@ -90,6 +97,7 @@ from open_webui.tools.builtin import (
     toggle_automation,
     update_automation,
     update_calendar_event,
+    update_knowledge_base,
     update_memory,
     update_task,
     view_channel_message,
@@ -716,46 +724,50 @@ async def get_builtin_tools(
     ):
         builtin_functions.extend([list_chat_files, query_chat_files, grep_chat_files, view_file])
 
-    # Knowledge base tools - conditional injection based on model knowledge
-    # If model has attached knowledge (any type), only provide query_knowledge_files
-    # Otherwise, provide all KB browsing tools
+    # Knowledge base tools. Discovery tools are ALWAYS injected so the agent can
+    # find other bases even when one is attached to the model; previously an
+    # attached collection silently removed list/search/query of knowledge bases.
+    # See docs/AGENT_TOOL_CONTRACT.md §10.1.
     model_knowledge = get_attached_knowledge(model, metadata)
+    knowledge_types = {item.get('type') for item in (model_knowledge or [])}
     if is_builtin_tool_enabled('knowledge'):
         from open_webui.env import ENABLE_KB_EXEC
 
+        builtin_functions.extend([list_knowledge_bases, search_knowledge_bases, query_knowledge_files])
+
         if ENABLE_KB_EXEC:
             builtin_functions.append(kb_exec)
-            builtin_functions.append(query_knowledge_files)
-            # Notes attached to the model need view_note since kb_exec is file-only
-            if model_knowledge:
-                knowledge_types = {item.get('type') for item in model_knowledge}
-                if 'note' in knowledge_types:
-                    builtin_functions.append(view_note)
-            if not model_knowledge:
-                builtin_functions.append(query_knowledge_bases)
-                builtin_functions.append(search_knowledge_bases)
-        elif model_knowledge:
-            builtin_functions.extend(
-                [list_knowledge, search_knowledge_files, grep_knowledge_files, query_knowledge_files]
-            )
 
-            knowledge_types = {item.get('type') for item in model_knowledge}
-            if 'file' in knowledge_types or 'collection' in knowledge_types:
-                builtin_functions.extend([view_file, view_knowledge_file])
+        if model_knowledge:
+            builtin_functions.extend(
+                [list_knowledge, search_knowledge_files, grep_knowledge_files, view_knowledge_file]
+            )
             if 'note' in knowledge_types:
                 builtin_functions.append(view_note)
         else:
             builtin_functions.extend(
-                [
-                    list_knowledge_bases,
-                    search_knowledge_bases,
-                    query_knowledge_bases,
-                    grep_knowledge_files,
-                    search_knowledge_files,
-                    query_knowledge_files,
-                    view_knowledge_file,
-                ]
+                [query_knowledge_bases, grep_knowledge_files, search_knowledge_files, view_knowledge_file]
             )
+
+        if 'file' in knowledge_types or 'collection' in knowledge_types:
+            builtin_functions.append(view_file)
+
+    # Knowledge WRITE tools (P-007 S2). Never inside a note-attached chat: the
+    # user is editing there, not managing. Writes also presuppose reads: turning
+    # the `knowledge` category off must not leave a write-only backdoor. See
+    # docs/AGENT_TOOL_CONTRACT.md §10.2 / §10.3.
+    if not is_note_chat and is_builtin_tool_enabled('knowledge') and is_builtin_tool_enabled('knowledge_manage'):
+        builtin_functions.extend(
+            [
+                preview_delete,
+                create_knowledge_base,
+                update_knowledge_base,
+                add_text_to_knowledge,
+                create_knowledge_directory,
+                remove_file_from_knowledge,
+                delete_knowledge_base,
+            ]
+        )
 
     # Chats tools - search and fetch user's chat history
     if is_builtin_tool_enabled('chats'):
@@ -836,6 +848,11 @@ async def get_builtin_tools(
         is_builtin_tool_enabled('notes') and config.get('notes.enable') and await has_user_permission('notes')
     ):
         builtin_functions.extend([search_notes, view_note, write_note, replace_note_content])
+
+        # Deletion is never offered inside a note-attached chat: the user is
+        # editing there, not managing. See docs/AGENT_TOOL_CONTRACT.md §10.3.
+        if not is_note_chat:
+            builtin_functions.extend([preview_delete, delete_note])
 
     # Channels tools - search channels and messages
     if is_builtin_tool_enabled('channels') and config.get('channels.enable') and await has_user_permission('channels'):

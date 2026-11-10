@@ -9,10 +9,12 @@ IMPORTANT: DO NOT IMPORT THIS MODULE DIRECTLY IN OTHER PARTS OF THE CODEBASE.
 import asyncio
 import logging
 import time
+from datetime import datetime, timezone
 from typing import Literal, Optional
 from urllib.parse import unquote
 
 from fastapi import HTTPException, Request
+from fastapi import status as http_status
 
 from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX
 from open_webui.env import (
@@ -64,6 +66,7 @@ from open_webui.routers.memories import (
 from open_webui.routers.retrieval import search_web as _search_web
 from open_webui.socket.main import sio
 from open_webui.tasks import stop_item_tasks
+from open_webui.tools.deletion_guard import consume_token, issue_token, make_resource_key
 from open_webui.tools.knowledge_fs import kb_exec  # noqa: F401 — re-exported
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.json_codec import JSONCodec
@@ -1507,6 +1510,893 @@ async def replace_note_content(
     except Exception as e:
         log.exception(f'replace_note_content error: {e}')
         return JSONCodec.dumps({'error': str(e), 'code': 'unexpected_error'})
+
+
+# =============================================================================
+# DELETION GUARD TOOLS
+# =============================================================================
+#
+# Agent tools never delete user content on a model's word alone. Every
+# destructive tool below requires a single-use token issued by preview_delete
+# for the same user and the same resource. See docs/AGENT_TOOL_CONTRACT.md §7-8.
+
+
+def _tool_result(status: str, code: str = 'OK', message: str = '', data: Optional[dict] = None) -> str:
+    """Uniform envelope for agent write tools. See docs/AGENT_TOOL_CONTRACT.md §5."""
+    return JSONCodec.dumps(
+        {'status': status, 'code': code, 'message': message, 'data': data},
+        ensure_ascii=False,
+    )
+
+
+def _iso_utc(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def _recycle_expires_at() -> str:
+    from open_webui.utils.resource_service import RETENTION
+
+    return _iso_utc(time.time() + RETENTION)
+
+
+def _is_admin_user(user: dict) -> bool:
+    return bool(user) and user.get('role') == 'admin'
+
+
+async def _can_delete_note(note, user: dict) -> bool:
+    """Only the owner may delete a note.
+
+    `utils/resource_service.owned_row` deliberately does not grant an
+    administrator backdoor over somebody else's private note, and it also
+    rejects a plain write grantee. Promising otherwise here would issue a
+    confirmation token for a delete that is guaranteed to fail.
+    """
+    if note is None or not user:
+        return False
+    return note.user_id == user.get('id')
+
+
+async def _knowledge_has_write_access(knowledge, user: dict) -> bool:
+    """Same rule as routers/knowledge.py `_verify_knowledge_write_access`."""
+    if knowledge is None or not user:
+        return False
+
+    from open_webui.models.access_grants import AccessGrants
+
+    user_id = user.get('id')
+    if knowledge.user_id == user_id or _is_admin_user(user):
+        return True
+
+    user_group_ids = [group.id for group in await Groups.get_groups_by_member_id(user_id, include_inherited=True)]
+    return await AccessGrants.has_access(
+        user_id=user_id,
+        resource_type='knowledge',
+        resource_id=knowledge.id,
+        permission='write',
+        user_group_ids=set(user_group_ids),
+    )
+
+
+async def _build_delete_impact(
+    resource_type: str,
+    resource_id: str,
+    knowledge_id: Optional[str],
+    user: dict,
+) -> tuple[Optional[dict], Optional[str]]:
+    """Return (impact, None) or (None, error_envelope). Never mutates anything."""
+    from open_webui.models.access_grants import AccessGrants
+    from open_webui.models.knowledge import Knowledges
+
+    if resource_type == 'note':
+        note = await Notes.get_note_by_id(resource_id)
+        if note is None:
+            return None, _tool_result('failed', 'NOT_FOUND', '没有找到这篇笔记，它可能已被删除。')
+        if not await _can_delete_note(note, user):
+            return None, _tool_result(
+                'failed',
+                'PERMISSION_DENIED',
+                '只有笔记的所有者可以删除这篇笔记。请你复制内容后自行删除，或联系所有者处理。',
+            )
+
+        grants = await AccessGrants.get_grants_by_resource('note', note.id)
+        warnings = ['这篇笔记已共享给其他用户，删除后他们将无法访问。'] if grants else []
+        return (
+            {
+                'resource_type': 'note',
+                'resource_id': note.id,
+                'note_id': note.id,
+                'knowledge_id': None,
+                'title': note.title,
+                'name': note.title,
+                'file_count': None,
+                'directory_count': None,
+                'is_shared': bool(grants),
+                'recoverable_until': _recycle_expires_at(),
+                'warnings': warnings,
+            },
+            None,
+        )
+
+    if resource_type == 'knowledge':
+        knowledge = await Knowledges.get_knowledge_by_id(resource_id)
+        if knowledge is None:
+            return None, _tool_result('failed', 'NOT_FOUND', '没有找到这个知识库，它可能已被删除。')
+        if not await _knowledge_has_write_access(knowledge, user):
+            return None, _tool_result('failed', 'PERMISSION_DENIED', '你没有删除这个知识库的权限。')
+
+        files = await Knowledges.get_files_by_id(knowledge.id)
+        directories = await Knowledges.get_all_directories(knowledge.id)
+        grants = await AccessGrants.get_grants_by_resource('knowledge', knowledge.id)
+
+        warnings = []
+        if grants:
+            warnings.append('该知识库已共享给其他用户或所有人，删除后他们将无法访问。')
+        if files:
+            warnings.append(f'其中 {len(files)} 个文件会一起移入回收站。')
+
+        return (
+            {
+                'resource_type': 'knowledge',
+                'resource_id': knowledge.id,
+                'note_id': None,
+                'knowledge_id': knowledge.id,
+                'title': knowledge.name,
+                'name': knowledge.name,
+                'file_count': len(files),
+                'directory_count': len(directories),
+                'is_shared': bool(grants),
+                'recoverable_until': _recycle_expires_at(),
+                'warnings': warnings,
+            },
+            None,
+        )
+
+    # resource_type == 'knowledge_file'
+    knowledge = await Knowledges.get_knowledge_by_id(knowledge_id)
+    if knowledge is None:
+        return None, _tool_result('failed', 'NOT_FOUND', '没有找到这个知识库，它可能已被删除。')
+    if not await _knowledge_has_write_access(knowledge, user):
+        return None, _tool_result('failed', 'PERMISSION_DENIED', '你没有修改这个知识库的权限。')
+    if not await Knowledges.has_file(knowledge.id, resource_id):
+        return None, _tool_result('failed', 'NOT_FOUND', '这个文件不在该知识库中，或已被移除。')
+
+    from open_webui.models.files import Files
+
+    file = await Files.get_file_by_id(resource_id)
+    grants = await AccessGrants.get_grants_by_resource('knowledge', knowledge.id)
+    warnings = ['该知识库已共享给其他用户，移除后他们将无法检索到这个文件。'] if grants else []
+
+    return (
+        {
+            'resource_type': 'knowledge_file',
+            'resource_id': resource_id,
+            'note_id': None,
+            'knowledge_id': knowledge.id,
+            'title': getattr(file, 'filename', None),
+            'name': getattr(file, 'filename', None),
+            'file_count': 1,
+            'directory_count': None,
+            'is_shared': bool(grants),
+            'recoverable_until': _recycle_expires_at(),
+            'warnings': warnings,
+        },
+        None,
+    )
+
+
+async def preview_delete(
+    resource_type: str,
+    resource_id: str,
+    knowledge_id: Optional[str] = None,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Show what deleting a note or knowledge base would affect, and get the one-time
+    token required to actually delete it.
+
+    This tool NEVER deletes anything. Always call it before delete_note,
+    delete_knowledge_base or remove_file_from_knowledge: present the impact to the
+    user, wait for their explicit agreement, then call the delete tool with the
+    returned confirmation_token.
+
+    :param resource_type: One of "note", "knowledge", "knowledge_file".
+    :param resource_id: The note id, knowledge base id, or knowledge file id.
+    :param knowledge_id: Required when resource_type is "knowledge_file": the
+        knowledge base that file belongs to.
+    :return: JSON with status, data.impact and data.confirmation_token
+    """
+    user = __user__ or {}
+    user_id = user.get('id')
+
+    if __request__ is None or not user_id:
+        return _tool_result('failed', 'INTERNAL', '请求上下文不可用，请重试。')
+
+    resource_type = (resource_type or '').strip()
+    resource_id = (resource_id or '').strip()
+    knowledge_id = (knowledge_id or '').strip() or None
+
+    if resource_type not in ('note', 'knowledge', 'knowledge_file'):
+        return _tool_result(
+            'failed', 'INVALID_ARGUMENT', 'resource_type 必须是 note、knowledge 或 knowledge_file。'
+        )
+    if not resource_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', 'resource_id 不能为空。')
+    if resource_type == 'knowledge_file' and not knowledge_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', '删除知识库文件时必须提供 knowledge_id。')
+
+    try:
+        impact, error = await _build_delete_impact(resource_type, resource_id, knowledge_id, user)
+    except Exception as e:
+        log.exception(f'preview_delete error: {e}')
+        return _tool_result('failed', 'INTERNAL', '生成删除预览失败，请稍后重试。')
+
+    if error is not None:
+        return error
+
+    token = issue_token(user_id, make_resource_key(resource_type, resource_id, knowledge_id))
+
+    label = {'note': '笔记', 'knowledge': '知识库', 'knowledge_file': '知识库文件'}[resource_type]
+    name = impact.get('name') or impact.get('title') or resource_id
+    message = (
+        f'即将删除{label}「{name}」。请在用户明确同意后，带上 confirmation_token 调用对应的删除工具。'
+        f'删除会移入回收站，可恢复至 {impact["recoverable_until"]}。'
+    )
+    if impact.get('warnings'):
+        message = f'{message} 注意：{" ".join(impact["warnings"])}'
+
+    return _tool_result(
+        'confirmation_required',
+        'CONFIRMATION_REQUIRED',
+        message,
+        {'confirmation_token': token, 'impact': impact},
+    )
+
+
+async def delete_note(
+    note_id: str,
+    confirmation_token: str,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Move a note to the recycle bin.
+
+    Requires a confirmation_token from preview_delete with resource_type "note".
+    Call preview_delete first, show the impact to the user, and only then call this
+    tool. Deletion is reversible for seven days.
+
+    :param note_id: The id of the note to delete.
+    :param confirmation_token: The token returned by preview_delete.
+    :return: JSON with status and recovery deadline
+    """
+    user = __user__ or {}
+    user_id = user.get('id')
+
+    if __request__ is None or not user_id:
+        return _tool_result('failed', 'INTERNAL', '请求上下文不可用，请重试。')
+
+    note_id = (note_id or '').strip()
+    if not note_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', 'note_id 不能为空。')
+
+    try:
+        note = await Notes.get_note_by_id(note_id)
+    except Exception as e:
+        log.exception(f'delete_note lookup error: {e}')
+        return _tool_result('failed', 'INTERNAL', '读取笔记失败，请稍后重试。')
+
+    if note is None:
+        return _tool_result('failed', 'NOT_FOUND', '没有找到这篇笔记，它可能已被删除。')
+
+    if not await _can_delete_note(note, user):
+        return _tool_result(
+            'failed',
+            'PERMISSION_DENIED',
+            '只有笔记的所有者可以删除这篇笔记。请你复制内容后自行删除，或联系所有者处理。',
+        )
+
+    resource_key = make_resource_key('note', note.id)
+    if not consume_token(confirmation_token, user_id, resource_key):
+        return _tool_result(
+            'confirmation_required',
+            'CONFIRMATION_REQUIRED',
+            '确认令牌无效或已过期。请先调用 preview_delete 重新获取，并向用户确认后再删除。',
+        )
+
+    # `legacy_delete` expects an attribute-style user (UserModel), not the raw dict.
+    try:
+        actor = UserModel(**user)
+    except Exception:
+        return _tool_result('failed', 'INTERNAL', '用户上下文不可用，请重试。')
+
+    from open_webui.utils.resource_service import legacy_delete
+
+    try:
+        await legacy_delete(actor, 'note', note.id)
+    except HTTPException as e:
+        detail = e.detail
+        reason = detail.get('reason') if isinstance(detail, dict) else None
+        if reason == 'protected_resource':
+            return _tool_result(
+                'failed',
+                'PROTECTED_RESOURCE',
+                '这篇笔记正被共享或受保护，暂时不能删除。请先在笔记的访问设置中解除共享，再试一次。',
+            )
+        if reason == 'resource_operation_failed':
+            return _tool_result('failed', 'PROCESSING_FAILED', '回收操作没有完成，笔记仍然存在，请稍后重试。')
+        if e.status_code == http_status.HTTP_404_NOT_FOUND:
+            return _tool_result('failed', 'NOT_FOUND', '没有找到这篇笔记，它可能已经被回收了。')
+        if e.status_code in (http_status.HTTP_403_FORBIDDEN, http_status.HTTP_401_UNAUTHORIZED):
+            return _tool_result('failed', 'PERMISSION_DENIED', '你没有删除这篇笔记的权限。')
+        log.warning(f'delete_note rejected by resource service: status={e.status_code} detail={detail}')
+        return _tool_result('failed', 'PROTECTED_RESOURCE', '这篇笔记当前不允许删除。')
+    except Exception as e:
+        log.exception(f'delete_note error: {e}')
+        return _tool_result('failed', 'INTERNAL', '删除失败，笔记仍然存在，请稍后重试。')
+
+    expires_at = _recycle_expires_at()
+    return _tool_result(
+        'success',
+        'OK',
+        f'笔记「{note.title or note.id}」已移入回收站，可在 {expires_at} 前恢复。',
+        {
+            'note_id': note.id,
+            'title': note.title,
+            'recycle_expires_at': expires_at,
+        },
+    )
+
+
+# =============================================================================
+# KNOWLEDGE WRITE TOOLS
+# =============================================================================
+#
+# The read-only knowledge tools live further down. These are the write paths,
+# gated by the `knowledge_manage` category and never injected into a
+# note-attached chat. See docs/AGENT_TOOL_CONTRACT.md §4.2 and §10.2.
+
+
+async def _knowledge_for_write(
+    knowledge_id: str, user: dict
+) -> tuple[Optional[object], Optional[str]]:
+    """Load a KB and check write access. Returns (knowledge, error_envelope)."""
+    from open_webui.models.knowledge import Knowledges
+
+    knowledge = await Knowledges.get_knowledge_by_id(knowledge_id)
+    if knowledge is None:
+        return None, _tool_result('failed', 'NOT_FOUND', '没有找到这个知识库，它可能已被删除。')
+    if not await _knowledge_has_write_access(knowledge, user):
+        return None, _tool_result('failed', 'PERMISSION_DENIED', '你没有修改这个知识库的权限。')
+
+    # External knowledge sources are read-only by definition.
+    from open_webui.routers.knowledge import is_external_knowledge
+
+    if is_external_knowledge(knowledge):
+        return None, _tool_result('failed', 'INVALID_ARGUMENT', '外部知识源是只读的，不能通过工具写入。')
+
+    return knowledge, None
+
+
+def _safe_filename(raw: str, fallback: str = 'note.md') -> str:
+    """Strip any path structure; knowledge filenames are display names only."""
+    name = (raw or '').strip().replace('\\', '/').split('/')[-1]
+    name = ''.join(ch for ch in name if ch not in '\x00\r\n')
+    if not name or name in ('.', '..'):
+        name = fallback
+    return name[:255]
+
+
+async def create_knowledge_base(
+    name: str,
+    description: str = '',
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Create a new, empty knowledge base owned by the current user.
+
+    Requires the knowledge-base creation permission. The new base is private to
+    the creator unless sharing is configured later in the UI.
+
+    :param name: Display name of the knowledge base.
+    :param description: Short description.
+    :return: JSON with status and the new knowledge base id
+    """
+    user = __user__ or {}
+    user_id = user.get('id')
+
+    if __request__ is None or not user_id:
+        return _tool_result('failed', 'INTERNAL', '请求上下文不可用，请重试。')
+
+    name = (name or '').strip()
+    description = (description or '').strip()
+    if not name:
+        return _tool_result('failed', 'INVALID_ARGUMENT', '知识库名称不能为空。')
+
+    try:
+        from open_webui.models.config import Config
+        from open_webui.models.knowledge import KnowledgeForm, Knowledges
+        from open_webui.routers.knowledge import embed_knowledge_base_metadata, filter_allowed_access_grants
+        from open_webui.utils.access_control import has_permission
+
+        if user.get('role') != 'admin' and not await has_permission(
+            user_id, 'workspace.knowledge', await Config.get('user.permissions')
+        ):
+            return _tool_result(
+                'failed',
+                'PERMISSION_DENIED',
+                '你没有创建知识库的权限，请联系管理员开通。',
+            )
+
+        form = KnowledgeForm(name=name, description=description, access_grants=None)
+        form.access_grants = await filter_allowed_access_grants(
+            await Config.get('user.permissions'),
+            user_id,
+            user.get('role', 'user'),
+            form.access_grants,
+            'sharing.public_knowledge',
+        )
+
+        knowledge = await Knowledges.insert_new_knowledge(user_id, form)
+        if not knowledge:
+            return _tool_result('failed', 'INTERNAL', '创建知识库失败，请稍后重试。')
+
+        try:
+            await embed_knowledge_base_metadata(__request__, knowledge.id, knowledge.name, knowledge.description)
+        except Exception as e:
+            # Metadata embedding is best effort; the base already exists.
+            log.warning(f'create_knowledge_base metadata embed failed: {e}')
+
+        return _tool_result(
+            'success',
+            'OK',
+            f'已创建知识库「{knowledge.name}」，可以继续往里添加内容。',
+            {
+                'knowledge_id': knowledge.id,
+                'name': knowledge.name,
+                'created_at': _iso_utc(knowledge.created_at),
+            },
+        )
+    except Exception as e:
+        log.exception(f'create_knowledge_base error: {e}')
+        return _tool_result('failed', 'INTERNAL', '创建知识库失败，请稍后重试。')
+
+
+async def update_knowledge_base(
+    knowledge_id: str,
+    name: Optional[str] = None,
+    description: Optional[str] = None,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Rename a knowledge base or change its description.
+
+    Only the fields you pass are changed. At least one of name/description is
+    required.
+
+    :param knowledge_id: Id of the knowledge base.
+    :param name: New display name.
+    :param description: New description.
+    :return: JSON with status and the updated fields
+    """
+    user = __user__ or {}
+    user_id = user.get('id')
+
+    if __request__ is None or not user_id:
+        return _tool_result('failed', 'INTERNAL', '请求上下文不可用，请重试。')
+
+    knowledge_id = (knowledge_id or '').strip()
+    if not knowledge_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', 'knowledge_id 不能为空。')
+
+    new_name = name.strip() if isinstance(name, str) else None
+    new_description = description.strip() if isinstance(description, str) else None
+    if not new_name and new_description is None:
+        return _tool_result('failed', 'INVALID_ARGUMENT', '至少需要提供 name 或 description。')
+    if new_name is not None and not new_name:
+        return _tool_result('failed', 'INVALID_ARGUMENT', '知识库名称不能为空。')
+
+    try:
+        knowledge, error = await _knowledge_for_write(knowledge_id, user)
+        if error is not None:
+            return error
+
+        from open_webui.models.knowledge import KnowledgeForm, Knowledges
+        from open_webui.routers.knowledge import embed_knowledge_base_metadata
+
+        form = KnowledgeForm(
+            name=new_name if new_name else knowledge.name,
+            description=new_description if new_description is not None else knowledge.description,
+            access_grants=None,  # never touch sharing from a tool
+        )
+
+        updated = await Knowledges.update_knowledge_by_id(id=knowledge.id, form_data=form)
+        if not updated:
+            return _tool_result('failed', 'INTERNAL', '更新知识库失败，请稍后重试。')
+
+        try:
+            await embed_knowledge_base_metadata(__request__, updated.id, updated.name, updated.description)
+        except Exception as e:
+            log.warning(f'update_knowledge_base metadata embed failed: {e}')
+
+        return _tool_result(
+            'success',
+            'OK',
+            f'已更新知识库「{updated.name}」。',
+            {
+                'knowledge_id': updated.id,
+                'name': updated.name,
+                'description': updated.description,
+            },
+        )
+    except Exception as e:
+        log.exception(f'update_knowledge_base error: {e}')
+        return _tool_result('failed', 'INTERNAL', '更新知识库失败，请稍后重试。')
+
+
+async def add_text_to_knowledge(
+    knowledge_id: str,
+    filename: str,
+    content: str,
+    directory_id: Optional[str] = None,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Save a piece of text (usually Markdown) as a file inside a knowledge base.
+
+    This is how you write content into a knowledge base. Processing (chunking and
+    embedding) happens in the background, so the result is `accepted`, not
+    `completed`: tell the user the file is being processed and check its status
+    before claiming it is searchable.
+
+    :param knowledge_id: Target knowledge base id.
+    :param filename: Display filename, e.g. "会议纪要.md".
+    :param content: The text to store.
+    :param directory_id: Optional target directory inside the knowledge base.
+    :return: JSON with status accepted and the new file id
+    """
+    user = __user__ or {}
+    user_id = user.get('id')
+
+    if __request__ is None or not user_id:
+        return _tool_result('failed', 'INTERNAL', '请求上下文不可用，请重试。')
+
+    knowledge_id = (knowledge_id or '').strip()
+    if not knowledge_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', 'knowledge_id 不能为空。')
+    if not isinstance(content, str) or not content.strip():
+        return _tool_result('failed', 'INVALID_ARGUMENT', 'content 不能为空。')
+
+    filename = _safe_filename(filename, 'note.md')
+    directory_id = (directory_id or '').strip() or None
+
+    try:
+        knowledge, error = await _knowledge_for_write(knowledge_id, user)
+        if error is not None:
+            return error
+
+        from open_webui.models.files import FileForm, Files
+        from open_webui.models.knowledge import Knowledges
+
+        if directory_id:
+            directory = await Knowledges.get_directory_by_id(directory_id)
+            if directory is None or directory.knowledge_id != knowledge.id:
+                return _tool_result('failed', 'INVALID_ARGUMENT', '目标目录不属于该知识库。')
+
+        import asyncio
+        import hashlib
+        import io
+        import uuid as _uuid
+
+        file_id = str(_uuid.uuid4())
+        text = content
+        # Persist the bytes too, so the result behaves like a real upload:
+        # previewable and downloadable, not just an indexing stub.
+        from open_webui.storage.provider import Storage
+
+        _, stored_path = await asyncio.to_thread(
+            Storage.upload_file, io.BytesIO(text.encode('utf-8')), filename, {}
+        )
+        file_item = await Files.insert_new_file(
+            user_id,
+            FileForm(
+                id=file_id,
+                filename=filename,
+                path=stored_path,
+                hash=hashlib.sha256(text.encode('utf-8')).hexdigest(),
+                data={'content': text},
+                meta={
+                    'name': filename,
+                    'content_type': 'text/markdown',
+                    'size': len(text.encode('utf-8')),
+                },
+            ),
+        )
+        if not file_item:
+            return _tool_result('failed', 'INTERNAL', '保存内容失败，请稍后重试。')
+
+        from open_webui.internal.db import get_async_db_context
+        from open_webui.models.users import UserModel as _UserModel
+        from open_webui.routers.retrieval import ProcessFileForm, process_file
+
+        actor = _UserModel(**user)
+        # process_file commits through the session it is given, so it needs a
+        # real one; it manages its own short-lived sessions internally.
+        async with get_async_db_context() as session:
+            await process_file(
+                __request__,
+                ProcessFileForm(file_id=file_item.id, collection_name=knowledge.id),
+                user=actor,
+                db=session,
+            )
+
+        linked = await Knowledges.add_file_to_knowledge_by_id(
+            knowledge_id=knowledge.id,
+            file_id=file_item.id,
+            user_id=user_id,
+            directory_id=directory_id,
+            db=None,
+        )
+        if not linked:
+            return _tool_result(
+                'failed',
+                'PROCESSING_FAILED',
+                '内容已保存但没能加入知识库，请稍后重试或在知识库页面手动添加。',
+            )
+
+        return _tool_result(
+            'accepted',
+            'OK',
+            f'已把「{filename}」提交到知识库「{knowledge.name}」，正在后台建立索引；'
+            '索引完成前它还搜不到，请稍后确认状态。',
+            {
+                'knowledge_id': knowledge.id,
+                'file_id': file_item.id,
+                'filename': filename,
+                'status': 'processing',
+            },
+        )
+    except Exception as e:
+        log.exception(f'add_text_to_knowledge error: {e}')
+        return _tool_result('failed', 'PROCESSING_FAILED', '写入知识库失败，请稍后重试。')
+
+
+async def create_knowledge_directory(
+    knowledge_id: str,
+    name: str,
+    parent_id: Optional[str] = None,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Create a folder inside a knowledge base.
+
+    :param knowledge_id: Target knowledge base id.
+    :param name: Folder name.
+    :param parent_id: Optional parent folder id; omit to create at the root.
+    :return: JSON with status and the new directory id
+    """
+    user = __user__ or {}
+    user_id = user.get('id')
+
+    if __request__ is None or not user_id:
+        return _tool_result('failed', 'INTERNAL', '请求上下文不可用，请重试。')
+
+    knowledge_id = (knowledge_id or '').strip()
+    name = (name or '').strip()
+    parent_id = (parent_id or '').strip() or None
+
+    if not knowledge_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', 'knowledge_id 不能为空。')
+    if not name:
+        return _tool_result('failed', 'INVALID_ARGUMENT', '目录名称不能为空。')
+    if len(name) > 255:
+        return _tool_result('failed', 'INVALID_ARGUMENT', '目录名称过长。')
+
+    try:
+        knowledge, error = await _knowledge_for_write(knowledge_id, user)
+        if error is not None:
+            return error
+
+        from open_webui.models.knowledge import Knowledges
+
+        if parent_id:
+            parent = await Knowledges.get_directory_by_id(parent_id)
+            if parent is None or parent.knowledge_id != knowledge.id:
+                return _tool_result('failed', 'INVALID_ARGUMENT', '父目录不属于该知识库。')
+
+        existing = await Knowledges.get_all_directories(knowledge.id)
+        if any(d.parent_id == parent_id and d.name == name for d in existing):
+            return _tool_result('failed', 'INVALID_ARGUMENT', '同一层级下已存在同名目录。')
+
+        directory = await Knowledges.create_directory(
+            knowledge_id=knowledge.id,
+            name=name,
+            user_id=user_id,
+            parent_id=parent_id,
+            db=None,
+        )
+        if not directory:
+            return _tool_result('failed', 'INTERNAL', '创建目录失败，请稍后重试。')
+
+        return _tool_result(
+            'success',
+            'OK',
+            f'已在知识库「{knowledge.name}」中创建目录「{name}」。',
+            {
+                'knowledge_id': knowledge.id,
+                'directory_id': directory.id,
+                'name': directory.name,
+                'parent_id': directory.parent_id,
+            },
+        )
+    except Exception as e:
+        log.exception(f'create_knowledge_directory error: {e}')
+        return _tool_result('failed', 'INTERNAL', '创建目录失败，请稍后重试。')
+
+
+async def remove_file_from_knowledge(
+    knowledge_id: str,
+    file_id: str,
+    confirmation_token: str,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Detach a file from a knowledge base.
+
+    Requires a confirmation_token from preview_delete with resource_type
+    "knowledge_file".
+
+    :param knowledge_id: The knowledge base the file belongs to.
+    :param file_id: The file to remove.
+    :param confirmation_token: The token returned by preview_delete.
+    :return: JSON with status
+    """
+    user = __user__ or {}
+    user_id = user.get('id')
+
+    if __request__ is None or not user_id:
+        return _tool_result('failed', 'INTERNAL', '请求上下文不可用，请重试。')
+
+    knowledge_id = (knowledge_id or '').strip()
+    file_id = (file_id or '').strip()
+    if not knowledge_id or not file_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', 'knowledge_id 与 file_id 都不能为空。')
+
+    try:
+        knowledge, error = await _knowledge_for_write(knowledge_id, user)
+        if error is not None:
+            return error
+
+        from open_webui.models.files import Files
+        from open_webui.models.knowledge import Knowledges
+
+        file = await Files.get_file_by_id(file_id)
+        if file is None or not await Knowledges.has_file(knowledge.id, file_id):
+            return _tool_result('failed', 'NOT_FOUND', '这个文件不在该知识库中，或已被移除。')
+
+        resource_key = make_resource_key('knowledge_file', file_id, knowledge.id)
+        if not consume_token(confirmation_token, user_id, resource_key):
+            return _tool_result(
+                'confirmation_required',
+                'CONFIRMATION_REQUIRED',
+                '确认令牌无效或已过期。请先调用 preview_delete 重新获取，并向用户确认后再移除。',
+            )
+
+        from open_webui.models.users import UserModel as _UserModel
+        from open_webui.utils.resource_service import knowledge_cleanup
+
+        actor = _UserModel(**user)
+        await knowledge_cleanup(actor, knowledge.id, file_ids=[file_id])
+
+        expires_at = _recycle_expires_at()
+        return _tool_result(
+            'success',
+            'OK',
+            f'已从知识库「{knowledge.name}」中移除「{getattr(file, "filename", file_id)}」，'
+            f'原始文件保留至 {expires_at}。',
+            {
+                'knowledge_id': knowledge.id,
+                'file_id': file_id,
+                'recycle_expires_at': expires_at,
+            },
+        )
+    except HTTPException as e:
+        detail = e.detail
+        reason = detail.get('reason') if isinstance(detail, dict) else None
+        if reason == 'protected_resource':
+            return _tool_result(
+                'failed',
+                'PROTECTED_RESOURCE',
+                '该文件正被共享或受保护，暂时不能移除。请先在知识库页面确认影响。',
+            )
+        log.warning(f'remove_file_from_knowledge rejected: status={e.status_code} detail={detail}')
+        return _tool_result('failed', 'PROCESSING_FAILED', '移除失败，文件仍然保留，请稍后重试。')
+    except Exception as e:
+        log.exception(f'remove_file_from_knowledge error: {e}')
+        return _tool_result('failed', 'INTERNAL', '移除失败，文件仍然保留，请稍后重试。')
+
+
+async def delete_knowledge_base(
+    knowledge_id: str,
+    confirmation_token: str,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Move a knowledge base to the recycle bin.
+
+    Requires a confirmation_token from preview_delete with resource_type
+    "knowledge". Deletion is reversible for seven days.
+
+    :param knowledge_id: The knowledge base to delete.
+    :param confirmation_token: The token returned by preview_delete.
+    :return: JSON with status and recovery deadline
+    """
+    user = __user__ or {}
+    user_id = user.get('id')
+
+    if __request__ is None or not user_id:
+        return _tool_result('failed', 'INTERNAL', '请求上下文不可用，请重试。')
+
+    knowledge_id = (knowledge_id or '').strip()
+    if not knowledge_id:
+        return _tool_result('failed', 'INVALID_ARGUMENT', 'knowledge_id 不能为空。')
+
+    try:
+        knowledge, error = await _knowledge_for_write(knowledge_id, user)
+        if error is not None:
+            return error
+
+        resource_key = make_resource_key('knowledge', knowledge.id)
+        if not consume_token(confirmation_token, user_id, resource_key):
+            return _tool_result(
+                'confirmation_required',
+                'CONFIRMATION_REQUIRED',
+                '确认令牌无效或已过期。请先调用 preview_delete 重新获取，并向用户确认后再删除。',
+            )
+
+        from open_webui.models.users import UserModel as _UserModel
+        from open_webui.utils.resource_service import legacy_delete
+
+        actor = _UserModel(**user)
+        await legacy_delete(actor, 'knowledge', knowledge.id)
+
+        expires_at = _recycle_expires_at()
+        return _tool_result(
+            'success',
+            'OK',
+            f'知识库「{knowledge.name}」已移入回收站，可在 {expires_at} 前恢复。',
+            {
+                'knowledge_id': knowledge.id,
+                'name': knowledge.name,
+                'recycle_expires_at': expires_at,
+            },
+        )
+    except HTTPException as e:
+        detail = e.detail
+        reason = detail.get('reason') if isinstance(detail, dict) else None
+        if reason == 'protected_resource':
+            return _tool_result(
+                'failed',
+                'PROTECTED_RESOURCE',
+                '该知识库正被共享或受保护，暂时不能删除。请先解除共享，或前往资源管理确认影响。',
+            )
+        if reason == 'resource_operation_failed':
+            return _tool_result('failed', 'PROCESSING_FAILED', '回收操作没有完成，知识库仍然存在，请稍后重试。')
+        if e.status_code == http_status.HTTP_404_NOT_FOUND:
+            return _tool_result('failed', 'NOT_FOUND', '没有找到这个知识库，它可能已经被回收了。')
+        if e.status_code in (http_status.HTTP_403_FORBIDDEN, http_status.HTTP_401_UNAUTHORIZED):
+            return _tool_result('failed', 'PERMISSION_DENIED', '你没有删除这个知识库的权限。')
+        log.warning(f'delete_knowledge_base rejected: status={e.status_code} detail={detail}')
+        return _tool_result('failed', 'PROTECTED_RESOURCE', '这个知识库当前不允许删除。')
+    except Exception as e:
+        log.exception(f'delete_knowledge_base error: {e}')
+        return _tool_result('failed', 'INTERNAL', '删除失败，知识库仍然存在，请稍后重试。')
 
 
 # =============================================================================
