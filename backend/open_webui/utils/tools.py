@@ -745,7 +745,9 @@ async def get_builtin_tools(
             if 'note' in knowledge_types:
                 builtin_functions.append(view_note)
         else:
-            builtin_functions.extend([query_knowledge_bases, grep_knowledge_files, search_knowledge_files, view_knowledge_file])
+            builtin_functions.extend(
+                [query_knowledge_bases, grep_knowledge_files, search_knowledge_files, view_knowledge_file]
+            )
 
         if 'file' in knowledge_types or 'collection' in knowledge_types:
             builtin_functions.append(view_file)

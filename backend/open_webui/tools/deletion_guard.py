@@ -17,7 +17,6 @@ import logging
 import secrets
 import threading
 import time
-from typing import Optional
 
 log = logging.getLogger(__name__)
 
@@ -34,7 +33,7 @@ _lock = threading.Lock()
 _tokens: dict[str, dict] = {}
 
 
-def make_resource_key(resource_type: str, resource_id: str, knowledge_id: Optional[str] = None) -> str:
+def make_resource_key(resource_type: str, resource_id: str, knowledge_id: str | None = None) -> str:
     """Build the canonical key a token is bound to.
 
     The key must be stable across the preview call and the delete call, which

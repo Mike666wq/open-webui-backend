@@ -5,7 +5,6 @@ attachment, write tools stay out of note-attached chats, and the per-model
 categories keep working.
 """
 
-import time
 import unittest
 
 from fastapi import Request
