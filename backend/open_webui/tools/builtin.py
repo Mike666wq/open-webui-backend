@@ -2086,17 +2086,26 @@ async def add_text_to_knowledge(
             if directory is None or directory.knowledge_id != knowledge.id:
                 return _tool_result('failed', 'INVALID_ARGUMENT', '目标目录不属于该知识库。')
 
+        import asyncio
         import hashlib
+        import io
         import uuid as _uuid
 
         file_id = str(_uuid.uuid4())
         text = content
+        # Persist the bytes too, so the result behaves like a real upload:
+        # previewable and downloadable, not just an indexing stub.
+        from open_webui.storage.provider import Storage
+
+        _, stored_path = await asyncio.to_thread(
+            Storage.upload_file, io.BytesIO(text.encode('utf-8')), filename, {}
+        )
         file_item = await Files.insert_new_file(
             user_id,
             FileForm(
                 id=file_id,
                 filename=filename,
-                path='',
+                path=stored_path,
                 hash=hashlib.sha256(text.encode('utf-8')).hexdigest(),
                 data={'content': text},
                 meta={

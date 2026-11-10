@@ -261,6 +261,24 @@ class KnowledgeWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['data']['filename'], 'passwd.md')
         self.assertNotIn('/', result['data']['filename'])
 
+    async def test_add_text_persists_a_real_file(self):
+        """The stored bytes must exist so the result is previewable, not an index stub."""
+        knowledge = await self.make_knowledge()
+        result = parse(
+            await add_text_to_knowledge(
+                knowledge.id, 'persist.md', '# 保留内容', None,
+                __request__=self.request, __user__=self.owner,
+            )
+        )
+        self.assertEqual(result['status'], 'accepted', result)
+
+        from open_webui.models.files import Files
+
+        file = await Files.get_file_by_id(result['data']['file_id'])
+        self.assertIsNotNone(file)
+        self.assertTrue(file.path, 'agent-created knowledge file must have a storage path')
+        self.assertEqual((file.data or {}).get('content'), '# 保留内容')
+
     async def test_add_text_rejects_empty_content(self):
         knowledge = await self.make_knowledge()
         result = parse(
