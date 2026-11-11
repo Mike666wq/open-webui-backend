@@ -2120,17 +2120,39 @@ async def add_text_to_knowledge(
 
         from open_webui.internal.db import get_async_db_context
         from open_webui.models.users import UserModel as _UserModel
-        from open_webui.routers.retrieval import ProcessFileForm, process_file
+        from open_webui.utils.knowledge_indexing import index_file_in_background
 
         actor = _UserModel(**user)
-        # process_file commits through the session it is given, so it needs a
-        # real one; it manages its own short-lived sessions internally.
-        async with get_async_db_context() as session:
-            await process_file(
+        # Indexing embeds every chunk, which is a network call per chunk. The
+        # tool returns "accepted" and promises background processing, so the
+        # work must actually happen in the background: doing it inline kept
+        # the agent waiting for minutes on a long note.
+        # The task is tracked so it can be awaited on shutdown, and it is
+        # skipped entirely in the test runtime: a detached task would still be
+        # writing to the shared sqlite file when the next test cleans up.
+        from open_webui.utils import knowledge_indexing
+
+        if knowledge_indexing.INLINE_INDEXING:
+            await index_file_in_background(
                 __request__,
-                ProcessFileForm(file_id=file_item.id, collection_name=knowledge.id),
+                file_id=file_item.id,
+                collection_name=knowledge.id,
                 user=actor,
-                db=session,
+                db_factory=get_async_db_context,
+                knowledge_id=knowledge.id,
+                directory_id=directory_id,
+            )
+        else:
+            knowledge_indexing.track_indexing(
+                index_file_in_background(
+                    __request__,
+                    file_id=file_item.id,
+                    collection_name=knowledge.id,
+                    user=actor,
+                    db_factory=get_async_db_context,
+                    knowledge_id=knowledge.id,
+                    directory_id=directory_id,
+                )
             )
 
         linked = await Knowledges.add_file_to_knowledge_by_id(

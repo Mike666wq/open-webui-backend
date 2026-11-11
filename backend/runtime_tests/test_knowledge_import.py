@@ -8,6 +8,7 @@ Covers the markdown-import groundwork on the knowledge router:
   vectorization; default true keeps the legacy FILE_NOT_PROCESSED gate)
 """
 
+import asyncio
 import unittest
 import uuid
 from types import SimpleNamespace
@@ -185,15 +186,56 @@ class KnowledgeImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(placed[file.id], directories['19.Zabbix/images'])
 
     async def test_default_process_vectorizes_extracted_content(self):
+        """The file is linked at once and vectorized afterwards.
+
+        Vectorizing inline held the request open for the whole embedding run —
+        a long note took minutes and the caller simply waited. The file is
+        therefore linked first and indexed in the background; the inline switch
+        lets the test observe the indexing without racing a detached task.
+        """
         kb = await self.create_knowledge()
         file = await self.create_file()
+        from open_webui.utils import knowledge_indexing
+
         with patch.object(api, 'process_file', new=AsyncMock()) as vectorize:
-            response = await self.client.post(
-                f'/api/v1/knowledge/{kb.id}/file/add', json={'file_id': file.id}
-            )
+            with patch.object(knowledge_indexing, 'INLINE_INDEXING', True):
+                response = await self.client.post(
+                    f'/api/v1/knowledge/{kb.id}/file/add', json={'file_id': file.id}
+                )
         self.assertEqual(response.status_code, 200, response.text)
         vectorize.assert_awaited_once()
         self.assertEqual(vectorize.await_args.args[1].collection_name, kb.id)
+        self.assertTrue(await Knowledges.has_file(kb.id, file.id))
+
+    async def test_adding_a_file_answers_without_waiting_for_the_indexing(self):
+        """The request must not block on the embedding run.
+
+        The route queues the indexing instead of awaiting it, so a slow or
+        unreachable embedding backend cannot hold the caller for the whole
+        vectorization. The file is linked before the response goes out, so it
+        is visible immediately; the indexing finishes afterwards.
+        """
+        kb = await self.create_knowledge()
+        file = await self.create_file()
+        from open_webui.utils import knowledge_indexing
+
+        queued = []
+
+        async def record_index(*_args, **_kwargs):
+            queued.append(True)
+
+        with patch.object(api, 'process_file', new=record_index):
+            with patch.object(knowledge_indexing, 'INLINE_INDEXING', False):
+                with patch.object(
+                    knowledge_indexing, 'index_file_in_background', new=AsyncMock()
+                ) as queued_task:
+                    response = await self.client.post(
+                        f'/api/v1/knowledge/{kb.id}/file/add', json={'file_id': file.id}
+                    )
+        self.assertEqual(response.status_code, 200, response.text)
+        # The indexing was handed to the background, not awaited inline.
+        queued_task.assert_awaited_once()
+        # The file is linked straight away, so it is visible before indexing.
         self.assertTrue(await Knowledges.has_file(kb.id, file.id))
 
     async def test_default_process_still_gates_unextracted_files(self):
