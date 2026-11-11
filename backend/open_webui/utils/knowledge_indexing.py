@@ -108,34 +108,35 @@ async def index_file_in_background(
 
 
 async def _mark_indexed(file_id: str) -> None:
+    await _write_index_state(file_id, 'completed')
+
+
+async def _write_index_state(file_id: str, state: str, error: str | None = None) -> None:
+    """Record the indexing outcome on the file itself.
+
+    The update goes through an explicit statement: the row may have been loaded
+    in another session, and assigning to a detached JSON column would then be
+    written back nowhere.
+    """
+    from sqlalchemy import update
+
     from open_webui.internal.db import get_async_db_context
-    from open_webui.models.files import Files
+    from open_webui.models.files import File
 
     async with get_async_db_context() as db:
-        file = await Files.get_file_by_id(file_id, db=db)
-        if file is None:
+        row = await db.get(File, file_id)
+        if row is None:
             return
-        meta = dict(file.meta or {})
-        meta['status'] = 'completed'
-        file.meta = meta
-        file.status = 'completed'
+        meta = dict(row.meta or {})
+        meta['status'] = state
+        if error:
+            meta['error'] = error[:500]
+        await db.execute(update(File).where(File.id == file_id).values(meta=meta))
         await db.commit()
 
 
 async def _mark_failed(file_id: str, reason: str) -> None:
-    from open_webui.internal.db import get_async_db_context
-    from open_webui.models.files import Files
-
     try:
-        async with get_async_db_context() as db:
-            file = await Files.get_file_by_id(file_id, db=db)
-            if file is None:
-                return
-            meta = dict(file.meta or {})
-            meta['status'] = 'failed'
-            meta['error'] = reason[:500]
-            file.meta = meta
-            file.status = 'failed'
-            await db.commit()
+        await _write_index_state(file_id, 'failed', reason)
     except Exception:
         log.exception('Could not record the failed index state of %s', file_id)

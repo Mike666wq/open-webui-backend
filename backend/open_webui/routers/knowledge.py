@@ -1098,6 +1098,11 @@ async def get_knowledge_by_id(id: str, user=Depends(get_verified_user), db: Asyn
         ):
             return KnowledgeFilesResponse(
                 **knowledge.model_dump(),
+                # `knowledge.model_dump()` carries the column value of `files`,
+                # which the model never fills; the real list comes from the
+                # join. Spreading it first made the knowledge detail report an
+                # empty file list even when the knowledge base held files.
+                files=await Knowledges.get_file_metadatas_by_id(knowledge.id, db=db),
                 write_access=(
                     user.id == knowledge.user_id
                     or (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL)

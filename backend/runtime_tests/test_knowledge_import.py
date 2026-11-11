@@ -207,6 +207,26 @@ class KnowledgeImportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(vectorize.await_args.args[1].collection_name, kb.id)
         self.assertTrue(await Knowledges.has_file(kb.id, file.id))
 
+    async def test_knowledge_detail_lists_its_files(self):
+        """The knowledge detail must report the files it holds.
+
+        The route spread `knowledge.model_dump()` first, and that carries the
+        column value of `files` — which the model never fills — so the real
+        list from the join was overwritten with an empty one. The knowledge
+        base looked empty no matter how many files it had.
+        """
+        kb = await self.create_knowledge()
+        file = await self.create_file()
+        with patch.object(api, 'process_file', new=AsyncMock()):
+            added = await self.client.post(
+                f'/api/v1/knowledge/{kb.id}/file/add', json={'file_id': file.id}
+            )
+        self.assertEqual(added.status_code, 200, added.text)
+        detail = await self.client.get(f'/api/v1/knowledge/{kb.id}')
+        self.assertEqual(detail.status_code, 200, detail.text)
+        listed = [row['id'] for row in (detail.json().get('files') or [])]
+        self.assertIn(file.id, listed, detail.text)
+
     async def test_adding_a_file_answers_without_waiting_for_the_indexing(self):
         """The request must not block on the embedding run.
 
