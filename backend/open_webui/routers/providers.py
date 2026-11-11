@@ -19,6 +19,14 @@ from open_webui.models.provider_connections import (
 from open_webui.utils.apps import validate_app_url
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.provider_capabilities import ADAPTERS, provider_family, validate_model_uses
+from open_webui.utils.media_assignment import (
+    MIGRATION_RETIRED,
+    PURPOSE_ORDER,
+    apply_assignment,
+    assignment_candidates,
+    assignment_state,
+    revert_assignment,
+)
 from open_webui.utils.provider_errors import (
     ProviderRequestError,
     is_provider_error,
@@ -1367,166 +1375,60 @@ def _params_fingerprint(payload: dict) -> str:
     return hashlib.sha256(json.dumps(summary, sort_keys=True, default=str).encode()).hexdigest()
 
 
-_MEDIA_SETTINGS = {
-    'transcription': (
-        'audio.stt',
-        'engine',
-        'openai',
-        'openai.api_base_url',
-        'openai.api_key',
-        'model',
-        'provider_connection_id',
-    ),
-    'speech': (
-        'audio.tts',
-        'engine',
-        'openai',
-        'openai.api_base_url',
-        'openai.api_key',
-        'model',
-        'provider_connection_id',
-    ),
-    'image': ('image_generation', 'engine', 'openai', None, None, 'model', 'provider_connection_id'),
+# The four media purposes each have exactly one authoritative exit: a provider
+# connection plus one of its whitelisted models. `media_assignment` owns the
+# read/write/validate logic; the endpoints below are the thin HTTP skin.
+
+
+@router.get('/media-assignment')
+async def get_media_assignment(user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
+    purposes = [await assignment_state(purpose, db) for purpose in PURPOSE_ORDER]
+    candidates = {purpose: await assignment_candidates(purpose, db) for purpose in PURPOSE_ORDER}
+    return {'object': 'media_assignment', 'purposes': purposes, 'candidates': candidates}
+
+
+class MediaAssignment(BaseModel):
+    connection_id: str = ''
+    model_id: str = ''
+
+
+@router.put('/media-assignment/{purpose}')
+async def put_media_assignment(
+    purpose: str,
+    form: MediaAssignment,
+    user=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    return await apply_assignment(purpose, form.connection_id, form.model_id, user, db)
+
+
+@router.delete('/media-assignment/{purpose}')
+async def delete_media_assignment(
+    purpose: str, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
+):
+    return await revert_assignment(purpose, db)
+
+
+# The old migration guessed the target connection by comparing a full endpoint
+# against a base URL and a decrypted key byte-for-byte. It could not match a
+# shared connection at all, and when it did fire it wrote a private one that
+# every other user then got a 403 from. It is retired, not repaired: keep the
+# routes so an old client gets a clear reason instead of a silent 404.
+_MIGRATION_RETIRED_DETAIL = {
+    'code': MIGRATION_RETIRED,
+    'message': '自动迁移已退役：它按完整地址与密钥逐字比对推断目标连接，无法匹配共享连接，'
+    '且会把全实例用途写成私有连接。请改用 /providers/media-assignment 显式指派。',
 }
 
 
-async def _migration_source(purpose, db=None):
-    import hashlib
-    import json
-
-    from open_webui.models.config import Config
-
-    if purpose not in _MEDIA_SETTINGS:
-        raise HTTPException(400, 'Unsupported migration purpose')
-    prefix, engine, old_engine, url, key, model, reference = _MEDIA_SETTINGS[purpose]
-    url_key = f'{prefix}.{url}' if url else 'image_generation.openai.api_base_url'
-    secret_key = f'{prefix}.{key}' if key else 'image_generation.openai.api_key'
-
-    async def read(key):
-        if db is None or not Config.persistent_enabled_for(key):
-            return await Config.get(key)
-        row = await db.get(Config, key)
-        return row.value if row else Config.default_value(key)
-
-    values = {
-        'engine': await read(f'{prefix}.{engine}'),
-        'url': await read(url_key),
-        'key': await read(secret_key),
-        'model': await read(f'{prefix}.{model}'),
-    }
-    digest = hashlib.sha256(json.dumps({'purpose': purpose, **values}, sort_keys=True).encode()).hexdigest()
-    return values, digest
-
-
 @router.get('/media-migration')
-async def migration_preview(user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
-    from open_webui.utils.providers import decrypt_credential, provider_base_url
-
-    result = []
-    connections = (
-        await db.scalars(
-            select(ProviderConnection).where(
-                ProviderConnection.owner_id == user.id,
-                ProviderConnection.visibility == 'private',
-                ProviderConnection.is_active.is_(True),
-            )
-        )
-    ).all()
-    for purpose in _MEDIA_SETTINGS:
-        values, digest = await _migration_source(purpose, db)
-        if values['engine'] != 'openai':
-            continue
-        candidates = [
-            c.id
-            for c in connections
-            if c.auth_type == 'api_key'
-            and provider_base_url(c) == (values['url'] or '').rstrip('/')
-            and decrypt_credential(c.credential) == values['key']
-        ]
-        result.append(
-            {
-                'purpose': purpose,
-                'base_url': values['url'],
-                'model': values['model'],
-                'configured': bool(values['url'] and values['key'] and values['model']),
-                'fingerprint': digest,
-                'visibility': 'private',
-                'matching_connections': candidates,
-            }
-        )
-    return result
-
-
-class MediaMigration(BaseModel):
-    purpose: str
-    fingerprint: str = Field(min_length=64, max_length=64)
+async def migration_preview_retired(user=Depends(get_admin_user)):
+    raise HTTPException(410, _MIGRATION_RETIRED_DETAIL)
 
 
 @router.post('/media-migration')
-async def migrate_media(
-    form: MediaMigration, user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)
-):
-    import uuid
-    from urllib.parse import urlsplit
-
-    from open_webui.models.config import Config
-    from open_webui.utils.providers import stable_model_id
-
-    purpose = form.purpose
-    values, digest = await _migration_source(purpose, db)
-    # A deterministic migration marker makes retries idempotent, without exposing secrets.
-    rows = (await db.scalars(select(ProviderConnection).where(ProviderConnection.owner_id == user.id))).all()
-    existing = next((c for c in rows if (c.config or {}).get('_migration') == form.fingerprint and c.is_active), None)
-    if values['engine'] == 'provider' and existing:
-        return await public_connection(existing, db)
-    if values['engine'] != 'openai' or digest != form.fingerprint:
-        raise HTTPException(409, 'Legacy settings changed; refresh migration preview')
-    if not all(values.get(key) for key in ('url', 'key', 'model')):
-        raise HTTPException(400, 'Legacy configuration is incomplete')
-    host = urlsplit(values['url']).hostname
-    provider = 'siliconflow' if host in ('api.siliconflow.cn', 'api.siliconflow.com') else 'custom'
-    validate_app_url(values['url'])
-    from open_webui.utils.provider_capabilities import DEFAULT_ADAPTER
-
-    adapter = 'siliconflow-image' if provider == 'siliconflow' and purpose == 'image' else DEFAULT_ADAPTER[purpose]
-    connection = new_provider_connection(
-        provider_id=provider,
-        name=f'Imported {purpose}',
-        auth_type='api_key',
-        visibility='private',
-        owner_id=user.id,
-        credential=encrypt_credential(values['key']),
-        status='configured',
-        is_active=True,
-        models=[],
-        config={
-            'base_url': values['url'],
-            'model_ids': [values['model']],
-            '_registry_version': 2,
-            '_migration': form.fingerprint,
-        },
-    )
-    connection.id = str(uuid.uuid5(uuid.NAMESPACE_URL, f'media-migration:{user.id}:{form.fingerprint}'))
-    db.add(connection)
-    await seed_connection_models(
-        connection,
-        [values['model']],
-        db,
-        display_names={values['model']: values['model']},
-        uses={purpose: adapter},
-        source='manual',
-    )
-    prefix, engine, _, _, _, model, reference = _MEDIA_SETTINGS[purpose]
-    await Config.upsert(
-        {
-            f'{prefix}.{engine}': 'provider',
-            f'{prefix}.{reference}': connection.id,
-            f'{prefix}.{model}': stable_model_id(connection.id, values['model']),
-        },
-        db=db,
-    )
-    await db.commit()
-    return await public_connection(connection, db)
+async def migrate_media_retired(user=Depends(get_admin_user)):
+    raise HTTPException(410, _MIGRATION_RETIRED_DETAIL)
 
 
 @router.get('/calls/history')

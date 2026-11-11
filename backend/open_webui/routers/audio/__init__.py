@@ -59,6 +59,7 @@ from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import strict_match_mime_type
+from open_webui.utils.media_assignment import redact_nested, restore_secrets
 from open_webui.utils.providers import (
     get_media_api_connection,
     media_http_session,
@@ -327,11 +328,14 @@ class AudioConfigUpdateForm(BaseModel):
 
 @router.get('/config')
 async def get_audio_config(request: Request, user=Depends(get_admin_user)):
-    return {
+    # Keys are write-only: report which ones exist, never the value itself.
+    payload = {
         'realtime': await get_config_values(REALTIME_CONFIG_KEYS),
         'tts': await get_config_values(TTS_CONFIG_KEYS),
         'stt': await get_config_values(STT_CONFIG_KEYS),
     }
+    redacted, present = redact_nested(payload)
+    return {**redacted, 'has_api_key': present}
 
 
 @router.post('/config/update')
@@ -346,17 +350,18 @@ async def update_audio_config(request: Request, form_data: AudioConfigUpdateForm
             raise HTTPException(400, 'Local Whisper is unavailable in slim. Select an external speech-to-text engine.')
         if form_data.tts.ENGINE == 'transformers' and current.get('audio.tts.engine') != 'transformers':
             raise HTTPException(400, 'Local TTS is unavailable in slim. Select an external text-to-speech engine.')
-    await Config.upsert(
-        {
-            **(
-                config_updates(form_data.realtime.model_dump(exclude_unset=True), REALTIME_CONFIG_KEYS)
-                if form_data.realtime
-                else {}
-            ),
-            **config_updates(form_data.tts.model_dump(exclude_unset=True), TTS_CONFIG_KEYS),
-            **config_updates(form_data.stt.model_dump(exclude_unset=True), STT_CONFIG_KEYS),
-        }
-    )
+    updates = {
+        **(
+            config_updates(form_data.realtime.model_dump(exclude_unset=True), REALTIME_CONFIG_KEYS)
+            if form_data.realtime
+            else {}
+        ),
+        **config_updates(form_data.tts.model_dump(exclude_unset=True), TTS_CONFIG_KEYS),
+        **config_updates(form_data.stt.model_dump(exclude_unset=True), STT_CONFIG_KEYS),
+    }
+    # A blank key box means "keep the stored credential"; the browser never saw
+    # the real value, so writing the blank through would erase it.
+    await Config.upsert(await restore_secrets(updates, {}))
 
     if form_data.stt.ENGINE == '' and not USE_SLIM:
         request.app.state.faster_whisper_model = await asyncio.to_thread(

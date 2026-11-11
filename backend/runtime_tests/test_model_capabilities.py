@@ -271,72 +271,96 @@ class ModelCapabilitiesTests(unittest.IsolatedAsyncioTestCase):
         models = (await self.client.get('/providers/models?purpose=speech')).json()['data']
         self.assertEqual(models[0]['verification']['speech']['status'], 'failed')
 
-    async def test_migration_is_private_idempotent_and_keeps_legacy_secret(self):
+    async def test_automatic_media_migration_is_retired(self):
+        """The inferred migration is gone, and says why.
+
+        It matched a full endpoint against a base URL and a decrypted key
+        byte-for-byte, so it could never match a shared connection; when it did
+        fire it wrote a private one that every other user then got a 403 from.
+        Repairing that inference was the wrong move — the replacement is an
+        explicit assignment, and this endpoint now refuses with a reason
+        instead of returning a plausible-looking wrong answer.
+        """
+        preview = await self.client.get('/providers/media-migration')
+        self.assertEqual(preview.status_code, 410, preview.text)
+        self.assertIn('MEDIA_MIGRATION_RETIRED', preview.text)
+        self.assertIn('media-assignment', preview.text)
+
+        legacy_secret = 'legacy-synthetic'
         await Config.upsert(
             {
                 'audio.stt.engine': 'openai',
                 'audio.stt.model': 'old-asr',
                 'audio.stt.openai.api_base_url': 'https://example.com/v1',
-                'audio.stt.openai.api_key': 'legacy-synthetic',
+                'audio.stt.openai.api_key': legacy_secret,
             }
         )
-        preview = (await self.client.get('/providers/media-migration')).json()
-        row = next(r for r in preview if r['purpose'] == 'transcription')
-        self.assertNotIn('legacy-synthetic', str(preview))
-        payload = {'purpose': 'transcription', 'fingerprint': row['fingerprint']}
-        first = await self.client.post('/providers/media-migration', json=payload)
-        self.assertEqual(first.status_code, 200, first.text)
-        second = await self.client.post('/providers/media-migration', json=payload)
-        self.assertEqual(first.json()['id'], second.json()['id'])
-        self.assertEqual(first.json()['visibility'], 'private')
-        self.assertEqual(await Config.get('audio.stt.openai.api_key'), 'legacy-synthetic')
-        self.assertTrue((await Config.get('audio.stt.model')).startswith('provider:'))
-        self.assertEqual(await Config.get('audio.stt.engine'), 'provider')
+        posted = await self.client.post('/providers/media-migration', json={'purpose': 'transcription'})
+        self.assertEqual(posted.status_code, 410, posted.text)
+        self.assertNotIn(legacy_secret, posted.text)
+        # A refusal must not touch the legacy block it was asked to migrate.
+        self.assertEqual(await Config.get('audio.stt.engine'), 'openai')
+        self.assertEqual(await Config.get('audio.stt.model'), 'old-asr')
 
-    async def test_equal_legacy_media_values_migrate_by_purpose(self):
-        shared = {
-            'engine': 'openai',
-            'model': 'shared-model',
-            'openai.api_base_url': 'https://example.com/v1',
-            'openai.api_key': 'shared-synthetic-key',
-        }
+    async def test_assignment_view_reports_legacy_without_leaking_the_secret(self):
+        legacy_secret = 'legacy-synthetic-transcription'
         await Config.upsert(
             {
-                **{f'audio.stt.{key}': value for key, value in shared.items()},
-                **{f'audio.tts.{key}': value for key, value in shared.items()},
+                'audio.stt.engine': 'openai',
+                'audio.stt.model': 'old-asr',
+                'audio.stt.openai.api_base_url': 'https://example.com/v1/audio/transcriptions',
+                'audio.stt.openai.api_key': legacy_secret,
+                'audio.stt.provider_connection_id': '',
             }
         )
-        preview = {row['purpose']: row for row in (await self.client.get('/providers/media-migration')).json()}
-        migrated = {}
-        for purpose in ('transcription', 'speech'):
-            row = preview[purpose]
-            first = await self.client.post(
-                '/providers/media-migration',
-                json={'purpose': purpose, 'fingerprint': row['fingerprint']},
-            )
-            self.assertEqual(first.status_code, 200, first.text)
-            second = await self.client.post(
-                '/providers/media-migration',
-                json={'purpose': purpose, 'fingerprint': row['fingerprint']},
-            )
-            self.assertEqual(second.status_code, 200, second.text)
-            self.assertEqual(second.json()['id'], first.json()['id'])
-            migrated[purpose] = first.json()['id']
-        self.assertNotEqual(migrated['transcription'], migrated['speech'])
+        payload = await self.client.get('/providers/media-assignment')
+        self.assertEqual(payload.status_code, 200, payload.text)
+        transcription = next(r for r in payload.json()['purposes'] if r['purpose'] == 'transcription')
+        self.assertEqual(transcription['mode'], 'legacy')
+        self.assertEqual(transcription['legacy']['normalized_base_url'], 'https://example.com/v1')
+        self.assertEqual(transcription['legacy']['has_api_key'], True)
+        self.assertNotIn(legacy_secret, payload.text)
 
-    async def test_changed_legacy_configuration_rejects_stale_migration(self):
+    async def test_image_config_never_returns_the_api_key(self):
+        """A settings GET used to hand the vendor key back as plain text."""
+        from fastapi import FastAPI
+
+        from open_webui.routers import images as images_router
+        from open_webui.utils.media_assignment import CLEAR_SENTINEL
+
+        secret = 'sk-image-legacy-synthetic'
         await Config.upsert(
             {
-                'audio.tts.engine': 'openai',
-                'audio.tts.model': 'old-tts',
-                'audio.tts.openai.api_base_url': 'https://example.com/v1',
-                'audio.tts.openai.api_key': 'legacy-synthetic',
+                'image_generation.engine': 'openai',
+                'image_generation.openai.api_key': secret,
             }
         )
-        row = next(r for r in (await self.client.get('/providers/media-migration')).json() if r['purpose'] == 'speech')
-        await Config.upsert({'audio.tts.model': 'changed'})
-        result = await self.client.post(
-            '/providers/media-migration', json={'purpose': 'speech', 'fingerprint': row['fingerprint']}
-        )
-        self.assertEqual(result.status_code, 409)
-        self.assertEqual(await Config.get('audio.tts.engine'), 'openai')
+
+        # The shared app only mounts the providers router, so mount images here.
+        app = FastAPI()
+        app.include_router(images_router.router, prefix='/images')
+        app.dependency_overrides[get_admin_user] = lambda: self.owner
+        app.dependency_overrides[get_verified_user] = lambda: self.owner
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url='http://test'
+        ) as client:
+            config = await client.get('/images/config')
+            self.assertEqual(config.status_code, 200, config.text)
+            self.assertNotIn(secret, config.text)
+            body = config.json()
+            self.assertEqual(body['IMAGES_OPENAI_API_KEY'], '')
+            self.assertEqual(body['has_api_key']['IMAGES_OPENAI_API_KEY'], True)
+
+            # A blank key box means "keep the stored credential".
+            body['IMAGE_GENERATION_MODEL'] = body.get('IMAGE_GENERATION_MODEL') or 'dall-e-3'
+            body['IMAGES_OPENAI_API_KEY'] = ''
+            saved = await client.post('/images/config/update', json=body)
+            self.assertEqual(saved.status_code, 200, saved.text)
+            self.assertEqual(await Config.get('image_generation.openai.api_key'), secret)
+
+            # The sentinel is the only way to remove it.
+            body['IMAGES_OPENAI_API_KEY'] = CLEAR_SENTINEL
+            cleared = await client.post('/images/config/update', json=body)
+            self.assertEqual(cleared.status_code, 200, cleared.text)
+            self.assertEqual(await Config.get('image_generation.openai.api_key'), '')
