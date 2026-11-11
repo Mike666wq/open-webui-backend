@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "sourceRepository": "Mike666wq/open-webui-frontend",
-  "sourceCommit": "08dbb87892e50b612b31a29c1ba1ee2c09105d0e",
+  "sourceCommit": "5efd43919a8cd46301060efbed4a7b87687a9c91",
   "upstreamVersion": "0.12.2",
   "upstreamCommit": "6a18585ff4c2e5f6805f682222cfbc46dc669ef8",
-  "archiveSha256": "a2dd1ef4c5b47b119f19ac741154532b1a3ae4f89f55327571202ca5974519e3",
-  "manifestSha256": "5b339186a367bd4c8de274e43bb52b871142bbda89eea24c7c9e3a3382621fa8",
-  "archiveUrl": "https://github.com/Mike666wq/open-webui-frontend/releases/download/frontend-08dbb87892e5/open-webui-frontend.zip"
+  "archiveSha256": "7cf8913bc786c8b404d54cadaec9b11bcaae7d72739efefe1c0d84c8f5813155",
+  "manifestSha256": "8baabd24ca8ba2354d72ef5ca562e4a34a0f6a58b17e8f03ffbcee958130a7b7",
+  "archiveUrl": "https://github.com/Mike666wq/open-webui-frontend/releases/download/frontend-5efd43919a8c/open-webui-frontend.zip"
 }
