@@ -849,18 +849,26 @@ class UsersTable:
     async def delete_user_by_id(self, id: str, db: AsyncSession | None = None) -> bool:
         from open_webui.models.chats import Chats
         from open_webui.models.groups import Groups
+        from open_webui.utils.resource_visibility import including_recycled
 
         # Remove User from Groups
         await Groups.remove_user_from_all_groups(id)
 
-        # Delete User Chats
-        async with get_async_db_context(db) as session:
-            deleted_chats = await Chats.delete_chats_by_user_id(id, db=session)
-            if not deleted_chats:
-                return False  # chats deletion failed
-            await session.execute(delete(User).where(User.id == id))
-            await session.commit()
-            return True
+        # Delete the account together with everything it owns. This must run
+        # inside the maintenance context: the visibility guard rejects direct
+        # DELETEs on chat/note/knowledge because those are supposed to go
+        # through the recycle bin, and deleting an account is not a
+        # recycle-bin operation — the content goes with the account. Swallowing
+        # that guard's 409 turned every user deletion into an unexplained 500
+        # while the account stayed in the database.
+        with including_recycled():
+            async with get_async_db_context(db) as session:
+                deleted_chats = await Chats.delete_chats_by_user_id(id, db=session)
+                if not deleted_chats:
+                    return False  # chats deletion failed
+                await session.execute(delete(User).where(User.id == id))
+                await session.commit()
+                return True
 
     async def get_user_api_key_by_id(self, id: str, db: AsyncSession | None = None) -> str | None:
         async with get_async_db_context(db) as session:
