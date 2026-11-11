@@ -149,6 +149,10 @@ async def legacy_values(purpose: str) -> dict:
 
 def legacy_state(purpose: str, values: dict) -> dict:
     base, normalized = normalize_base_url(values['url'], purpose)
+    # "Fields are filled in" is not the same as "an engine is selected".
+    # `audio.tts.engine` empty means the speech endpoint answers 404 outright,
+    # so the block must not be reported as a configured legacy setup.
+    has_engine = bool(values['engine'])
     return {
         'engine': values['engine'],
         'base_url': values['url'],
@@ -156,6 +160,7 @@ def legacy_state(purpose: str, values: dict) -> dict:
         'model': values['model'],
         'has_api_key': values['has_api_key'],
         'configured': bool(values['url'] and values['has_api_key'] and values['model']),
+        'has_engine': has_engine,
         'normalized': normalized,
     }
 
@@ -168,7 +173,9 @@ def _mode(purpose: str, values: dict) -> str:
         # `audio.realtime` ships a default base URL, so a non-empty URL says
         # nothing about whether the feature is on. The flag decides.
         return 'legacy' if values.get('enabled') else 'unconfigured'
-    if values['engine'] or values['url'] or values['has_api_key']:
+    # Without an engine the legacy endpoint answers 404, so this is not a
+    # legacy setup at all — the feature was never configured.
+    if values['engine']:
         return 'legacy'
     return 'unconfigured'
 
@@ -210,7 +217,15 @@ async def assignment_state(purpose: str, db: AsyncSession | None = None) -> dict
         'adapter': '',
         'legacy': {
             key: legacy[key]
-            for key in ('engine', 'base_url', 'normalized_base_url', 'model', 'has_api_key', 'configured')
+            for key in (
+                'engine',
+                'base_url',
+                'normalized_base_url',
+                'model',
+                'has_api_key',
+                'configured',
+                'has_engine',
+            )
         },
         'ready': False,
         'reasons': [],
@@ -242,7 +257,20 @@ async def assignment_state(purpose: str, db: AsyncSession | None = None) -> dict
         return state
 
     if mode == 'legacy':
-        state['ready'] = legacy['configured']
+        # A legacy block is a direct connection to the vendor, outside any
+        # provider connection: nothing here has been resolved, checked or
+        # tested. "The fields are filled in" is not "this works" — production
+        # carried a legacy image block whose every field was set while the
+        # vendor answered 400 because the default size was below its floor.
+        # Reporting it as ready would be a green light over a broken feature.
+        state['ready'] = False
+        state['reasons'].append(
+            {
+                'code': 'MEDIA_LEGACY_UNVERIFIED',
+                'message': '当前走旧配置直连，尚未验证连通性：字段齐全不代表调用可用。'
+                '建议指派到服务商连接，并用「测试」确认后再依赖它。',
+            }
+        )
         if legacy['normalized']:
             state['reasons'].append(
                 {

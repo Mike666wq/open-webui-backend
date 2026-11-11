@@ -278,6 +278,31 @@ def enforce_image_limits(service: MediaService, payload: dict) -> None:
         if isinstance(multiple, int) and value % multiple:
             raise HTTPException(400, f'图片尺寸必须是 {multiple} 的倍数')
 
+    # Some vendors size by area rather than by edge: MiniMax-H3-Image accepts
+    # 655,360 to 20,000,000 pixels and refuses anything else without
+    # rescaling. Refusing here says why, instead of letting the request fail
+    # upstream with a message the caller never sees.
+    if isinstance(width, int) and isinstance(height, int):
+        area = width * height
+        min_area = limits.get('min_area')
+        max_area = limits.get('max_area')
+        if isinstance(min_area, int) and area < min_area:
+            raise HTTPException(
+                400, f'图片面积不能小于 {min_area} 像素（当前 {width}x{height} = {area}）'
+            )
+        if isinstance(max_area, int) and area > max_area:
+            raise HTTPException(
+                400, f'图片面积不能大于 {max_area} 像素（当前 {width}x{height} = {area}）'
+            )
+        longest, shortest = max(width, height), min(width, height)
+        if shortest:
+            ratio = longest / shortest
+            max_ratio = limits.get('max_aspect_ratio')
+            if isinstance(max_ratio, (int, float)) and ratio > max_ratio:
+                raise HTTPException(
+                    400, f'图片宽高比不能超过 {max_ratio}:1（当前 {width}x{height}）'
+                )
+
 
 def _media_error(detail: str, service: MediaService, *, reason: str = 'upstream_failure'):
     """Build an upstream media failure that keeps the error taxonomy."""

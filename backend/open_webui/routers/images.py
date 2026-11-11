@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 
 import aiofiles
 import aiohttp
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from open_webui.config import (
@@ -68,6 +70,11 @@ IMAGE_FILE_EXTENSIONS = {
     'image/png': '.png',
     'image/webp': '.webp',
 }
+
+# The smallest output area image vendors accept in practice. Below it the
+# request is rejected upstream, and that rejection mentions a range this
+# screen has no way to show.
+MIN_IMAGE_AREA = 655360
 
 IMAGE_CONFIG_KEYS = {
     'ENABLE_IMAGE_GENERATION': 'image_generation.enable',
@@ -318,6 +325,46 @@ class ImagesConfig(BaseModel):
     # Keys are write-only. This map says which ones are already stored, so the
     # settings screen can label the field without ever receiving the secret.
     has_api_key: dict[str, bool] = {}
+
+
+async def upstream_media_error(response) -> HTTPException:
+    """Turn an upstream media failure into an error that says what went wrong.
+
+    The vendor body is the only place the reason lives. MiniMax, for one,
+    answers a size below its floor with a sentence naming the allowed range;
+    dropping it turned that into an unactionable "Bad Request".
+    """
+    try:
+        raw = await response.text()
+    except Exception:
+        raw = ''
+    detail = ''
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            for key in ('error', 'message', 'detail', 'base_resp'):
+                value = parsed.get(key)
+                if isinstance(value, dict):
+                    nested = value.get('message') or value.get('msg')
+                    if isinstance(nested, str) and nested.strip():
+                        detail = nested.strip()
+                        break
+                    code = value.get('code')
+                    if code:
+                        detail = str(code)
+                        break
+                elif isinstance(value, str) and value.strip():
+                    detail = value.strip()
+                    break
+        if not detail:
+            detail = raw.strip()[:500]
+    return HTTPException(
+        response.status,
+        detail or f'Image provider rejected the request (HTTP {response.status})',
+    )
 
 
 @router.get('/config', response_model=ImagesConfig)
@@ -784,6 +831,24 @@ async def image_generations(
             request, resolved_image, media_connection, api_key, form_data, metadata, user
         )
 
+    # A legacy block talks to the vendor directly, so a provider connection's
+    # service declaration does not apply and its size rules are unknown here.
+    # The one rule worth enforcing is the common floor: a size under a quarter
+    # megapixel is below what image vendors accept, and the upstream rejection
+    # explains it in terms this screen cannot show.
+    try:
+        legacy_width, legacy_height = await _parse_image_size(form_data.size or image_config.IMAGE_SIZE)
+    except HTTPException:
+        legacy_width, legacy_height = None, None
+    if legacy_width and legacy_height:
+        legacy_area = legacy_width * legacy_height
+        if legacy_area < MIN_IMAGE_AREA:
+            raise HTTPException(
+                400,
+                f'图片面积不能小于 {MIN_IMAGE_AREA} 像素'
+                f'（当前 {legacy_width}x{legacy_height} = {legacy_area}）',
+            )
+
     try:
         if image_config.IMAGE_GENERATION_ENGINE == 'openai':
             headers = {
@@ -811,14 +876,13 @@ async def image_generations(
                     if (form_data.size or image_config.IMAGE_SIZE)
                     else {}
                 ),
-                **(
-                    {}
-                    if re.match(
-                        IMAGE_URL_RESPONSE_MODELS_REGEX_PATTERN,
-                        model,
-                    )
-                    else {'response_format': 'b64_json'}
-                ),
+                # Do not force `b64_json`. A vendor that documents `url` as its
+                # default (MiniMax-H3-Image does) may cap the total area it
+                # will encode as base64, and forcing that format turns a
+                # request the vendor would happily serve into a rejection.
+                # An explicit `response_format` in the saved parameters still
+                # wins, because those are merged afterwards.
+                **({} if not image_config.IMAGES_OPENAI_API_PARAMS else image_config.IMAGES_OPENAI_API_PARAMS),
                 **({} if not image_config.IMAGES_OPENAI_API_PARAMS else image_config.IMAGES_OPENAI_API_PARAMS),
             }
 
@@ -840,7 +904,13 @@ async def image_generations(
             ):
                 if media_connection and not 200 <= r.status < 300:
                     raise provider_http_error(r.status)
-                r.raise_for_status()
+                if not 200 <= r.status < 300:
+                    # `raise_for_status()` drops the upstream body, so a vendor
+                    # that explains itself ("area must be between 655360 and
+                    # 20000000 pixels") reaches the administrator as a bare
+                    # "[ERROR: Bad Request]" and nothing can be diagnosed from
+                    # it. Pass the vendor's own explanation through instead.
+                    raise await upstream_media_error(r)
                 res = await r.json(content_type=None)
 
             images = []
@@ -1205,14 +1275,8 @@ async def image_edits(
                 **({'n': form_data.n} if form_data.n else {}),
                 **({'size': size} if size else {}),
                 **({'background': form_data.background} if form_data.background else {}),
-                **(
-                    {}
-                    if re.match(
-                        IMAGE_URL_RESPONSE_MODELS_REGEX_PATTERN,
-                        model,
-                    )
-                    else {'response_format': 'b64_json'}
-                ),
+                # Same reasoning as the generation path: let the vendor pick
+                # its own default response format.
             }
 
             files = []
