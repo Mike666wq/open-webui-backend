@@ -40,6 +40,7 @@ from open_webui.utils.images.comfyui import (
     comfyui_upload_image,
 )
 from open_webui.utils.json_codec import JSONCodec
+from open_webui.utils.media_assignment import normalize_base_url, redact_secrets, restore_secrets
 from open_webui.utils.providers import (
     get_media_api_connection,
     media_http_session,
@@ -314,10 +315,15 @@ class ImagesConfig(BaseModel):
     IMAGES_EDIT_COMFYUI_WORKFLOW: str
     IMAGES_EDIT_COMFYUI_WORKFLOW_NODES: list[dict]
 
+    # Keys are write-only. This map says which ones are already stored, so the
+    # settings screen can label the field without ever receiving the secret.
+    has_api_key: dict[str, bool] = {}
+
 
 @router.get('/config', response_model=ImagesConfig)
 async def get_config(request: Request, user=Depends(get_admin_user)):
-    return await get_config_values(IMAGE_CONFIG_KEYS)
+    values, present = redact_secrets(await get_config_values(IMAGE_CONFIG_KEYS))
+    return {**values, 'has_api_key': present}
 
 
 @router.post('/config/update')
@@ -351,7 +357,12 @@ async def update_config(request: Request, form_data: ImagesConfig, user=Depends(
             detail=ERROR_MESSAGES.INCORRECT_FORMAT('  (e.g., 50).'),
         )
 
-    updates = config_updates(form_data.model_dump(), IMAGE_CONFIG_KEYS)
+    payload = form_data.model_dump()
+    payload.pop('has_api_key', None)
+    updates = config_updates(payload, IMAGE_CONFIG_KEYS)
+    # A blank key field means "keep what is stored"; the browser never received
+    # the real value, so treating blank as delete would erase it on every save.
+    updates = await restore_secrets(updates, {})
     updates['image_generation.comfyui.base_url'] = form_data.COMFYUI_BASE_URL.strip('/')
     updates['images.edit.comfyui.base_url'] = form_data.IMAGES_EDIT_COMFYUI_BASE_URL.strip('/')
     await Config.upsert(updates)
@@ -783,7 +794,11 @@ async def image_generations(
             if ENABLE_FORWARD_USER_INFO_HEADERS:
                 headers = include_user_info_headers(headers, user)
 
-            url = f'{image_config.IMAGES_OPENAI_API_BASE_URL}/images/generations'
+            # A legacy block may store the complete endpoint. Appending the
+            # registered path again produced `/images/generations/images/generations`,
+            # which is what production was actually calling.
+            openai_base, _ = normalize_base_url(image_config.IMAGES_OPENAI_API_BASE_URL, 'image')
+            url = f'{openai_base}/images/generations'
             if image_config.IMAGES_OPENAI_API_VERSION:
                 url = f'{url}?api-version={image_config.IMAGES_OPENAI_API_VERSION}'
 
