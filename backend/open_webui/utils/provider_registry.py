@@ -216,21 +216,29 @@ _MINIMAX_IMAGE = _service(
             'display_name': model,
             'uses': {'image': 'minimax-image'},
         }
-        for model in ('image-01', 'image-01-live')
+        for model in ('MiniMax-H3-Image', 'MiniMax-H3-Image-Highspeed')
     ),
+    # MiniMax-H3-Image sizes by area, not by edge: the output must be between
+    # 655,360 and 20,000,000 pixels with an aspect ratio between 1:3 and 3:1,
+    # and the vendor refuses anything else without rescaling. The earlier
+    # image-01 limits (512..2048 per edge) came from a previous model and
+    # admitted sizes this one rejects.
     limits={
-        'max_prompt_chars': 1500,
-        'min_dimension': 512,
-        'max_dimension': 2048,
-        'dimension_multiple': 8,
-        'max_images': 9,
+        'max_prompt_chars': 32000,
+        'min_area': 655360,
+        'max_area': 20000000,
+        'min_aspect_ratio': 3,
+        'max_aspect_ratio': 3,
+        'max_images': 10,
     },
     options={
         'response_format': ['base64', 'url'],
-        'aspect_ratio': ['1:1', '16:9', '4:3', '3:2', '2:3', '3:4', '9:16', '21:9'],
-        'n': [1, 2, 3, 4, 5, 6, 7, 8, 9],
+        'aspect_ratio': ['1:1', '16:9', '4:3', '3:2', '2:3', '3:4', '9:16', '21:9', '3:1', '1:3'],
+        'area': ['1K', '2K', '4K'],
+        'n': [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
     },
-    notes='本期仅文生图，不支持图生图或图片编辑；国际区只登记已确认的 image-01。',
+    notes='MiniMax-H3-Image 文生图：面积须在 655,360~20,000,000 像素之间，宽高比 1:3~3:1；'
+    '高速版参数相同，模型名改为 MiniMax-H3-Image-Highspeed。',
 )
 
 TEMPLATES = [

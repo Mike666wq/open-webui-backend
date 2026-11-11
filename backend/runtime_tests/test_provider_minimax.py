@@ -255,12 +255,36 @@ class MiniMaxAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['images'][0]['url'], 'https://cdn.example/a.png')
 
     async def test_image_refuses_an_unsupported_size_before_the_request(self):
+        # MiniMax-H3-Image sizes by area: 655,360 to 20,000,000 pixels, with an
+        # aspect ratio between 1:3 and 3:1. The previous image-01 rules (512..2048
+        # per edge) admitted sizes this model rejects, so production kept
+        # sending 512x512 and the vendor answered 400.
         service = self.service('image', 'minimax-image')
         with self.assertRaises(HTTPException) as error:
             provider_media.enforce_image_limits(service, {'prompt': 'x', 'n': 1, 'width': 100, 'height': 100})
         self.assertEqual(error.exception.status_code, 400)
+        self.assertIn('面积', error.exception.detail)
+
+        # 512x512 is 262,144 pixels — under the floor, and exactly what
+        # production was configured with.
         with self.assertRaises(HTTPException) as error:
-            provider_media.enforce_image_limits(service, {'prompt': 'x' * 2000, 'n': 1})
+            provider_media.enforce_image_limits(service, {'prompt': 'x', 'n': 1, 'width': 512, 'height': 512})
+        self.assertEqual(error.exception.status_code, 400)
+
+        # 1024x1024 is 1,048,576 pixels and inside the accepted range.
+        provider_media.enforce_image_limits(service, {'prompt': 'x', 'n': 1, 'width': 1024, 'height': 1024})
+
+        # Too large, and beyond the aspect ratio the vendor accepts.
+        with self.assertRaises(HTTPException) as error:
+            provider_media.enforce_image_limits(service, {'prompt': 'x', 'n': 1, 'width': 8192, 'height': 8192})
+        self.assertEqual(error.exception.status_code, 400)
+        with self.assertRaises(HTTPException) as error:
+            provider_media.enforce_image_limits(service, {'prompt': 'x', 'n': 1, 'width': 4096, 'height': 256})
+        self.assertEqual(error.exception.status_code, 400)
+
+        # The prompt limit follows the current model: 32,000 characters.
+        with self.assertRaises(HTTPException) as error:
+            provider_media.enforce_image_limits(service, {'prompt': 'x' * 33000, 'n': 1})
         self.assertEqual(error.exception.status_code, 400)
 
     async def test_image_editing_is_not_implied_by_generation(self):
