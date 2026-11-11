@@ -117,6 +117,45 @@ async def get_image_config() -> SimpleNamespace:
     return SimpleNamespace(**await get_config_values(IMAGE_CONFIG_KEYS))
 
 
+async def explain_media_access_failure(connection_id: str, user, error: HTTPException) -> HTTPException:
+    """Turn a bare media 404 into something an administrator can act on.
+
+    The generic media resolver answers 404 for anything the caller cannot see —
+    the right contract for chat, where an inaccessible model must stay
+    invisible. Image and audio are different: an administrator configures one
+    connection and everyone holding the feature permission then calls it, so the
+    common cause is simply a connection left `private`.
+
+    "Provider connection not found" sends the administrator hunting for a
+    connection that plainly exists in their own list. Keep the resolver
+    contract and explain the reason at the feature boundary instead.
+    """
+    if not connection_id or getattr(error, 'status_code', None) != 404:
+        return error
+    try:
+        from open_webui.internal.db import get_async_db
+        from open_webui.models.provider_connections import ProviderConnection
+        from open_webui.utils.providers import can_access_connection
+
+        async with get_async_db() as db:
+            connection = await db.get(ProviderConnection, connection_id)
+            if connection is None:
+                return error
+            accessible = await can_access_connection(connection, user, db)
+    except Exception:
+        return error
+
+    if accessible:
+        return error
+    if connection.visibility != 'shared':
+        return HTTPException(
+            403,
+            'The provider connection used by this feature is private to its owner. '
+            'Share the connection (or configure a shared one) so other users can use it.',
+        )
+    return HTTPException(403, 'You do not have access to the provider connection used by this feature.')
+
+
 def config_updates(data: dict, key_map: dict[str, str]) -> dict:
     return {key_map[field]: value for field, value in data.items() if field in key_map}
 
@@ -449,6 +488,18 @@ async def get_models(request: Request, user=Depends(get_verified_user)):
                     models,
                 )
             )
+    except HTTPException as exc:
+        # An authorization problem must reach the caller unchanged. Wrapping it
+        # in a generic 400 is how "the connection is private" turned into
+        # "Failed to retrieve image generation models".
+        image_config = await get_image_config()
+        raise await explain_media_access_failure(
+            image_config.IMAGES_PROVIDER_CONNECTION_ID
+            if image_config.IMAGE_GENERATION_ENGINE == 'provider'
+            else '',
+            user,
+            exc,
+        ) from None
     except Exception as e:
         log.error(
             f'Failed to list image generation models: {str(e) or type(e).__name__}',
@@ -600,7 +651,17 @@ async def generate_images(request: Request, form_data: CreateImageForm, user=Dep
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
-    result = await image_generations(request, form_data, user=user)
+    image_config = await get_image_config()
+    try:
+        result = await image_generations(request, form_data, user=user)
+    except HTTPException as exc:
+        raise await explain_media_access_failure(
+            image_config.IMAGES_PROVIDER_CONNECTION_ID
+            if image_config.IMAGE_GENERATION_ENGINE == 'provider'
+            else '',
+            user,
+            exc,
+        ) from None
     await publish_event(
         request,
         EVENTS.IMAGE_GENERATED,
