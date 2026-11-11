@@ -94,6 +94,20 @@ async def _provider_db_scope(db: AsyncSession | None):
             yield session
 
 
+async def refresh_connection_config(connection: ProviderConnection, db: AsyncSession | None) -> None:
+    """Reload the connection config from the committed row before rewriting it.
+
+    `provider_connection.config` is a single JSON blob shared by several
+    independently scheduled writers: the per-user catalog snapshot, the enabled
+    map, the manual purpose overrides and the model-test results. Each of them
+    rewrites the whole blob, so merging from a copy that predates another
+    writer's commit destroys that writer's keys — a model test result could
+    vanish because a background catalog refresh started a moment earlier.
+    """
+    if isinstance(db, AsyncSession):
+        await db.refresh(connection)
+
+
 @dataclass
 class ResolvedProviderModel:
     connection: ProviderConnection
@@ -153,6 +167,12 @@ async def write_snapshot(
     if registry_migrated(connection):
         await store_catalog_snapshot(connection, user_id, entry, db)
         return
+    # The legacy snapshot shares its storage — one JSON blob — with the
+    # per-model test results. A background catalog refresh can be in flight
+    # while a model test finishes, and a merge built from an older in-memory
+    # copy silently discards whatever the other writer just committed. Base the
+    # merge on the committed row instead.
+    await refresh_connection_config(connection, db)
     config = dict(connection.config or {})
     cache = dict(config.get('_models_by_user') or {})
     cache[user_id] = entry
@@ -1193,6 +1213,7 @@ async def visible_connection_models(connection: ProviderConnection, user, db: As
         and entry.get('credential_hash') == legacy_hash
         and isinstance(entry.get('models'), list)
     ):
+        await refresh_connection_config(connection, db)
         config = dict(connection.config or {})
         enabled = dict(config.get('_model_enabled', {}))
         for model in entry['models']:
@@ -1214,6 +1235,7 @@ async def visible_connection_models(connection: ProviderConnection, user, db: As
     # Upgrade existing owner catalogs without a network dependency. Other users
     # never inherit an owner's per-user discovery snapshot.
     if connection.owner_id == user.id and connection.models and not entry:
+        await refresh_connection_config(connection, db)
         config = dict(connection.config or {})
         config['_models_by_user'] = {
             **config.get('_models_by_user', {}),
