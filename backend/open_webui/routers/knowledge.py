@@ -10,7 +10,7 @@ import zipfile
 from typing import List, Optional
 from urllib.parse import quote, unquote
 
-from fastapi import APIRouter, Depends, File as FastAPIFile, Form, HTTPException, Query, Request, UploadFile, status
+from fastapi import BackgroundTasks, APIRouter, Depends, File as FastAPIFile, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from open_webui.config import (
     BYPASS_ADMIN_ACCESS_CONTROL,
@@ -1098,6 +1098,11 @@ async def get_knowledge_by_id(id: str, user=Depends(get_verified_user), db: Asyn
         ):
             return KnowledgeFilesResponse(
                 **knowledge.model_dump(),
+                # `knowledge.model_dump()` carries the column value of `files`,
+                # which the model never fills; the real list comes from the
+                # join. Spreading it first made the knowledge detail report an
+                # empty file list even when the knowledge base held files.
+                files=await Knowledges.get_file_metadatas_by_id(knowledge.id, db=db),
                 write_access=(
                     user.id == knowledge.user_id
                     or (user.role == 'admin' and BYPASS_ADMIN_ACCESS_CONTROL)
@@ -1417,6 +1422,7 @@ async def add_file_to_knowledge_by_id(
     form_data: KnowledgeFileIdForm,
     user=Depends(get_verified_user),
     db: AsyncSession = Depends(get_async_session),
+    background_tasks: BackgroundTasks = None,
 ):
     knowledge = await Knowledges.get_knowledge_by_id(id=id, db=db)
     if not knowledge:
@@ -1473,23 +1479,62 @@ async def add_file_to_knowledge_by_id(
         )
 
     try:
-        # Add content to the vector database (skipped for attach-only placement)
         if form_data.process:
-            await process_file(
-                request,
-                ProcessFileForm(file_id=form_data.file_id, collection_name=id),
-                user=user,
+            # Vectorizing means one embedding call per chunk. Doing it inline
+            # held the request open for the whole run — a long note took
+            # minutes — so the file is linked first and indexed afterwards.
+            from open_webui.internal.db import get_async_db_context
+            from open_webui.utils.knowledge_indexing import index_file_in_background
+
+            await Knowledges.add_file_to_knowledge_by_id(
+                knowledge_id=id,
+                file_id=form_data.file_id,
+                user_id=user.id,
+                directory_id=form_data.directory_id,
                 db=db,
             )
+            from open_webui.utils import knowledge_indexing
 
-        # Add file to knowledge base
-        await Knowledges.add_file_to_knowledge_by_id(
-            knowledge_id=id,
-            file_id=form_data.file_id,
-            user_id=user.id,
-            directory_id=form_data.directory_id,
-            db=db,
-        )
+            if knowledge_indexing.INLINE_INDEXING:
+                # Tests and one-off maintenance runs the indexing inline.
+                await knowledge_indexing.index_file_in_background(
+                    request,
+                    file_id=form_data.file_id,
+                    collection_name=id,
+                    user=user,
+                    db_factory=get_async_db_context,
+                    indexer=process_file,
+                )
+            elif background_tasks is not None:
+                background_tasks.add_task(
+                    knowledge_indexing.index_file_in_background,
+                    request,
+                    file_id=form_data.file_id,
+                    collection_name=id,
+                    user=user,
+                    db_factory=get_async_db_context,
+                    indexer=process_file,
+                )
+            else:
+                # Called directly rather than through HTTP: no background
+                # runner, so the indexing happens here.
+                await knowledge_indexing.index_file_in_background(
+                    request,
+                    file_id=form_data.file_id,
+                    collection_name=id,
+                    user=user,
+                    db_factory=get_async_db_context,
+                    indexer=process_file,
+                )
+        else:
+            # Attach-only placement never reads the extracted text.
+            await Knowledges.add_file_to_knowledge_by_id(
+                knowledge_id=id,
+                file_id=form_data.file_id,
+                user_id=user.id,
+                directory_id=form_data.directory_id,
+                db=db,
+            )
     except Exception as e:
         log.debug(e)
         raise HTTPException(
