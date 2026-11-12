@@ -669,3 +669,16 @@ provider_media.call_media_service(service, *, model, credential, input) -> norma
   Base URL 和完整 URL 均不得重复追加路径；保存配置、列目录和查音色不触发推理。
 - `POST /connections/{id}/models` 可选 `source` 为 `provider`（默认）、`manual` 或 `preset`；
   `preset` 只接受该用途的官方声明中的模型和适配器，保留来源，不影响旧请求。
+
+---
+
+## 19. 自定义服务商选项、手动模型录入与延迟指标回显（P-014）
+
+- **自定义服务商与请求头**：`custom` 模板正式规范为「自定义提供商 (OpenAI 兼容)」，支持自由配置 Chat、语音转写、语音合成与生图端点。连接配置 `config.custom_headers` 支持传入自定义 Header 映射（如 `HTTP-Referer`、`X-Title` 等），在模型列表拉取、聊天对话与媒体服务出站请求中自动注入。
+- **手动添加模型（解耦上游目录依赖）**：
+  - 在添加连接向导（`AddProviderDialog`）的模型选择步骤中，无论上游 `/models` 是否响应，支持手动输入模型 ID 并加入所选白名单提交。
+  - 在服务商模型管理面板（`ProviderModelsPanel`）中，提供「手动添加模型」表单，输入 `upstream_id`、可选显示名称并选择用途（`uses`），以 `source='manual'` 直接加入白名单。
+- **模型测试参数与延迟指标持久化**：
+  - 聊天测试支持通过 `prompt` 传入自定义测试消息（默认为 `Reply OK.`）。
+  - 测试观测到的 `timings`（`first_output_ms` 首字延迟 / TTFT、`upstream_headers_ms` 响应头延迟、`upstream_total_ms` 上游总耗时）与 Token 用量由 `_save_model_test` 持久化写入 `ProviderModel.verification`。
+  - 模型列表卡片直观显示每个用途的测试状态及响应延迟（如 `✓ 128 ms` 或 `TTFT: 45ms · 128ms`）；测试弹窗以结构化网格展示关键性能指标、Token 生成速率及用量明细，并自动回显历史测试数据。
