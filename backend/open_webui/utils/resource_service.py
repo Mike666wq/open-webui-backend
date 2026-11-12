@@ -175,6 +175,11 @@ async def references(db, file_id, exclude=()):
                 refs.add((kind, values[1]))
     return sorted(refs)
 
+# How long an unfinished generation may sit untouched before it stops counting
+# as "in progress". A streaming reply updates its row continuously, so this
+# only ever expires work that is already dead.
+STALE_GENERATION_SECONDS = 10 * 60
+
 
 async def protections(db, row, kind, options):
     reasons = []
@@ -186,9 +191,30 @@ async def protections(db, row, kind, options):
     if kind == 'chat':
         from open_webui.models.chat_messages import ChatMessage
         from open_webui.tasks import item_tasks
-        if await db.scalar(select(ChatMessage.id).where(
-            ChatMessage.chat_id == row.id, ChatMessage.done.is_(False),
-        ).limit(1)) or row.timer_at or item_tasks.get(row.id):
+
+        # A live generation refreshes `updated_at` on every chunk, so an
+        # unfinished row that has not moved for minutes is a tombstone left by
+        # an interrupted stream, not work in progress. Without this bound a
+        # single stale row blocked the chat's deletion forever — the preview
+        # kept answering "generation active" for chats that had not generated
+        # anything in days.
+        stale_before = int(time.time()) - STALE_GENERATION_SECONDS
+        generating = await db.scalar(
+            select(ChatMessage.id)
+            .where(
+                ChatMessage.chat_id == row.id,
+                # Assistant messages are the ones that represent generation;
+                # other roles never carry an unfinished stream.
+                ChatMessage.role == 'assistant',
+                ChatMessage.done.is_(False),
+                ChatMessage.updated_at >= stale_before,
+            )
+            .limit(1)
+        )
+        # A timer is live while it is still due (or only just overdue); a due
+        # time far in the past is a claim that never happened.
+        timer_live = bool(row.timer_at) and row.timer_at > (time.time_ns() - STALE_GENERATION_SECONDS * 1_000_000_000)
+        if generating or timer_live or item_tasks.get(row.id):
             reasons.append('active_generation')
         if row.pinned and not options.get('include_pinned'):
             reasons.append('pinned')
