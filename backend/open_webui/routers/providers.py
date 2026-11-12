@@ -1045,11 +1045,12 @@ async def _test_model(
         from open_webui.utils.providers import catalog_error
 
         outcome, error, usage = 'passed', None, None
+        chat_content = form.prompt.strip() if form.prompt and form.prompt.strip() else 'Reply OK.'
         try:
             async with asyncio.timeout(120):
                 result = await provider_chat_completion(
                     model_id,
-                    {'messages': [{'role': 'user', 'content': 'Reply OK.'}], 'stream': False, 'max_tokens': 32},
+                    {'messages': [{'role': 'user', 'content': chat_content}], 'stream': False, 'max_tokens': 32},
                     user,
                     db,
                     allow_disabled=True,
@@ -1059,8 +1060,11 @@ async def _test_model(
             usage = result.get('usage') if isinstance(result, dict) else None
         except Exception as exc:
             outcome, error = 'failed', catalog_error(exc)
+        timings = {'upstream_total_ms': int((time.monotonic() - started) * 1000)}
+        test_usage = dict(usage or {})
+        test_usage['_timings'] = timings
         return await _save_model_test(
-            connection, resolved.model_metadata, before, form.purpose, outcome, error, started, user, db, usage
+            connection, resolved.model_metadata, before, form.purpose, outcome, error, started, user, db, test_usage
         )
     connection, key = await get_media_api_connection(connection_id, user, db)
     outcome, error, usage = 'passed', None, None
@@ -1082,6 +1086,10 @@ async def _test_model(
         from open_webui.utils.providers import catalog_error
 
         outcome, error = 'failed', catalog_error(exc)
+    elapsed = int((time.monotonic() - started) * 1000)
+    timings = {'upstream_total_ms': elapsed}
+    test_usage = dict(usage or {})
+    test_usage['_timings'] = timings
     response = await _save_model_test(
         connection,
         resolved.model_metadata,
@@ -1092,9 +1100,10 @@ async def _test_model(
         started,
         user,
         db,
-        usage,
+        test_usage,
         params_fingerprint=params_fingerprint,
     )
+    response['timings'] = timings
     # The operator sees which service and model were really used. The internal
     # adapter identifier stays out of the interface.
     response['service'] = {
@@ -1173,9 +1182,10 @@ async def test_model_stream(
         preview_bytes = 0
         stream = None
         try:
+            chat_content = form.prompt.strip() if form.prompt and form.prompt.strip() else 'Reply OK.'
             start_signal = asyncio.Event()
             task = asyncio.create_task(provider_chat_completion(
-                model_id, {'messages': [{'role': 'user', 'content': 'Reply OK.'}], 'stream': True,
+                model_id, {'messages': [{'role': 'user', 'content': chat_content}], 'stream': True,
                            'max_tokens': 32}, user, db, allow_disabled=True, on_request_started=start_signal.set
             ))
             signal_task = asyncio.create_task(start_signal.wait())
@@ -1235,8 +1245,10 @@ async def test_model_stream(
             if stream is not None and hasattr(stream.body_iterator, 'aclose'):
                 await stream.body_iterator.aclose()
         try:
+            test_usage = dict(usage or {})
+            test_usage['_timings'] = timings
             result = await _save_model_test(connection, resolved.model_metadata, before, form.purpose,
-                                            outcome, error, started, user, db, usage)
+                                            outcome, error, started, user, db, test_usage)
             result['timings'] = timings
             result['usage'] = reported_usage(usage)
             yield emit('completed' if outcome == 'passed' else 'failed', result)
@@ -1296,6 +1308,10 @@ async def _save_model_test(
     from open_webui.utils.provider_capabilities import fingerprint
 
     elapsed = int((time.monotonic() - started) * 1000)
+    timings = None
+    if isinstance(usage, dict) and '_timings' in usage:
+        usage = dict(usage)
+        timings = usage.pop('_timings', None)
     await db.refresh(connection, with_for_update=True)
     # Refresh a curated model as well as the connection: its uses may have
     # changed while the upstream request was in flight.
@@ -1324,6 +1340,10 @@ async def _save_model_test(
         'elapsed_ms': elapsed,
         'error': error,
     }
+    if timings:
+        result['timings'] = timings
+    if usage:
+        result['usage'] = reported_usage(usage)
     if params_fingerprint:
         result['params_fingerprint'] = params_fingerprint
     from open_webui.utils.providers import set_connection_model_verification
@@ -1351,6 +1371,8 @@ async def _save_model_test(
         'elapsed_ms': elapsed,
         'error': error,
         'message': 'No automatic retry. A failed or timed-out request may already have been charged.',
+        'timings': timings,
+        'usage': reported_usage(usage),
     }
 
 

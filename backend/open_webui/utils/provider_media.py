@@ -365,8 +365,14 @@ async def _read_body(response, limit: int = MAX_MEDIA_RESPONSE_BYTES) -> bytes:
     return await read_bounded_response(response, limit)
 
 
-def _headers(credential: str, extra: dict | None = None) -> dict:
+def _headers(credential: str, extra: dict | None = None, connection=None) -> dict:
     headers = {'Authorization': f'Bearer {credential}'}
+    if connection and isinstance(connection.config, dict):
+        config_headers = connection.config.get('custom_headers') or connection.config.get('headers')
+        if isinstance(config_headers, dict):
+            for k, v in config_headers.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    headers[k] = v
     headers.update(extra or {})
     return headers
 
@@ -412,7 +418,7 @@ async def _transcription(connection, service, model, credential, payload) -> dic
             form.add_field('response_format', response_format)
     form.add_field('file', bytes(audio), filename=filename, content_type=content_type)
     status, raw, _ = await _post(
-        connection, service, form=form, headers=_headers(credential, headers)
+        connection, service, form=form, headers=_headers(credential, headers, connection=connection)
     )
     if not 200 <= status < 300:
         raise _upstream_error(status, raw, service)
@@ -448,7 +454,7 @@ async def _speech(connection, service, model, credential, payload) -> dict:
             audio_format=service.options.get('format') or 'mp3',
         )
         status, raw, _ = await _post(
-            connection, service, json_body=body, headers=_headers(credential)
+            connection, service, json_body=body, headers=_headers(credential, connection=connection)
         )
         if not 200 <= status < 300:
             raise _upstream_error(status, raw, service)
@@ -468,7 +474,7 @@ async def _speech(connection, service, model, credential, payload) -> dict:
     if voice:
         body['voice'] = voice
     status, raw, headers = await _post(
-        connection, service, json_body=body, headers=_headers(credential)
+        connection, service, json_body=body, headers=_headers(credential, connection=connection)
     )
     if not 200 <= status < 300:
         raise _upstream_error(status, raw, service)
@@ -518,7 +524,7 @@ async def _image(connection, service, model, credential, payload) -> dict:
             response_format=service.options.get('response_format') or 'base64',
         )
         status, raw, _ = await _post(
-            connection, service, json_body=body, headers=_headers(credential)
+            connection, service, json_body=body, headers=_headers(credential, connection=connection)
         )
         if not 200 <= status < 300:
             raise _upstream_error(status, raw, service)
@@ -546,7 +552,7 @@ async def _image(connection, service, model, credential, payload) -> dict:
         response_format = service.options.get('response_format')
         if response_format:
             body['response_format'] = response_format
-    status, raw, _ = await _post(connection, service, json_body=body, headers=_headers(credential))
+    status, raw, _ = await _post(connection, service, json_body=body, headers=_headers(credential, connection=connection))
     if not 200 <= status < 300:
         raise _upstream_error(status, raw, service)
     try:
@@ -604,7 +610,7 @@ async def fetch_voices(connection, service: MediaService, credential: str, voice
         base_url=service.base_url,
         endpoint_kind=service.base_url,
     )
-    status, raw, _ = await _post(connection, voice_service, json_body=body, headers=_headers(credential))
+    status, raw, _ = await _post(connection, voice_service, json_body=body, headers=_headers(credential, connection=connection))
     if not 200 <= status < 300:
         raise _upstream_error(status, raw, voice_service)
     try:

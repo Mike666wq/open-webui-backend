@@ -705,6 +705,11 @@ def provider_request_headers(connection: ProviderConnection, token: str) -> dict
     headers = {'Authorization': f'Bearer {token}', 'Accept': 'application/json'}
     if connection.provider_id == 'kimi':
         headers.update(kimi_device_headers((connection.config or {}).get('device_id')))
+    config_headers = (connection.config or {}).get('custom_headers') or (connection.config or {}).get('headers')
+    if isinstance(config_headers, dict):
+        for k, v in config_headers.items():
+            if isinstance(k, str) and isinstance(v, str):
+                headers[k] = v
     return headers
 
 

@@ -385,7 +385,7 @@ TEMPLATES = [
     },
     {
         'id': 'custom',
-        'name': 'New API / OpenAI 兼容',
+        'name': '自定义提供商 (OpenAI 兼容)',
         'protocol': PROTOCOL_OPENAI_COMPATIBLE,
         'group': GROUP_GATEWAY,
         'auth_types': ['api_key'],
