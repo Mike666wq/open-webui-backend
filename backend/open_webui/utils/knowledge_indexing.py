@@ -21,6 +21,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
+from collections.abc import Coroutine
+from typing import Optional, Union
 
 from fastapi import HTTPException
 
@@ -52,7 +55,16 @@ def set_inline_indexing(enabled: bool) -> None:
 _PENDING: set[asyncio.Task] = set()
 
 
-def track_indexing(task: asyncio.Task) -> asyncio.Task:
+def track_indexing(task: Union[asyncio.Task, Coroutine]) -> asyncio.Task:
+    """Register an indexing job so it can be drained on shutdown.
+
+    Accepts either an already-scheduled `asyncio.Task` or a bare coroutine.
+    A coroutine is scheduled here — calling `add_done_callback()` on it
+    directly would raise AttributeError, and awaiting it twice is not an
+    option since callers hand it over fire-and-forget.
+    """
+    if not isinstance(task, asyncio.Task):
+        task = asyncio.create_task(task)
     _PENDING.add(task)
     task.add_done_callback(_PENDING.discard)
     return task
@@ -98,21 +110,40 @@ async def index_file_in_background(
                 user=user,
                 db=session,
             )
-        await _mark_indexed(file_id)
+        await _mark_indexed(file_id, knowledge_id=knowledge_id, collection_name=collection_name)
     except HTTPException as exc:
         log.warning('Background indexing failed for %s: %s', file_id, exc.detail)
-        await _mark_failed(file_id, str(exc.detail))
+        await _mark_failed(file_id, str(exc.detail), knowledge_id=knowledge_id, collection_name=collection_name)
     except Exception as exc:
         log.exception('Background indexing failed for %s', file_id)
-        await _mark_failed(file_id, str(exc))
+        await _mark_failed(file_id, str(exc), knowledge_id=knowledge_id, collection_name=collection_name)
 
 
-async def _mark_indexed(file_id: str) -> None:
-    await _write_index_state(file_id, 'completed')
+async def _mark_indexed(file_id: str, knowledge_id: str | None = None, collection_name: str | None = None) -> None:
+    await _write_index_state(
+        file_id,
+        'completed',
+        knowledge_id=knowledge_id,
+        collection_name=collection_name,
+    )
 
 
-async def _write_index_state(file_id: str, state: str, error: str | None = None) -> None:
+async def _write_index_state(
+    file_id: str,
+    state: str,
+    error: str | None = None,
+    knowledge_id: Optional[str] = None,
+    collection_name: Optional[str] = None,
+) -> None:
     """Record the indexing outcome on the file itself.
+
+    Both status surfaces are written so every reader agrees:
+    - `file.data.status` / `file.data.error` — what file previews and the
+      process/status endpoint report;
+    - `file.meta.status` / `file.meta.error` — the legacy location some
+      views still read;
+    - `file.meta.index_state[knowledge_id]` — the per-knowledge-base record
+      used by knowledge/note readiness, only when `knowledge_id` is given.
 
     The update goes through an explicit statement: the row may have been loaded
     in another session, and assigning to a detached JSON column would then be
@@ -129,14 +160,37 @@ async def _write_index_state(file_id: str, state: str, error: str | None = None)
             return
         meta = dict(row.meta or {})
         meta['status'] = state
-        if error:
-            meta['error'] = error[:500]
-        await db.execute(update(File).where(File.id == file_id).values(meta=meta))
+        meta['error'] = error[:500] if error else None
+        if knowledge_id:
+            index_state = dict(meta.get('index_state') or {})
+            if not isinstance(index_state.get(knowledge_id), dict):
+                index_state[knowledge_id] = {}
+            index_state[knowledge_id] = {
+                'state': state,
+                'error': error if error else None,
+                'updated_at': int(time.time() * 1000),
+                'collection_name': collection_name,
+            }
+            meta['index_state'] = index_state
+
+        data = {**(row.data or {}), 'status': state, 'error': error[:500] if error else None}
+        await db.execute(update(File).where(File.id == file_id).values(data=data, meta=meta))
         await db.commit()
 
 
-async def _mark_failed(file_id: str, reason: str) -> None:
+async def _mark_failed(
+    file_id: str,
+    reason: str,
+    knowledge_id: str | None = None,
+    collection_name: str | None = None,
+) -> None:
     try:
-        await _write_index_state(file_id, 'failed', reason)
+        await _write_index_state(
+            file_id,
+            'failed',
+            reason,
+            knowledge_id=knowledge_id,
+            collection_name=collection_name,
+        )
     except Exception:
         log.exception('Could not record the failed index state of %s', file_id)

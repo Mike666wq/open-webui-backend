@@ -55,6 +55,25 @@ async def check_notes_access(user: UserModel, db: AsyncSession):
         )
 
 
+async def _user_note_write_access(note, user: UserModel, db: AsyncSession) -> bool:
+    """Single source of truth for note write access in list/search responses."""
+    if user.role == 'admin' or getattr(note, 'user_id', None) == user.id:
+        return True
+
+    groups = await Groups.get_groups_by_member_id(user.id, db=db, include_inherited=True)
+    group_ids = {group.id for group in groups}
+    if await AccessGrants.has_access(
+        user_id=user.id,
+        resource_type='note',
+        resource_id=note.id,
+        permission='write',
+        user_group_ids=group_ids,
+        db=db,
+    ):
+        return True
+    return bool(has_public_write_access_grant(getattr(note, 'access_grants', None) or []))
+
+
 def _truncate_note_data(data: Optional[dict], max_length: int = 1000) -> Optional[dict]:
     if not data:
         return data
@@ -92,6 +111,7 @@ class NoteItemResponse(BaseModel):
     updated_at: int
     created_at: int
     user: Optional[UserResponse] = None
+    write_access: Optional[bool] = False
 
 
 @router.get('/', response_model=list[NoteItemResponse])
@@ -118,18 +138,22 @@ async def get_notes(
 
     pinned_note_ids = await Notes.get_pinned_note_ids(user.id, db=db)
 
-    return [
-        NoteUserResponse(
-            **{
-                **note.model_dump(),
-                'is_pinned': note.id in pinned_note_ids,
-                'data': _truncate_note_data(note.data),
-                'user': UserResponse(**users[note.user_id].model_dump()),
-            }
+    response = []
+    for note in notes:
+        if note.user_id not in users:
+            continue
+        response.append(
+            NoteUserResponse(
+                **{
+                    **note.model_dump(),
+                    'is_pinned': note.id in pinned_note_ids,
+                    'data': _truncate_note_data(note.data),
+                    'user': UserResponse(**users[note.user_id].model_dump()),
+                    'write_access': await _user_note_write_access(note, user, db),
+                }
+            )
         )
-        for note in notes
-        if note.user_id in users
-    ]
+    return response
 
 
 ############################
@@ -152,18 +176,22 @@ async def get_pinned_notes(
     user_ids = list(set(note.user_id for note in notes))
     users = {user.id: user for user in await Users.get_users_by_user_ids(user_ids, db=db)}
 
-    return [
-        NoteUserResponse(
-            **{
-                **note.model_dump(),
-                'is_pinned': True,
-                'data': _truncate_note_data(note.data),
-                'user': UserResponse(**users[note.user_id].model_dump()),
-            }
+    response = []
+    for note in notes:
+        if note.user_id not in users:
+            continue
+        response.append(
+            NoteUserResponse(
+                **{
+                    **note.model_dump(),
+                    'is_pinned': True,
+                    'data': _truncate_note_data(note.data),
+                    'user': UserResponse(**users[note.user_id].model_dump()),
+                    'write_access': await _user_note_write_access(note, user, db),
+                }
+            )
         )
-        for note in notes
-        if note.user_id in users
-    ]
+    return response
 
 
 @router.get('/search', response_model=NoteListResponse)
@@ -210,6 +238,7 @@ async def search_notes(
     for note in result.items:
         note.is_pinned = note.id in pinned_note_ids
         note.data = _truncate_note_data(note.data)
+        note.write_access = await _user_note_write_access(note, user, db)
     return result
 
 
