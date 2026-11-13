@@ -2123,6 +2123,34 @@ async def add_text_to_knowledge(
         from open_webui.utils.knowledge_indexing import index_file_in_background
 
         actor = _UserModel(**user)
+
+        # The KB relation is established BEFORE any indexing is scheduled:
+        # if the link fails there are no vectors to orphan, and indexing
+        # only ever sees a file that is already reachable through the KB.
+        linked = await Knowledges.add_file_to_knowledge_by_id(
+            knowledge_id=knowledge.id,
+            file_id=file_item.id,
+            user_id=user_id,
+            directory_id=directory_id,
+            db=None,
+        )
+        if not linked:
+            # Roll back the just-created file so no unreachable row or stored
+            # blob is left behind.
+            try:
+                from open_webui.storage.provider import Storage
+
+                if file_item.path:
+                    await asyncio.to_thread(Storage.delete_file, file_item.path)
+                await Files.delete_file_by_id(file_item.id)
+            except Exception:
+                log.exception('Could not clean up unlinked knowledge file %s', file_item.id)
+            return _tool_result(
+                'failed',
+                'PROCESSING_FAILED',
+                '内容已保存但没能加入知识库，请稍后重试或在知识库页面手动添加。',
+            )
+
         # Indexing embeds every chunk, which is a network call per chunk. The
         # tool returns "accepted" and promises background processing, so the
         # work must actually happen in the background: doing it inline kept
@@ -2133,14 +2161,16 @@ async def add_text_to_knowledge(
         from open_webui.utils import knowledge_indexing
 
         if knowledge_indexing.INLINE_INDEXING:
-            await index_file_in_background(
-                __request__,
-                file_id=file_item.id,
-                collection_name=knowledge.id,
-                user=actor,
-                db_factory=get_async_db_context,
-                knowledge_id=knowledge.id,
-                directory_id=directory_id,
+            await knowledge_indexing.track_indexing(
+                index_file_in_background(
+                    __request__,
+                    file_id=file_item.id,
+                    collection_name=knowledge.id,
+                    user=actor,
+                    db_factory=get_async_db_context,
+                    knowledge_id=knowledge.id,
+                    directory_id=directory_id,
+                )
             )
         else:
             knowledge_indexing.track_indexing(
@@ -2153,20 +2183,6 @@ async def add_text_to_knowledge(
                     knowledge_id=knowledge.id,
                     directory_id=directory_id,
                 )
-            )
-
-        linked = await Knowledges.add_file_to_knowledge_by_id(
-            knowledge_id=knowledge.id,
-            file_id=file_item.id,
-            user_id=user_id,
-            directory_id=directory_id,
-            db=None,
-        )
-        if not linked:
-            return _tool_result(
-                'failed',
-                'PROCESSING_FAILED',
-                '内容已保存但没能加入知识库，请稍后重试或在知识库页面手动添加。',
             )
 
         return _tool_result(

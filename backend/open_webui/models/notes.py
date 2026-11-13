@@ -119,6 +119,7 @@ class NoteUpdateForm(BaseModel):
 
 class NoteUserResponse(NoteModel):
     user: Optional[UserResponse] = None
+    write_access: Optional[bool] = False
 
 
 class NoteItemResponse(BaseModel):

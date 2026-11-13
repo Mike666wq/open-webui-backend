@@ -172,6 +172,7 @@ from open_webui.routers import (
     mfa,
     models,
     notes,
+    workspace_loop,
     notifications,
     ollama,
     openai,
@@ -532,6 +533,15 @@ async def lifespan(app: FastAPI):
 
     # Shutdown: clean up shared resources
     from open_webui.utils.session_pool import close_session
+
+    # Wait for background knowledge-indexing tasks before cancelling any
+    # worker, so a restart cannot drop an in-flight vectorization.
+    from open_webui.utils.knowledge_indexing import drain_indexing
+
+    try:
+        await drain_indexing()
+    except Exception:
+        log.exception('Failed to drain background knowledge-indexing tasks')
 
     app.state.provider_call_retention.cancel()
     await asyncio.gather(app.state.provider_call_retention, return_exceptions=True)
@@ -927,6 +937,7 @@ app.include_router(users.router, prefix='/api/v1/users', tags=['users'])
 app.include_router(apps.router, prefix='/api/v1/apps', tags=['apps'])
 app.include_router(channels.router, prefix='/api/v1/channels', tags=['channels'])
 app.include_router(chats.router, prefix='/api/v1/chats', tags=['chats'])
+app.include_router(workspace_loop.router, prefix='/api/v1/notes', tags=['notes'])
 app.include_router(notes.router, prefix='/api/v1/notes', tags=['notes'])
 
 
