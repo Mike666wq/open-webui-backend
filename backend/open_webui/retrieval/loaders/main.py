@@ -538,6 +538,16 @@ class Loader:
     def _get_loader(self, filename: str, file_content_type: str, file_path: str):
         file_ext = filename.split('.')[-1].lower()
 
+        # A generic ZIP is not a document format. The old fallback sent it to
+        # TextLoader, which tried to decode hundreds of MB of binary and could
+        # leave the upload perpetually pending. Fail fast with an actionable
+        # error instead; archives such as docx/pptx/xlsx are handled below.
+        if file_ext == 'zip' or file_content_type in {'application/zip', 'application/x-zip-compressed'}:
+            raise ValueError(
+                'ZIP archives are not supported for inline extraction. '
+                'Extract the archive and upload the supported files individually.'
+            )
+
         if file_ext in known_archive_ext or file_content_type in known_archive_content_types:
             max_file_size = self.config['rag.file.max_size']
             try:
