@@ -3,6 +3,16 @@
 # verified DIY frontend are complete replacements, not overlays of old files.
 FROM ghcr.io/open-webui/open-webui:v0.12.2@sha256:10e6a78ba2d172493460a9e8a92c496aaa7a64dc4d26d622a2e95e0c736081c9
 
+# Document extraction runtime: LibreOffice is required for legacy .ppt/.doc
+# conversion by unstructured; the wrapper gives every conversion its own HOME
+# so concurrent uploads do not fight over LibreOffice's profile lock.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libreoffice-impress \
+        libreoffice-writer \
+        fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG BUILD_HASH=local-development
 ARG FRONTEND_COMMIT=unknown
 LABEL org.opencontainers.image.title="Open WebUI Backend" \
@@ -19,6 +29,9 @@ COPY package.json CHANGELOG.md backend.upstream.json frontend.lock.json /app/
 COPY LICENSE LICENSE_HISTORY LICENSE_NOTICE CONTRIBUTOR_LICENSE_AGREEMENT /app/licenses/
 COPY .build/frontend/ /app/build/
 COPY scripts/frontend_archive.py /app/backend-build/frontend_archive.py
+COPY scripts/soffice-wrapper.sh /usr/local/bin/soffice
+RUN chmod +x /usr/local/bin/soffice \
+    && ln -sf /usr/local/bin/soffice /usr/local/bin/libreoffice
 COPY scripts/chatgpt-authorize.py /app/scripts/chatgpt-authorize.py
 
 ENV FRONTEND_BUILD_DIR=/app/build \
