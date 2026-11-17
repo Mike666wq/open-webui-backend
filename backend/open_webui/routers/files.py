@@ -23,7 +23,13 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse, StreamingResponse
-from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, STORAGE_LOCAL_CACHE, STORAGE_PROVIDER, UPLOAD_DIR
+from open_webui.config import (
+    BYPASS_ADMIN_ACCESS_CONTROL,
+    CACHE_DIR,
+    STORAGE_LOCAL_CACHE,
+    STORAGE_PROVIDER,
+    UPLOAD_DIR,
+)
 from open_webui.constants import ERROR_MESSAGES
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_db_context, get_async_session
@@ -937,12 +943,22 @@ async def get_legacy_ppt_preview_by_id(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Original file is unavailable.')
 
     try:
-        source_path = await asyncio.to_thread(Storage.get_file, file.path)
-        with tempfile.TemporaryDirectory(prefix='open-webui-ppt-preview-') as output_dir:
-            converted = await asyncio.to_thread(
-                convert_legacy_ppt_to_pptx, source_path, output_dir
-            )
-            body = converted.read_bytes()
+        cache_dir = CACHE_DIR / 'legacy-ppt-preview'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_material = f'{file.id}:{file.hash or (file.meta or {}).get("file_hash") or file.updated_at}'
+        cache_path = cache_dir / f'{hashlib.sha256(cache_material.encode()).hexdigest()}.pptx'
+        if cache_path.is_file() and cache_path.stat().st_size > 0:
+            body = cache_path.read_bytes()
+        else:
+            source_path = await asyncio.to_thread(Storage.get_file, file.path)
+            with tempfile.TemporaryDirectory(prefix='open-webui-ppt-preview-') as output_dir:
+                converted = await asyncio.to_thread(
+                    convert_legacy_ppt_to_pptx, source_path, output_dir
+                )
+                body = converted.read_bytes()
+            cache_tmp = cache_path.with_suffix('.tmp')
+            cache_tmp.write_bytes(body)
+            cache_tmp.replace(cache_path)
     except HTTPException:
         raise
     except Exception as exc:
