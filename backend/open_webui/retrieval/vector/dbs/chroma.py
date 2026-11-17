@@ -149,6 +149,30 @@ class ChromaClient(VectorDBBase):
             )
         return None
 
+    def _verify_collection_dimension(self, collection, expected_dimension: int) -> None:
+        """Fail with an actionable error before Chroma throws a raw dimension error."""
+        name = getattr(collection, 'name', '?')
+        try:
+            sample = collection.get(limit=1, include=['embeddings'])
+            embeddings = sample.get('embeddings') or []
+            if not embeddings:
+                return
+            actual_dimension = len(embeddings[0])
+        except Exception as exc:
+            log.warning(
+                'Could not determine dimension for collection %s: %s',
+                name,
+                exc,
+            )
+            return
+
+        if actual_dimension != expected_dimension:
+            raise ValueError(
+                f'Collection {name!r} was created with dim={actual_dimension}, refusing to '
+                f'write vectors with dim={expected_dimension}. Recreate the collection or '
+                'reindex it with the current embedding model.'
+            )
+
     def insert(self, collection_name: str, items: list[VectorItem]):
         # Insert the items into the collection, if the collection does not exist, it will be created.
         collection = self.client.get_or_create_collection(
@@ -159,6 +183,9 @@ class ChromaClient(VectorDBBase):
         documents = [item['text'] for item in items]
         embeddings = [item['vector'] for item in items]
         metadatas = [process_metadata(item['metadata']) for item in items]
+
+        if embeddings:
+            self._verify_collection_dimension(collection, len(embeddings[0]))
 
         for batch in create_batches(
             api=self.client,
@@ -179,6 +206,9 @@ class ChromaClient(VectorDBBase):
         documents = [item['text'] for item in items]
         embeddings = [item['vector'] for item in items]
         metadatas = [process_metadata(item['metadata']) for item in items]
+
+        if embeddings:
+            self._verify_collection_dimension(collection, len(embeddings[0]))
 
         collection.upsert(ids=ids, documents=documents, embeddings=embeddings, metadatas=metadatas)
 
