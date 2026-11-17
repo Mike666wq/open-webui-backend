@@ -3,6 +3,7 @@ import errno
 import hashlib
 import logging
 import os
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Optional
@@ -57,6 +58,7 @@ router = APIRouter()
 from open_webui.utils.access_control.files import check_knowledge_import_access, has_access_to_file
 from open_webui.utils.knowledge_import_lifecycle import has_managed_marker
 from open_webui.utils.json_codec import JSONCodec
+from open_webui.utils.legacy_office_preview import convert_legacy_ppt_to_pptx
 
 
 def _private_cache_headers(file) -> dict[str, str]:
@@ -902,6 +904,62 @@ async def get_file_content_by_id(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.NOT_FOUND,
         )
+
+
+@router.get('/{id}/preview')
+async def get_legacy_ppt_preview_by_id(
+    id: str,
+    user=Depends(get_verified_user),
+    db: AsyncSession = Depends(get_async_session),
+):
+    """Return a .pptx preview for legacy .ppt files.
+
+    The knowledge viewer already renders .pptx slide images. Legacy .ppt files
+    need one server-side LibreOffice conversion; doing it here keeps the
+    browser free of a second office parser.
+    """
+    file = await Files.get_file_by_id(id, db=db)
+    if not file:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    if not await _can_access_file(file, user, 'read', id, db=db):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ERROR_MESSAGES.NOT_FOUND)
+
+    filename = file.meta.get('name', file.filename) if file.meta else file.filename
+    content_type = (file.meta or {}).get('content_type')
+    if not filename.lower().endswith('.ppt') and content_type != 'application/vnd.ms-powerpoint':
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail='Legacy PPT preview is only available for .ppt files.',
+        )
+
+    if not file.path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail='Original file is unavailable.')
+
+    try:
+        source_path = await asyncio.to_thread(Storage.get_file, file.path)
+        with tempfile.TemporaryDirectory(prefix='open-webui-ppt-preview-') as output_dir:
+            converted = await asyncio.to_thread(
+                convert_legacy_ppt_to_pptx, source_path, output_dir
+            )
+            body = converted.read_bytes()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        log.warning('Legacy PPT preview failed for %s: %s', id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc) or 'Unable to generate a legacy PPT preview.',
+        ) from exc
+
+    return Response(
+        content=body,
+        media_type='application/vnd.openxmlformats-officedocument.presentationml.presentation',
+        headers={
+            'Cache-Control': 'private, no-store',
+            'X-OpenWebUI-Preview-Format': 'pptx',
+        },
+    )
 
 
 @router.get('/{id}/content/html')
