@@ -2329,7 +2329,10 @@ async def remove_file_from_knowledge(
         from open_webui.utils.resource_service import knowledge_cleanup
 
         actor = _UserModel(**user)
-        await knowledge_cleanup(actor, knowledge.id, file_ids=[file_id])
+        # preview_delete is the user's explicit confirmation. It may have warned
+        # that the owning KB is shared; carry that confirmation through so the
+        # cleanup does not fail with shared_confirmation_required.
+        await knowledge_cleanup(actor, knowledge.id, file_ids=[file_id], confirm_shared=True)
 
         expires_at = _recycle_expires_at()
         return _tool_result(
