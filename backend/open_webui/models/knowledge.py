@@ -13,8 +13,10 @@ from open_webui.models.files import (
     FileModelResponse,
 )
 from open_webui.models.groups import Groups
+from open_webui.models.resources import ResourceEntry
 from open_webui.models.users import User, UserModel, UserResponse, Users
 from open_webui.utils.knowledge_import_lifecycle import managed_file_visible_in_knowledge
+from open_webui.utils.resource_visibility import BLOCKED
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
     JSON,
@@ -26,6 +28,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     delete,
+    exists,
     func,
     or_,
     select,
@@ -186,6 +189,17 @@ class KnowledgeFileListResponse(BaseModel):
     directories: list[KnowledgeDirectoryModel] = Field(default_factory=list)
     breadcrumbs: list[KnowledgeDirectoryModel] = Field(default_factory=list)
     total: int
+
+
+def _visible_knowledge_file_link():
+    """Exclude a knowledge_file link whose ResourceEntry is recycled/purging."""
+    return ~exists(
+        select(ResourceEntry.id).where(
+            ResourceEntry.type == 'knowledge_file',
+            ResourceEntry.resource_id == KnowledgeFile.id,
+            ResourceEntry.state.in_(BLOCKED),
+        )
+    )
 
 
 class KnowledgeTable:
@@ -386,6 +400,7 @@ class KnowledgeTable:
                     .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
                     .join(Knowledge, KnowledgeFile.knowledge_id == Knowledge.id)
                     .outerjoin(User, User.id == KnowledgeFile.user_id)
+                    .filter(_visible_knowledge_file_link())
                 )
 
                 # Apply access-control directly to the joined query
@@ -522,6 +537,7 @@ class KnowledgeTable:
                     .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
                     .outerjoin(User, User.id == KnowledgeFile.user_id)
                     .filter(KnowledgeFile.knowledge_id == knowledge_id)
+                    .filter(_visible_knowledge_file_link())
                 )
 
                 # Filter by directory_id (None = root level)
@@ -641,6 +657,7 @@ class KnowledgeTable:
                     select(File)
                     .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
                     .filter(KnowledgeFile.knowledge_id == knowledge_id)
+                    .filter(_visible_knowledge_file_link())
                 )
                 files = result.scalars().all()
                 return [
@@ -662,6 +679,7 @@ class KnowledgeTable:
                     select(File.id, File.user_id, File.path, File.hash, File.meta, File.created_at, File.updated_at)
                     .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
                     .filter(KnowledgeFile.knowledge_id == knowledge_id)
+                    .filter(_visible_knowledge_file_link())
                 )
                 return [
                     FileMetadataResponse(
@@ -898,6 +916,7 @@ class KnowledgeTable:
                     select(File, KnowledgeFile.directory_id)
                     .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
                     .filter(KnowledgeFile.knowledge_id == knowledge_id)
+                    .filter(_visible_knowledge_file_link())
                 )
                 return [
                     (FileModel.model_validate(file), dir_id)
@@ -1099,6 +1118,7 @@ class KnowledgeTable:
                 .join(KnowledgeFile, File.id == KnowledgeFile.file_id)
                 .filter(KnowledgeFile.knowledge_id == knowledge_id)
                 .filter(KnowledgeFile.directory_id.in_(directory_ids))
+                .filter(_visible_knowledge_file_link())
             )
             return [FileModel.model_validate(file) for file in result.scalars().all()]
 
