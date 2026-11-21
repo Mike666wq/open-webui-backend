@@ -3105,7 +3105,8 @@ async def search_knowledge_files(
 ) -> str:
     """
     Search files by filename across knowledge bases the user has access to.
-    When the model has attached knowledge, searches only within attached KBs and files.
+    Attached KBs/files are the default scope; an explicit knowledge_id is checked by read
+    permission and may be outside that default scope.
     Helpful when looking for a specific document or file name.
 
     :param query: The search query to find matching files by filename
@@ -3142,10 +3143,23 @@ async def search_knowledge_files(
                 elif item_type == 'file':
                     attached_file_ids.add(item_id)
 
-            # If knowledge_id specified, verify it's in the attached set
+            # If knowledge_id is specified, permissions decide access. Attachment
+            # only defines the default scope; it must not hide a readable KB.
             if knowledge_id:
                 if knowledge_id not in attached_kb_ids:
-                    return JSONCodec.dumps({'error': f'Knowledge base {knowledge_id} is not attached to this model'})
+                    knowledge = await Knowledges.get_knowledge_by_id(knowledge_id)
+                    if not knowledge or not (
+                        user_role == 'admin'
+                        or knowledge.user_id == user_id
+                        or await AccessGrants.has_access(
+                            user_id=user_id,
+                            resource_type='knowledge',
+                            resource_id=knowledge.id,
+                            permission='read',
+                            user_group_ids=set(user_group_ids),
+                        )
+                    ):
+                        return JSONCodec.dumps({'error': f'Access denied to knowledge base {knowledge_id}'})
                 attached_kb_ids = {knowledge_id}
 
             all_files = []
@@ -3954,26 +3968,24 @@ async def list_knowledge(
     __model_knowledge__: Optional[list[dict]] = None,
 ) -> str:
     """
-    List knowledge bases, files, and notes attached to the current model.
-    Use this first to discover what knowledge is available before querying or reading files.
-    Without knowledge_id: returns KB summaries (name, description, file_count)
-    plus standalone files and notes — no file listing inside KBs.
-    With knowledge_id: includes paginated file listing for that specific KB.
-    Use skip/count to page through large KBs.
+    List knowledge bases the user can access, plus files and notes attached to the
+    current model or folder. Attachments are a default scope, not an access-control
+    boundary: a user who can read a KB can inspect it even when it is not attached.
+    Use this first to discover what knowledge is available before querying or reading
+    files. Without knowledge_id: returns KB summaries (name, description, file_count)
+    plus standalone files and notes. With knowledge_id: includes paginated file listing
+    for that specific KB. Use skip/count to page through large KBs.
 
     :param knowledge_id: Optional KB ID to get file listing for
     :param skip: Number of files to skip for pagination (default: 0)
     :param count: Maximum files per page (default: 50, max: 200)
-    :return: JSON with knowledge_bases, files, and notes attached to this model
+    :return: JSON with accessible knowledge_bases, attached files, and attached notes
     """
     if __request__ is None:
         return JSONCodec.dumps({'error': 'Request context not available'})
 
     if not __user__:
         return JSONCodec.dumps({'error': 'User context not available'})
-
-    if not __model_knowledge__:
-        return JSONCodec.dumps({'knowledge_bases': [], 'files': [], 'notes': []})
 
     # Coerce parameters from LLM tool calls (may come as strings)
     if isinstance(skip, str):
@@ -4001,60 +4013,86 @@ async def list_knowledge(
         user_role = __user__.get('role', 'user')
         user_group_ids = [group.id for group in await Groups.get_groups_by_member_id(user_id, include_inherited=True)]
 
+        async def can_read(knowledge) -> bool:
+            return bool(
+                user_role == 'admin'
+                or knowledge.user_id == user_id
+                or await AccessGrants.has_access(
+                    user_id=user_id,
+                    resource_type='knowledge',
+                    resource_id=knowledge.id,
+                    permission='read',
+                    user_group_ids=set(user_group_ids),
+                )
+            )
+
+        attached_items = list(__model_knowledge__ or [])
         knowledge_bases = []
         files = []
         notes = []
+        seen_kb_ids = set()
 
-        for item in __model_knowledge__:
+        if knowledge_id:
+            knowledge = await Knowledges.get_knowledge_by_id(knowledge_id)
+            if not knowledge or not await can_read(knowledge):
+                return JSONCodec.dumps({'error': f'Access denied to knowledge base {knowledge_id}'})
+            candidate_ids = [knowledge_id]
+        else:
+            # Match the workspace listing: every readable KB is discoverable.
+            result = await Knowledges.search_knowledge_bases(
+                user_id,
+                filter={'query': '', 'user_id': user_id, 'group_ids': user_group_ids},
+                skip=0,
+                limit=200,
+            )
+            candidate_ids = []
+            for knowledge in result.items:
+                if knowledge.id not in seen_kb_ids and await can_read(knowledge):
+                    candidate_ids.append(knowledge.id)
+                    seen_kb_ids.add(knowledge.id)
+
+            # Keep attachment-only collections visible even if a search backend
+            # does not include them in the main listing.
+            for item in attached_items:
+                if item.get('type') != 'collection':
+                    continue
+                item_id = item.get('id')
+                if not item_id or item_id in seen_kb_ids:
+                    continue
+                knowledge = await Knowledges.get_knowledge_by_id(item_id)
+                if knowledge and await can_read(knowledge):
+                    candidate_ids.append(item_id)
+                    seen_kb_ids.add(item_id)
+
+        for kb_id in candidate_ids:
+            knowledge = await Knowledges.get_knowledge_by_id(kb_id)
+            if not knowledge or not await can_read(knowledge):
+                continue
+            kb_files = await Knowledges.get_files_by_id(knowledge.id)
+            file_count = len(kb_files) if kb_files else 0
+            kb_entry = {
+                'id': knowledge.id,
+                'name': knowledge.name,
+                'description': knowledge.description or '',
+                'file_count': file_count,
+            }
+            if knowledge_id and knowledge_id == knowledge.id and kb_files:
+                paged_files = kb_files[skip : skip + count]
+                kb_entry['files'] = [{'id': f.id, 'filename': f.filename} for f in paged_files]
+                kb_entry['files_skip'] = skip
+                kb_entry['files_count'] = len(paged_files)
+                kb_entry['files_total'] = file_count
+                kb_entry['has_more'] = skip + count < file_count
+            knowledge_bases.append(kb_entry)
+
+        # Attached standalone files and notes remain part of the model/folder context.
+        for item in attached_items:
             item_type = item.get('type')
             item_id = item.get('id')
-
-            if item_type == 'collection':
-                knowledge = await Knowledges.get_knowledge_by_id(item_id)
-                if knowledge and (
-                    user_role == 'admin'
-                    or knowledge.user_id == user_id
-                    or await AccessGrants.has_access(
-                        user_id=user_id,
-                        resource_type='knowledge',
-                        resource_id=knowledge.id,
-                        permission='read',
-                        user_group_ids=set(user_group_ids),
-                    )
-                ):
-                    kb_files = await Knowledges.get_files_by_id(knowledge.id)
-                    file_count = len(kb_files) if kb_files else 0
-
-                    kb_entry = {
-                        'id': knowledge.id,
-                        'name': knowledge.name,
-                        'description': knowledge.description or '',
-                        'file_count': file_count,
-                    }
-
-                    # Include file listing only when this KB is targeted
-                    if knowledge_id and knowledge_id == knowledge.id:
-                        if kb_files:
-                            paged_files = kb_files[skip : skip + count]
-                            kb_entry['files'] = [{'id': f.id, 'filename': f.filename} for f in paged_files]
-                            kb_entry['files_skip'] = skip
-                            kb_entry['files_count'] = len(paged_files)
-                            kb_entry['files_total'] = file_count
-                            kb_entry['has_more'] = skip + count < file_count
-
-                    knowledge_bases.append(kb_entry)
-
-            elif item_type == 'file':
+            if item_type == 'file':
                 file = await Files.get_file_by_id(item_id)
-                if file and await _has_read_access_to_file(file, __user__, __model_knowledge__):
-                    files.append(
-                        {
-                            'id': file.id,
-                            'filename': file.filename,
-                            'updated_at': file.updated_at,
-                        }
-                    )
-
+                if file and await _has_read_access_to_file(file, __user__, attached_items):
+                    files.append({'id': file.id, 'filename': file.filename, 'updated_at': file.updated_at})
             elif item_type == 'note':
                 note = await Notes.get_note_by_id(item_id)
                 if note and (
@@ -4067,19 +4105,10 @@ async def list_knowledge(
                         permission='read',
                     )
                 ):
-                    notes.append(
-                        {
-                            'id': note.id,
-                            'title': note.title,
-                        }
-                    )
+                    notes.append({'id': note.id, 'title': note.title})
 
         return JSONCodec.dumps(
-            {
-                'knowledge_bases': knowledge_bases,
-                'files': files,
-                'notes': notes,
-            },
+            {'knowledge_bases': knowledge_bases, 'files': files, 'notes': notes},
             ensure_ascii=False,
         )
     except Exception as e:
@@ -4151,8 +4180,28 @@ async def query_knowledge_files(
         external_knowledges = []
         note_results = []  # Notes aren't vectorized, handle separately
 
-        # If model has attached knowledge, use those
-        if __model_knowledge__:
+        # Explicit IDs are a permission-bound request, not a folder/model scope.
+        if knowledge_ids:
+            for knowledge_id in knowledge_ids:
+                knowledge = await Knowledges.get_knowledge_by_id(knowledge_id)
+                if knowledge and (
+                    user_role == 'admin'
+                    or knowledge.user_id == user_id
+                    or await AccessGrants.has_access(
+                        user_id=user_id,
+                        resource_type='knowledge',
+                        resource_id=knowledge.id,
+                        permission='read',
+                        user_group_ids=set(user_group_ids),
+                    )
+                ):
+                    if (knowledge.meta or {}).get('source') == 'external':
+                        external_knowledges.append(knowledge)
+                    else:
+                        collection_names.append(knowledge_id)
+
+        # If model has attached knowledge, use those as the default scope.
+        elif __model_knowledge__:
             for item in __model_knowledge__:
                 item_type = item.get('type')
                 item_id = item.get('id')
@@ -4205,25 +4254,6 @@ async def query_knowledge_files(
                             }
                         )
 
-        elif knowledge_ids:
-            # User specified specific KBs
-            for knowledge_id in knowledge_ids:
-                knowledge = await Knowledges.get_knowledge_by_id(knowledge_id)
-                if knowledge and (
-                    user_role == 'admin'
-                    or knowledge.user_id == user_id
-                    or await AccessGrants.has_access(
-                        user_id=user_id,
-                        resource_type='knowledge',
-                        resource_id=knowledge.id,
-                        permission='read',
-                        user_group_ids=set(user_group_ids),
-                    )
-                ):
-                    if (knowledge.meta or {}).get('source') == 'external':
-                        external_knowledges.append(knowledge)
-                    else:
-                        collection_names.append(knowledge_id)
         else:
             # No model knowledge and no specific IDs - search all accessible KBs
             result = await Knowledges.search_knowledge_bases(
