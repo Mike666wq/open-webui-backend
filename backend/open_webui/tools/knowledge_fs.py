@@ -382,9 +382,10 @@ async def _get_accessible_kb_ids(
             if item.get('type') == 'collection':
                 attached_kb_ids.add(item.get('id'))
         if knowledge_id:
-            if knowledge_id not in attached_kb_ids:
-                return []
-            attached_kb_ids = {knowledge_id}
+            kb = await Knowledges.get_knowledge_by_id(knowledge_id)
+            if kb and await _has_access(kb):
+                return [(kb.id, kb.name, kb.description or '')]
+            return []
         for kb_id in attached_kb_ids:
             kb = await Knowledges.get_knowledge_by_id(kb_id)
             if kb and await _has_access(kb):
