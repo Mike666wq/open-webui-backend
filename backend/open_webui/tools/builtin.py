@@ -3161,10 +3161,21 @@ async def search_knowledge_files(
                     ):
                         return JSONCodec.dumps({'error': f'Access denied to knowledge base {knowledge_id}'})
                 attached_kb_ids = {knowledge_id}
+            else:
+                # Attachments are the default hint, not the access boundary. Search
+                # every readable KB when the caller did not name one explicitly.
+                readable = await Knowledges.search_knowledge_bases(
+                    user_id,
+                    filter={'query': '', 'user_id': user_id, 'group_ids': user_group_ids},
+                    skip=0,
+                    limit=200,
+                )
+                for knowledge in readable.items:
+                    attached_kb_ids.add(knowledge.id)
 
             all_files = []
 
-            # Search within attached KBs
+            # Search within readable KBs
             for kb_id in attached_kb_ids:
                 knowledge = await Knowledges.get_knowledge_by_id(kb_id)
                 if not knowledge:
@@ -4253,6 +4264,22 @@ async def query_knowledge_files(
                                 'type': 'note',
                             }
                         )
+
+            # Attachments are a default hint; when no IDs were supplied, include
+            # every readable KB so all workspace knowledge is at the same level.
+            readable = await Knowledges.search_knowledge_bases(
+                user_id,
+                filter={'query': '', 'user_id': user_id, 'group_ids': user_group_ids},
+                skip=0,
+                limit=50,
+            )
+            for knowledge_base in readable.items:
+                if knowledge_base.id in collection_names:
+                    continue
+                if (knowledge_base.meta or {}).get('source') == 'external':
+                    external_knowledges.append(knowledge_base)
+                else:
+                    collection_names.append(knowledge_base.id)
 
         else:
             # No model knowledge and no specific IDs - search all accessible KBs
