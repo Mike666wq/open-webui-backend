@@ -153,7 +153,10 @@ async def _apply_migration(request, user, db, index, fingerprint, alias_owners):
             '_legacy_source': fingerprint,
             '_legacy_index': index,
             '_legacy_aliases': aliases,
-            '_legacy_access_ids': source['aliases'],
+            # Use the filtered set: a conflicting alias owned by another
+            # source must not be written here, or legacy_model_access will
+            # deny the whole upstream to non-admin users.
+            '_legacy_access_ids': aliases,
             '_legacy_chat_ids': source['models'],
             '_legacy_names': {mid: alias for alias, mid in aliases.items()},
         },
@@ -165,14 +168,14 @@ async def _apply_migration(request, user, db, index, fingerprint, alias_owners):
             'name': alias,
             'tags': source['special_config'].get('tags', []),
         }
-        for alias, mid in source['aliases'].items()
+        for alias, mid in aliases.items()
     ]
     db.add(connection)
     # The migrated models form the curated whitelist of the new connection.
     from open_webui.models.provider_connections import ProviderModel
 
     now = int(time.time())
-    for order, (alias, mid) in enumerate(source['aliases'].items()):
+    for order, (alias, mid) in enumerate(aliases.items()):
         db.add(
             ProviderModel(
                 id=str(uuid.uuid4()),

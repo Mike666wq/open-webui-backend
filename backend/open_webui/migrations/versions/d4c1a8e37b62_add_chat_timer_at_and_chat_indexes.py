@@ -43,6 +43,13 @@ def upgrade() -> None:
             due_at = int(meta.get('timer_at'))
         except (TypeError, ValueError):
             continue
+        # Legacy meta.timer_at is seconds; the new column and the timer worker
+        # compare against time.time_ns(). Writing seconds here would make every
+        # historical timer immediately due, so normalise to ns first.
+        if due_at > 0 and due_at < 100_000_000_000:
+            due_at *= 1_000_000_000
+        if due_at <= 0:
+            continue
         conn.execute(chat.update().where(chat.c.id == chat_id).values(timer_at=due_at))
 
     op.create_index('user_id_updated_at_id_idx', 'chat', ['user_id', sa.text('updated_at DESC'), 'id'])

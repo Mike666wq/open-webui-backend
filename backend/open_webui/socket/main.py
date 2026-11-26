@@ -815,19 +815,24 @@ def with_resource_viewer(permission='read'):
                 return
             with as_viewer(user['id']):
                 document_id = normalize_document_id(data.get('document_id', ''))
-                if document_id.startswith('note:'):
-                    note_id = document_id.split(':', 1)[1]
-                    note = await Notes.get_note_by_id(note_id)
-                    if not note:
+                if not document_id:
+                    return
+                # Fail closed: only the document kinds we can authorise may
+                # reach a handler. Anything else would skip every access check.
+                if not document_id.startswith('note:'):
+                    return
+                note_id = document_id.split(':', 1)[1]
+                note = await Notes.get_note_by_id(note_id)
+                if not note:
+                    return
+                if user.get('role') != 'admin':
+                    if not await has_permission(user['id'], 'features.notes', await Config.get('user.permissions')):
                         return
-                    if user.get('role') != 'admin':
-                        if not await has_permission(user['id'], 'features.notes', await Config.get('user.permissions')):
-                            return
-                        if user['id'] != note.user_id and not await AccessGrants.has_access(
-                            user_id=user['id'], resource_type='note', resource_id=note_id,
-                            permission=permission,
-                        ):
-                            return
+                    if user['id'] != note.user_id and not await AccessGrants.has_access(
+                        user_id=user['id'], resource_type='note', resource_id=note_id,
+                        permission=permission,
+                    ):
+                        return
                 return await handler(sid, data)
         return wrapped
     return decorate

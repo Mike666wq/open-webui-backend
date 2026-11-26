@@ -1,3 +1,4 @@
+import errno
 import logging
 import hashlib
 import os
@@ -25,6 +26,7 @@ from open_webui.config import (
     S3_REGION_NAME,
     S3_SECRET_ACCESS_KEY,
     S3_USE_ACCELERATE_ENDPOINT,
+    RAG_FILE_MAX_SIZE,
     STORAGE_PROVIDER,
     UPLOAD_DIR,
 )
@@ -71,6 +73,23 @@ def _remove_prepared_cache(target: dict) -> None:
         pass
 
 
+def _upload_byte_limit() -> int:
+    """Hard ceiling for a single upload, using the configured default.
+
+    The router validates the size after the write; this bounds the read itself
+    so an oversized body cannot exhaust memory first. Admin overrides stored in
+    the config table are still enforced by the router check that follows.
+    """
+    # RAG_FILE_MAX_SIZE is unset by default, which used to mean "unbounded".
+    # Keep a hard floor so a single request cannot exhaust the process.
+    DEFAULT_MAX_UPLOAD_MB = 100
+    try:
+        megabytes = int(RAG_FILE_MAX_SIZE) if RAG_FILE_MAX_SIZE else DEFAULT_MAX_UPLOAD_MB
+    except (TypeError, ValueError):
+        megabytes = DEFAULT_MAX_UPLOAD_MB
+    return megabytes * 1024 * 1024 if megabytes > 0 else DEFAULT_MAX_UPLOAD_MB * 1024 * 1024
+
+
 class StorageProvider(ABC):
     def prepare_upload(self, storage_name: str) -> dict:
         raise NotImplementedError('Prepared uploads are not supported by this provider')
@@ -115,7 +134,20 @@ class LocalStorageProvider(StorageProvider):
 
     @staticmethod
     def upload_file(file: BinaryIO, filename: str, tags: Dict[str, str]) -> Tuple[bytes, str]:
-        contents = file.read()
+        # Read in bounded chunks so a client cannot stream an unbounded body
+        # into memory before the caller gets a chance to enforce a size limit.
+        max_bytes = _upload_byte_limit()
+        chunks = []
+        total = 0
+        while True:
+            chunk = file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if max_bytes and total > max_bytes:
+                raise OSError(errno.EFBIG, f'File exceeds the {max_bytes // (1024 * 1024)} MB upload limit')
+            chunks.append(chunk)
+        contents = b''.join(chunks)
         if not contents:
             raise ValueError(ERROR_MESSAGES.EMPTY_CONTENT)
         file_path = os.path.join(UPLOAD_DIR, filename)
