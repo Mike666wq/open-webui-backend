@@ -88,8 +88,8 @@ def chat_search_message_content_match_sql(dialect_name: str, key: str) -> str:
             )
             OR EXISTS (
                 SELECT 1
-                FROM json_each(Chat.chat#>'{{history,messages}}') AS history_message
-                WHERE json_typeof(history_message.value->'content') = 'string'
+                FROM jsonb_each(Chat.chat#>'{{history,messages}}') AS history_message
+                WHERE jsonb_typeof(history_message.value->'content') = 'string'
                 AND LOWER(history_message.value->>'content') LIKE '%' || :{key} || '%'
             )
             OR EXISTS (
@@ -1937,7 +1937,14 @@ class ChatTable:
             shared
             and shared.chat.get('share_mode') == 'continue'
             and await AccessGrants.has_access(
-                user_id=user.id, resource_type='shared_chat', resource_id=id, permission='read', db=db
+                user_id=user.id,
+                resource_type='shared_chat',
+                resource_id=id,
+                # Shared-chat continuation is granted as a single read grant;
+                # share_mode='continue' is what makes that grant writable.
+                # A plain share (share_mode=None) stays read-only.
+                permission='read',
+                db=db,
             )
         ):
             return ChatModel.model_validate(chat)
@@ -2018,12 +2025,20 @@ class ChatTable:
             )
             return {folder_id: count for folder_id, count in result.all() if folder_id}
 
-    async def get_chats(self, skip: int = 0, limit: int = 50, db: AsyncSession | None = None) -> list[ChatModel]:
+    async def get_chats(
+        self,
+        skip: int = 0,
+        limit: int | None = 50,
+        db: AsyncSession | None = None,
+    ) -> list[ChatModel]:
         async with get_async_db_context(db) as session:
             stmt = select(Chat).where(Chat.meta['internal'].as_boolean().is_not(True))
+            if skip:
+                stmt = stmt.offset(skip)
+            if limit is not None:
+                stmt = stmt.limit(limit)
             result = await session.execute(stmt.order_by(Chat.updated_at.desc()))
-            all_chats = result.scalars().all()
-            return [ChatModel.model_validate(chat) for chat in all_chats]
+            return [ChatModel.model_validate(chat) for chat in result.scalars().all()]
 
     async def get_user_usage_chat_stats(self, user_id: str, db: AsyncSession | None = None) -> dict:
         async with get_async_db_context(db) as session:

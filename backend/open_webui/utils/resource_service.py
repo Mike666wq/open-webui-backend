@@ -626,7 +626,7 @@ async def restore(db, row, kind, entry):
             child_row = await db.get(models()[current.type], current.resource_id)
             if child_row:
                 await restore(db, child_row, current.type, current)
-    # A restored share stays private. Republishing from the original chat
+    # A restored share stays suspended. Republishing from the original chat
     # creates a new token; old URLs never become public as an undo side effect.
     if kind == 'share':
         entry.state = 'paused'
@@ -661,6 +661,27 @@ async def purge(db, row, kind, entry, checkpoint):
                 child.data = {**child.data, 'purge_steps': child_steps}
                 await checkpoint({**steps, child_id: True})
             await purge(db, child_row, child_kind, child, child_checkpoint)
+        # move_files recycle relocated direct children to the parent without
+        # creating lifecycle entries for them, so the descendant loop above
+        # cannot see them.  Silently dropping the directory row would leave
+        # those moved children active with no entry of their own: the `moved`
+        # references in this entry would dangle forever and the resources page
+        # could no longer find them.  Refuse the permanent delete instead and
+        # require the caller to recycle those children separately.  This keeps
+        # the explicit "move files = keep them" intent intact, stays reversible
+        # (restore still works while the entry is recycled), and never destroys
+        # content the user chose to preserve.  Children the user moved again
+        # after recycling are already outside this directory and are ignored.
+        unresolved = []
+        for moved in entry.data.get('moved', []):
+            member = await db.get(models()[moved['type']], moved['id'])
+            if not member or getattr(member, moved['field'], None) != moved['target']:
+                continue
+            child_entry = await entry_for(db, moved['type'], member.id, entry.user_id)
+            if not child_entry or child_entry.state == 'active':
+                unresolved.append(moved)
+        if unresolved:
+            raise HTTPException(409, 'Folder has moved contents; recycle those items before permanent deletion')
     elif kind == 'knowledge_file':
         from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
         if not steps.get('vector'):
@@ -913,6 +934,9 @@ async def run_task(task_id):
 async def resource_changed(user_id, kind, resource_id, action):
     """No private body is included; each device re-fetches through its guard."""
     from open_webui.socket.main import sio
+    from open_webui.utils.resource_events import resource_changed_allowed
+    if not await resource_changed_allowed(user_id):
+        return
     await sio.emit('resources:changed', {
         'type': kind, 'id': resource_id, 'action': action,
     }, room=f'user:{user_id}')

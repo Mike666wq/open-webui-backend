@@ -6,6 +6,8 @@ from contextvars import ContextVar
 from sqlalchemy import and_, event, exists, or_, select
 from sqlalchemy.orm import Session, with_loader_criteria
 
+from open_webui.utils.resource_timestamps import normalize_created_at_ns
+
 viewer = ContextVar('resource_viewer', default=None)
 maintenance = ContextVar('resource_maintenance', default=False)
 BLOCKED = ('recycled', 'purging', 'paused', 'private')
@@ -30,11 +32,53 @@ def as_viewer(user_id):
         viewer.reset(token)
 
 
-def visible(kind, column):
+def _personal_owner_filter(kind: str, resource_column, owner_column=None, resource_entry=None):
+    """Personal chat/share entries are hidden only from their own owner.
+
+    Knowledge, channels and files can be shared/public. Their owner is not
+    necessarily the viewer, so keep the original global semantics for those
+    kinds rather than accidentally exposing or hiding someone else's resource.
+    """
+    if kind not in ('chat', 'share'):
+        return None
+    user_id = owner_column if owner_column is not None else viewer.get()
+    if user_id is None:
+        return None
+    from open_webui.models.chats import Chat
+    from open_webui.models.shared_chats import SharedChat
+
+    if kind == 'share':
+        return exists(select(SharedChat.id).where(
+            SharedChat.id == resource_column, SharedChat.user_id == user_id,
+        )).correlate_except(SharedChat)
+    if resource_entry is not None:
+        return resource_entry.user_id == user_id
+    return exists(select(Chat.id).where(
+        Chat.id == resource_column, Chat.user_id == user_id,
+    )).correlate_except(Chat)
+
+
+def _blocked_conditions(resource_column, kind: str, owner_column=None):
+    from open_webui.models.resources import ResourceEntry
+    conditions = [
+        ResourceEntry.type == kind,
+        ResourceEntry.resource_id == resource_column,
+        ResourceEntry.state.in_(BLOCKED),
+    ]
+    if kind == 'share':
+        # A share restored as private stays readable but not writable. Its
+        # entry no longer hides the old URL from the global share query.
+        conditions.append(ResourceEntry.state != 'paused')
+    owner_filter = _personal_owner_filter(kind, resource_column, owner_column, ResourceEntry)
+    if owner_filter is not None:
+        conditions.append(owner_filter)
+    return conditions
+
+
+def visible(kind, column, owner_column=None):
     from open_webui.models.resources import ResourceEntry
     return ~exists(select(ResourceEntry.id).where(
-        ResourceEntry.type == kind, ResourceEntry.resource_id == column,
-        ResourceEntry.state.in_(BLOCKED),
+        *_blocked_conditions(column, kind, owner_column),
     )).correlate_except(ResourceEntry)
 
 
@@ -45,7 +89,7 @@ def message_visible(model, user_id):
         ResourceEntry.resource_id == model.channel_id,
         ResourceEntry.user_id == user_id,
         ResourceEntry.state.in_(('recycled', 'cleared')),
-        ResourceEntry.cutoff_at >= model.created_at,
+        ResourceEntry.cutoff_at >= normalize_created_at_ns(model.created_at),
     )).correlate_except(ResourceEntry)
 
 
@@ -71,9 +115,18 @@ def install_resource_visibility():
                 'chat', 'data', 'meta', 'files', 'params', 'content', 'file_id', 'knowledge_id', 'chat_id', 'channel_id',
             )}
             if interesting:
-                blocked = state.session.execute(select(ResourceEntry.resource_id).where(
+                current_user_id = viewer.get()
+                rows = state.session.execute(select(ResourceEntry.type, ResourceEntry.resource_id).where(
+                    or_(
+                        ResourceEntry.type.notin_(('chat', 'share')),
+                        ResourceEntry.user_id == current_user_id,
+                    ),
                     ResourceEntry.state.in_(BLOCKED),
-                )).scalars().all()
+                )).all()
+                blocked = {
+                    identity for kind, identity in rows
+                    if current_user_id is not None or kind not in ('chat', 'share')
+                }
                 encoded = json.dumps(interesting, default=str)
                 if any(identity in encoded for identity in blocked):
                     raise HTTPException(409, 'Referenced resource is retained in the recycle bin')
@@ -97,7 +150,7 @@ def install_resource_visibility():
             if name in direct:
                 predicates.append(visible(direct[name], cls.id))
             if name == 'shared_chat':
-                predicates.append(visible('chat', cls.chat_id))
+                predicates.append(visible('chat', cls.chat_id, getattr(cls, 'user_id', None)))
             if name in ('knowledge_file', 'knowledge_directory'):
                 field = cls.directory_id if name == 'knowledge_file' else cls.parent_id
                 predicates.append(or_(field.is_(None), visible('knowledge_directory', field)))
@@ -129,10 +182,18 @@ def install_resource_visibility():
                    if getattr(obj, '__tablename__', '') not in ('resource_entry', 'resource_task', 'resource_rule')]
         if not changed:
             return
+        current_user_id = viewer.get()
         rows = session.execute(select(ResourceEntry.type, ResourceEntry.resource_id).where(
+            or_(
+                ResourceEntry.type.notin_(('chat', 'share')),
+                ResourceEntry.user_id == current_user_id,
+            ),
             ResourceEntry.state.in_(BLOCKED),
         )).all()
-        blocked = {(kind, identity) for kind, identity in rows}
+        blocked = {
+            (kind, identity) for kind, identity in rows
+            if current_user_id is not None or kind not in ('chat', 'share')
+        }
         identities = {identity for _, identity in blocked}
         import json
         for obj in changed:
