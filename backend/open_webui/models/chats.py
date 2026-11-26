@@ -818,16 +818,9 @@ class ChatTable:
                 updated = {**stored, **chat}
                 if 'history' in chat:
                     # The caller built its history from an earlier read; merge so messages saved since then survive.
-                    updated['history'] = self.merge_history(stored.get('history'), chat['history'])
-                    for mid, message in (stored.get('history', {}).get('messages') or {}).items():
-                        if (message.get('user_id') or chat_item.user_id) != chat_item.user_id or (
-                            message.get('role') == 'assistant'
-                            and (
-                                message.get('done') is False or updated['history']['messages'][mid].get('done') is False
-                            )
-                        ):
-                            updated['history']['messages'][mid] = message
-                    updated['history'] = self.merge_history(updated['history'], {})
+                    updated['history'] = self._merge_stored_history(
+                        stored.get('history'), chat['history'], chat_item.user_id
+                    )
 
                 updated = self._clean_null_bytes(updated)
                 chat_item.chat = updated
@@ -850,7 +843,24 @@ class ChatTable:
                         )
                 return ChatModel.model_validate(chat_item)
         except Exception:
+            log.exception('Failed to update chat %s', id)
             return
+
+    def _merge_stored_history(self, stored_history, incoming_history, owner_id):
+        """Merge a stale writer's history without dropping newer stored messages."""
+        merged = self.merge_history(stored_history, incoming_history)
+        merged_messages = merged.get('messages') or {}
+        for mid, message in ((stored_history or {}).get('messages') or {}).items():
+            if not isinstance(message, dict):
+                continue
+            current = merged_messages.get(mid) or {}
+            foreign = (message.get('user_id') or owner_id) != owner_id
+            unfinished = message.get('role') == 'assistant' and (
+                message.get('done') is False or current.get('done') is False
+            )
+            if foreign or unfinished:
+                merged_messages[mid] = message
+        return self.merge_history(merged, {})
 
     async def update_chat_variables_by_id(
         self,

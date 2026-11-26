@@ -79,6 +79,36 @@ CONFIGURED_PURPOSES = ('chat', *MEDIA_PURPOSES)
 router = APIRouter()
 
 
+# Headers that would let a stored config override auth or the request target.
+_FORBIDDEN_CUSTOM_HEADERS = {'host', 'content-length', 'transfer-encoding', 'connection'}
+
+
+def _validate_custom_headers(config: dict) -> None:
+    """Validate user-supplied outbound headers.
+
+    The request builder already consumes config.custom_headers, so the write
+    path must accept it; but it is a place where a user could try to override
+    authentication or the request host, so the keys and values are bounded.
+    """
+    headers = config.get('custom_headers') or config.get('headers')
+    if headers is None:
+        return
+    if not isinstance(headers, dict):
+        raise HTTPException(400, 'custom_headers must be an object of string values')
+    if len(headers) > 32:
+        raise HTTPException(400, 'custom_headers allows at most 32 entries')
+    for name, value in headers.items():
+        if not isinstance(name, str) or not isinstance(value, str):
+            raise HTTPException(400, 'custom_headers must map strings to strings')
+        if not name or len(name) > 128 or len(value) > 1024:
+            raise HTTPException(400, 'custom_headers name or value is too long')
+        if any(ch in name for ch in '\r\n') or any(ch in value for ch in '\r\n'):
+            raise HTTPException(400, 'custom_headers must not contain newlines')
+        lowered = name.strip().lower()
+        if lowered in _FORBIDDEN_CUSTOM_HEADERS or lowered == 'authorization':
+            raise HTTPException(400, f'custom_headers may not override {name}')
+
+
 def _template_for(form: ProviderConnectionCreate) -> dict:
     """Resolve the provider template of a create request.
 
@@ -142,9 +172,13 @@ def _validate_form(form: ProviderConnectionCreate, user):
     elif not form.api_key:
         raise HTTPException(400, 'An API key is required')
     config = dict(form.config or {})
-    allowed = {'base_url', 'region', 'workspace_id', 'model_ids', 'api_type', 'services'}
+    allowed = {
+        'base_url', 'region', 'workspace_id', 'model_ids', 'api_type', 'services',
+        'custom_headers', 'headers',
+    }
     if set(config) - allowed:
         raise HTTPException(400, 'Unsupported provider configuration field')
+    _validate_custom_headers(config)
     for key in ('region', 'workspace_id', 'api_type'):
         if key in config and (not isinstance(config[key], str) or len(config[key]) > 128):
             raise HTTPException(400, f'{key} must be a string no longer than 128 characters')
@@ -448,9 +482,13 @@ async def update_connection(
         config = values['config'] or {}
         if connection.auth_type == 'oauth':
             raise HTTPException(400, 'Manage OAuth through its provider settings')
-        allowed = {'base_url', 'region', 'workspace_id', 'model_ids', 'api_type', 'services'}
+        allowed = {
+        'base_url', 'region', 'workspace_id', 'model_ids', 'api_type', 'services',
+        'custom_headers', 'headers',
+    }
         if set(config) - allowed:
             raise HTTPException(400, 'Unsupported provider configuration field')
+        _validate_custom_headers(config)
         for key in ('region', 'workspace_id', 'api_type'):
             if key in config and (not isinstance(config[key], str) or len(config[key]) > 128):
                 raise HTTPException(400, f'{key} must be a string no longer than 128 characters')

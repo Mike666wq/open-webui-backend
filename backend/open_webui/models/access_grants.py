@@ -176,6 +176,11 @@ def normalize_access_grants(access_grants: Optional[list]) -> list[dict]:
             continue
         if principal_type == PRINCIPAL_TYPE_ANYONE and (principal_id != WILDCARD_PRINCIPAL_ID or permission != 'read'):
             continue
+        # A wildcard user principal must not grant write. `user:*` with write
+        # is equivalent to "任何登录用户可写" and bypasses per-user grants;
+        # keep it read-only exactly like `anyone`.
+        if principal_type == PRINCIPAL_TYPE_USER and principal_id == WILDCARD_PRINCIPAL_ID and permission != 'read':
+            continue
 
         key = (principal_type, principal_id, permission)
         deduped[key] = {

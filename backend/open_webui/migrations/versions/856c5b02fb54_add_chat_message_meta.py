@@ -18,7 +18,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.add_column('chat_message', sa.Column('meta', sa.JSON(), nullable=True))
+    # A database restored from a snapshot or touched by hand can already have
+    # the column while its alembic version still lags. Adding it again would
+    # abort startup, so check first (same pattern as 4c5ce3d2f27f).
+    columns = {column['name'] for column in sa.inspect(op.get_bind()).get_columns('chat_message')}
+    if 'meta' not in columns:
+        op.add_column('chat_message', sa.Column('meta', sa.JSON(), nullable=True))
 
 
 def downgrade() -> None:
