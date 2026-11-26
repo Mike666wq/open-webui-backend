@@ -2175,7 +2175,12 @@ async def verify_chat_ownership(chat_id: str | None, user) -> None:
             detail='Channel chats are not supported on this endpoint',
         )
 
-    if not (user.role == 'admin' and ENABLE_ADMIN_CHAT_ACCESS) and not await Chats.is_chat_owner(chat_id, user.id):
+    # Use the same write gate as /api/chat/completions so shared/folder
+    # continuation users can complete messages they were allowed to send.
+    # Admins keep their existing bypass via ENABLE_ADMIN_CHAT_ACCESS.
+    if not (user.role == 'admin' and ENABLE_ADMIN_CHAT_ACCESS) and not await Chats.get_accessible_chat_by_id(
+        chat_id, user, permission='write'
+    ):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.DEFAULT(),

@@ -4,7 +4,7 @@ import logging
 import re
 from uuid import uuid4
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from open_webui.config import (
@@ -1168,10 +1168,18 @@ async def get_all_user_tags(user=Depends(get_verified_user), db: AsyncSession = 
 
 
 @router.get('/all/db', response_model=list[ChatResponse])
-async def get_all_user_chats_in_db(user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
+async def get_all_user_chats_in_db(
+    skip: int = 0,
+    limit: int = Query(50, ge=1, le=1000),
+    user=Depends(get_admin_user),
+    db: AsyncSession = Depends(get_async_session),
+):
     if not ENABLE_ADMIN_EXPORT:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
-    return [ChatResponse.model_validate(chat, from_attributes=True) for chat in await Chats.get_chats(db=db)]
+    return [
+        ChatResponse.model_validate(chat, from_attributes=True)
+        for chat in await Chats.get_chats(skip=skip, limit=limit, db=db)
+    ]
 
 
 ############################
@@ -1283,7 +1291,7 @@ async def unshare_all_chats(
             actor=user,
             subject_id=user.id,
             subject_type='user',
-            data={'count': len(chat_ids), 'chat_ids': chat_ids},
+            data={'count': len(ids), 'share_ids': ids, 'chat_ids': ids},
         )
     return result
 
