@@ -53,10 +53,11 @@ class ShareVisibilityTests(unittest.TestCase):
         self.assertIn('resource_entry.user_id = shared_chat.user_id', compiled)
         self.assertIn('resource_entry.type = \'chat\'', compiled)
 
-    def test_paused_private_share_stays_hidden_by_blocked_filter(self):
+    def test_paused_share_stays_hidden_by_blocked_filter(self):
         statement = select(SharedChat).where(visible('share', SharedChat.id))
         compiled = str(statement.compile(compile_kwargs={'literal_binds': True}))
-        self.assertIn('resource_entry.state', compiled)
+        self.assertIn("resource_entry.state IN", compiled)
+        self.assertIn("'paused'", compiled)
 
     def test_generic_resource_visibility_is_unchanged(self):
         from open_webui.models.knowledge import Knowledge

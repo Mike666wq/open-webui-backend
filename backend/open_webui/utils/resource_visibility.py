@@ -65,10 +65,6 @@ def _blocked_conditions(resource_column, kind: str, owner_column=None):
         ResourceEntry.resource_id == resource_column,
         ResourceEntry.state.in_(BLOCKED),
     ]
-    if kind == 'share':
-        # A share restored as private stays readable but not writable. Its
-        # entry no longer hides the old URL from the global share query.
-        conditions.append(ResourceEntry.state != 'paused')
     owner_filter = _personal_owner_filter(kind, resource_column, owner_column, ResourceEntry)
     if owner_filter is not None:
         conditions.append(owner_filter)
