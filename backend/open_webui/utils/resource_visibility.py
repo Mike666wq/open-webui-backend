@@ -6,7 +6,6 @@ from contextvars import ContextVar
 from sqlalchemy import and_, event, exists, or_, select
 from sqlalchemy.orm import Session, with_loader_criteria
 
-from open_webui.utils.resource_timestamps import normalize_created_at_ns
 
 viewer = ContextVar('resource_viewer', default=None)
 maintenance = ContextVar('resource_maintenance', default=False)
@@ -85,7 +84,10 @@ def message_visible(model, user_id):
         ResourceEntry.resource_id == model.channel_id,
         ResourceEntry.user_id == user_id,
         ResourceEntry.state.in_(('recycled', 'cleared')),
-        ResourceEntry.cutoff_at >= normalize_created_at_ns(model.created_at),
+        # model.created_at is a SQL column stored in ns, matching cutoff_at.
+        # Do not pass the column through a Python normalizer here: it would
+        # collapse to 0 and hide every message in a cleared channel.
+        ResourceEntry.cutoff_at >= model.created_at,
     )).correlate_except(ResourceEntry)
 
 
