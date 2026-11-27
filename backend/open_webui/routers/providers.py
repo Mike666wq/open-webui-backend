@@ -888,7 +888,7 @@ class ModelUpdate(BaseModel):
     capabilities: Any = None
 
 
-@router.put('/connections/{connection_id}/models/{upstream_id}')
+@router.put('/connections/{connection_id}/models/{upstream_id:path}')
 async def update_connection_model(
     connection_id: str,
     upstream_id: str,
@@ -932,7 +932,7 @@ async def update_connection_model(
     return {'object': 'list', 'data': await connection_models(connection, db)}
 
 
-@router.delete('/connections/{connection_id}/models/{upstream_id}')
+@router.delete('/connections/{connection_id}/models/{upstream_id:path}')
 async def remove_connection_model(
     connection_id: str,
     upstream_id: str,
